@@ -1,0 +1,21 @@
+# ── 루트 전체 무시 (PythonCode/ 외 모든 파일/폴더) ──────────────
+/*
+
+# .gitignore 자체는 추적
+!/.gitignore
+
+# PythonCode 디렉토리만 추적
+!/PythonCode/
+
+# ── PythonCode 내 런타임 산출물 ─────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+PythonCode/log/
+PythonCode/checkpoints/
+PythonCode/wandb/
+PythonCode/*.db
+PythonCode/*.log
+PythonCode/*.csv

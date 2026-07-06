@@ -1,0 +1,57 @@
+defaults:
+  - algorithm: td3   
+  - _self_ 
+
+# env
+env_type : !!str gymnasium
+env_id : !!str Walker2d-v5
+
+fmu_filename : !!str  models/Grab_Dynamic_linux.fmu
+
+
+# Common Configurations
+random_seed : !!int 1
+device : cuda
+
+max_steps : !!int 1000000
+max_epochs : !!int 100000
+max_rollout : !!int 25
+batch_size : !!int 256
+critic_hidden_dims : [256, 256]
+actor_hidden_dims : [256, 256]
+gamma : !!float 0.99
+adam_eps : !!float 0.00000001
+activation_fc : ReLU
+actor_lr : !!float 0.0003
+critic_lr : !!float 0.0003
+
+# Configurations for Offline Algorithms
+buffer_capacity : !!int 1000000
+update_after : !!int 1000
+max_random_rollout : !!int 2000
+tau : !!float 0.005
+
+# Evaluation & Logging Configurations
+eval : !!bool true
+eval_freq : !!int 1000
+eval_episodes : !!int 5
+save_model : !!bool true
+model_checkpoint_freq : !!int 100000
+save_dir : ''
+# Sim-to-Real
+use_caps : !!bool false
+caps_lambda_t: !!float 0.025  # 0.0250
+caps_lambda_s: !!float 0.0125  # 0.0125
+caps_eps: !!float 0.1
+caps_annealing: !!bool true
+caps_annealing_max_steps: 500000
+
+# Loading Model
+load_model : !!bool false
+load_checkpoint_dir : ''   # Relative dir. Example: SAC_HalfCheetah-v4_2024-04-28_03:10:36/checkpoint_5
+
+# Logging
+use_wandb : !!bool True
+wandb_project: !!str online_rl
+wandb_team : None
+wandb_group: !!str default-group

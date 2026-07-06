@@ -1,0 +1,10 @@
+# OHT 라우팅 RL 의존 패키지
+# torch는 환경(CUDA 유무)에 맞는 빌드를 별도로 설치하는 것을 권장합니다.
+#   - GPU: https://pytorch.org 의 설치 가이드 참고
+#   - CPU만 사용해도 동작합니다(자동 감지).
+numpy
+pandas
+torch
+wandb
+PyYAML
+# sqlite3 는 파이썬 표준 라이브러리에 포함되어 있어 별도 설치가 필요 없습니다.
