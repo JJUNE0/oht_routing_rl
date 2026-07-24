@@ -53,8 +53,11 @@ class PClient:
        secData ={}
 
        episode_index = 0
-       def __init__(self, socket):
+       def __init__(self, socket, sim_end_time=45000):
            self.client_socket = socket
+           self.requested_end_time = int(sim_end_time)
+           if self.requested_end_time <= 0:
+               raise ValueError("sim_end_time must be positive")
            try:
                self.client_socket.settimeout(self.RECV_TIMEOUT)  # 무한 hang 진단용; 타임아웃시 RecieveMessage가 로그 후 계속 대기
            except Exception:
@@ -65,7 +68,8 @@ class PClient:
            self.SendStartPythonStartTime(0);
            self.SendDijkstraUpdateTime(1);
            self.SendReroutingUpdateTime(7);
-           self.SendEndTime(45000);
+           # This raw fixed-width field must occur exactly once here.
+           self.SendEndTime(self.requested_end_time);
            self.RecieveSetPara();
            self.file_path = datetime.now().strftime('%Y%m%d%H%M%S')  + self.file_path;
            self.file_path_TCP = datetime.now().strftime('%Y%m%d%H%M%S')  + self.file_path_TCP;
@@ -79,7 +83,8 @@ class PClient:
            self.SendStartPythonStartTime(0);
            self.SendDijkstraUpdateTime(1);
            self.SendReroutingUpdateTime(7);
-           self.SendEndTime(45000);
+           # The reset handshake also owns exactly one end-time field.
+           self.SendEndTime(self.requested_end_time);
            self.RecieveSetPara();
            return 2;
            
@@ -1437,9 +1442,14 @@ class PClient:
                     raise RuntimeError("RecieveMessage 180s 무응답 — desync 의심, 재접속 (마지막 v=" + str(self.LAST_V) + ")")
                 continue;
             if not data:
-                print("client disconnected");
-                print("received:",data);
-                break;
+                # recv()가 b''를 반환하면 peer가 연결을 정상 종료한 것이다.
+                # 부분/빈 버퍼를 이후 파서에 넘기면 IndexError로 원인이 가려지므로,
+                # 즉시 예외를 올려 main의 재접속 경로를 타게 한다.
+                got = bufferSize - rebufferSize
+                raise ConnectionError(
+                    "Socket peer disconnected while receiving "
+                    + str(bufferSize) + "B message (received " + str(got) + "B)"
+                )
 
             rebufferSize = rebufferSize -len(data)
             returnData =returnData + data ;

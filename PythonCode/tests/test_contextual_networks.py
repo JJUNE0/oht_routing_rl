@@ -1,0 +1,247 @@
+import copy
+import io
+import inspect
+import unittest
+
+import torch
+
+from cocel_rl.algorithms.contextual_td7 import (
+    ContextualActor,
+    ContextualNetworkConfig,
+    ContextualNetworkError,
+    ContextualTwinCritic,
+    DirectionalContextEncoder,
+    actor_diagnostics,
+    critic_diagnostics,
+)
+
+
+def make_inputs(batch=4, *, requires_grad=False, scale=1.0, device="cpu"):
+    shapes = (
+        (batch, 8),
+        (batch, 10, 8),
+        (batch, 10, 8),
+        (batch, 10, 2),
+        (batch, 10, 2),
+        (batch, 6),
+    )
+    return tuple(
+        (torch.randn(shape, device=device) * scale).requires_grad_(requires_grad)
+        for shape in shapes
+    )
+
+
+class ContextualNetworkTests(unittest.TestCase):
+    def setUp(self):
+        torch.manual_seed(23)
+        self.config = ContextualNetworkConfig()
+        self.encoder = DirectionalContextEncoder(self.config)
+        self.actor = ContextualActor(self.config)
+        self.critic = ContextualTwinCritic(self.config)
+
+    def test_actor_and_twin_critic_shapes_ranges_and_finite_gradients(self):
+        state = torch.randn(11, 128, requires_grad=True)
+        actor_output = self.actor(state)
+        self.assertEqual(actor_output.action.shape, (11, 1))
+        self.assertEqual(actor_output.pre_tanh.shape, (11, 1))
+        self.assertTrue((actor_output.action >= -1.0).all())
+        self.assertTrue((actor_output.action <= 1.0).all())
+        action = actor_output.action.detach().requires_grad_(True)
+        critic_output = self.critic(state, action)
+        self.assertEqual(critic_output.q1.shape, (11, 1))
+        self.assertEqual(critic_output.q2.shape, (11, 1))
+        (critic_output.q1 + critic_output.q2).mean().backward()
+        self.assertIsNotNone(action.grad)
+        self.assertTrue(torch.isfinite(action.grad).all())
+        self.assertGreater(float(action.grad.abs().sum()), 0.0)
+
+    def test_actor_loss_reaches_every_observation_group(self):
+        inputs = make_inputs(5, requires_grad=True)
+        encoding = self.encoder(*inputs)
+        loss = -self.actor(encoding.state).action.mean()
+        loss.backward()
+        for value in inputs:
+            self.assertIsNotNone(value.grad)
+            self.assertTrue(torch.isfinite(value.grad).all())
+            self.assertGreater(float(value.grad.abs().sum()), 0.0)
+
+    def test_all_parameter_gradients_are_finite(self):
+        inputs = make_inputs(4)
+        state = self.encoder(*inputs).state
+        actor_output = self.actor(state)
+        critic_output = self.critic(state, actor_output.action)
+        loss = (
+            actor_output.action.square().mean()
+            + critic_output.q1.square().mean()
+            + critic_output.q2.square().mean()
+        )
+        loss.backward()
+        parameters = list(self.encoder.parameters())
+        parameters += list(self.actor.parameters())
+        parameters += list(self.critic.parameters())
+        self.assertTrue(all(parameter.grad is not None for parameter in parameters))
+        self.assertTrue(
+            all(torch.isfinite(parameter.grad).all() for parameter in parameters)
+        )
+
+    def test_twin_critics_do_not_share_parameters(self):
+        q1_ids = {id(parameter) for parameter in self.critic.q1.parameters()}
+        q2_ids = {id(parameter) for parameter in self.critic.q2.parameters()}
+        self.assertTrue(q1_ids.isdisjoint(q2_ids))
+
+    def test_models_are_shared_across_batch_not_rail_specific(self):
+        self.assertFalse(
+            any("rail" in name.lower() for name, _ in self.actor.named_parameters())
+        )
+        self.assertFalse(
+            any("rail" in name.lower() for name, _ in self.critic.named_parameters())
+        )
+        self.assertEqual(
+            sum(parameter.numel() for parameter in self.actor.parameters()),
+            sum(parameter.numel() for parameter in ContextualActor().parameters()),
+        )
+
+    def test_source_contains_no_region_mask_or_aggregation_path(self):
+        source = inspect.getsource(DirectionalContextEncoder).lower()
+        source += inspect.getsource(ContextualTwinCritic).lower()
+        self.assertNotIn("padding", source)
+        self.assertNotIn("region", source)
+        self.assertNotIn("masked_mean", source)
+
+    def test_zero_extreme_and_normal_forward_are_finite(self):
+        for scale in (0.0, 1.0, 1e6):
+            with self.subTest(scale=scale):
+                inputs = make_inputs(3, scale=scale)
+                encoding = self.encoder(*inputs)
+                actor_output = self.actor(encoding.state)
+                critic_output = self.critic(encoding.state, actor_output.action)
+                for tensor in (
+                    encoding.state,
+                    actor_output.pre_tanh,
+                    actor_output.action,
+                    critic_output.q1,
+                    critic_output.q2,
+                ):
+                    self.assertTrue(torch.isfinite(tensor).all())
+
+    def test_nan_inf_inputs_fail_fast_without_sanitization(self):
+        for value in (float("nan"), float("inf")):
+            inputs = list(make_inputs(2))
+            inputs[0][0, 0] = value
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ContextualNetworkError, "NaN or Inf"):
+                    self.encoder(*inputs)
+
+    def test_dropout_zero_forward_is_deterministic(self):
+        inputs = make_inputs(4)
+        first = self.encoder(*inputs, return_attention=True)
+        second = self.encoder(*inputs, return_attention=True)
+        torch.testing.assert_close(first.state, second.state)
+        torch.testing.assert_close(
+            first.incoming_attention, second.incoming_attention
+        )
+
+    def test_same_seed_and_state_dict_produce_identical_output(self):
+        inputs = make_inputs(4)
+        clone = DirectionalContextEncoder(self.config)
+        clone.load_state_dict(copy.deepcopy(self.encoder.state_dict()))
+        first = self.encoder(*inputs)
+        second = clone(*inputs)
+        torch.testing.assert_close(first.state, second.state)
+
+    def test_save_load_round_trip_is_identical(self):
+        inputs = make_inputs(4)
+        state = self.encoder(*inputs).state
+        actor_output = self.actor(state)
+        critic_output = self.critic(state, actor_output.action)
+        stream = io.BytesIO()
+        torch.save(
+            {
+                "encoder": self.encoder.state_dict(),
+                "actor": self.actor.state_dict(),
+                "critic": self.critic.state_dict(),
+            },
+            stream,
+        )
+        stream.seek(0)
+        saved = torch.load(stream, weights_only=True)
+        encoder = DirectionalContextEncoder(self.config)
+        actor = ContextualActor(self.config)
+        critic = ContextualTwinCritic(self.config)
+        encoder.load_state_dict(saved["encoder"])
+        actor.load_state_dict(saved["actor"])
+        critic.load_state_dict(saved["critic"])
+        loaded_state = encoder(*inputs).state
+        loaded_actor = actor(loaded_state)
+        loaded_critic = critic(loaded_state, loaded_actor.action)
+        torch.testing.assert_close(state, loaded_state)
+        torch.testing.assert_close(actor_output.action, loaded_actor.action)
+        torch.testing.assert_close(critic_output.q1, loaded_critic.q1)
+        torch.testing.assert_close(critic_output.q2, loaded_critic.q2)
+
+    def test_diagnostics_have_required_finite_values(self):
+        state = torch.randn(8, 128)
+        actor_output = self.actor(state)
+        critic_output = self.critic(state, actor_output.action)
+        diagnostics = {}
+        diagnostics.update(actor_diagnostics(actor_output))
+        diagnostics.update(critic_diagnostics(critic_output))
+        expected = {
+            "action/pre_tanh_mean",
+            "action/pre_tanh_std",
+            "action/mean",
+            "action/std",
+            "action/saturation_ratio",
+            "critic/q1_mean",
+            "critic/q2_mean",
+            "critic/q_range",
+        }
+        self.assertTrue(expected.issubset(diagnostics))
+        self.assertTrue(
+            all(torch.isfinite(torch.tensor(value)) for value in diagnostics.values())
+        )
+
+    def test_inputs_are_not_modified(self):
+        inputs = make_inputs(3)
+        before = tuple(value.clone() for value in inputs)
+        state = self.encoder(*inputs).state
+        state_before = state.clone()
+        action = self.actor(state).action
+        action_before = action.clone()
+        self.critic(state, action)
+        for original, current in zip(before, inputs):
+            torch.testing.assert_close(original, current)
+        torch.testing.assert_close(state_before, state)
+        torch.testing.assert_close(action_before, action)
+
+    def test_forward_backward_smoke_100_iterations(self):
+        optimizer = torch.optim.Adam(
+            list(self.encoder.parameters())
+            + list(self.actor.parameters())
+            + list(self.critic.parameters()),
+            lr=1e-5,
+        )
+        for _ in range(100):
+            optimizer.zero_grad(set_to_none=True)
+            state = self.encoder(*make_inputs(2)).state
+            actor_output = self.actor(state)
+            critic_output = self.critic(state, actor_output.action)
+            loss = (
+                actor_output.pre_tanh.square().mean()
+                + critic_output.q1.square().mean()
+                + critic_output.q2.square().mean()
+            )
+            self.assertTrue(torch.isfinite(loss))
+            loss.backward()
+            optimizer.step()
+        self.assertTrue(
+            all(
+                torch.isfinite(parameter).all()
+                for module in (self.encoder, self.actor, self.critic)
+                for parameter in module.parameters()
+            )
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

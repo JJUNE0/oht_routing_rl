@@ -114,7 +114,9 @@ PythonCode/
 | 항목 | 내용 |
 |------|------|
 | **입력** | 글로벌 컨텍스트 10차원 + 레일 토큰 시퀀스 (레일 obs 18차원 × 레일 수) |
-| **어텐션** | `ContextConcatRailAttention` — 글로벌·레일 임베딩 concat → Q/K 프로젝션 → Multi-Head Attention |
+| **어텐션** | `ContextConcatRailAttention` — 정규화된 글로벌·레일 임베딩 concat → Q/K/V 1회 프로젝션 → head별 RMS 제한 scaled-dot-product attention |
+| **정책 head** | TD7 방식 `[H,C] → Linear → AvgL1Norm → concat(zs)` 후 2-layer ReLU policy |
+| **critic** | TD7 방식 `[H,C,action] → Linear → AvgL1Norm → concat(zs,zsa)`, valid-token mean Q |
 | **출력** | 리전별 1차원 액션 → 해당 리전 내 모든 레일에 동일 cost 적용 |
 | **리전 구성** | `region.target_size=50` (레일 수 기준), 인접 레일 클러스터링 |
 | **설정** | `config["token_td7"]` — `embed_dim`, `num_heads` |

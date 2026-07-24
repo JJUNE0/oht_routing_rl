@@ -79,3 +79,21 @@ EXP_META는 `PythonCode/ClientAlgorithm.py` 상단에 정의되어 있으며 wan
 | 2026-06-18 | residual | (1-x,1+x) | A | True | residual_baseline | 기존 운영 버전: cost = baseline(base+0.5wc) * clip(1+residual_scale*applied_a). applied_a는 raw action에서 전체 rail 평균(global 성분)을 뺀 값 (mean-centering). |
 | 2026-06-18 | b_rl | a[-1,1]->b[0,1] | A | False | diag | residual multiplier → additive b_rl cost로 전환 (진단용, 최종 기법 아님). cost = base + w*c*b_rl, b_rl=0.5*(a+1). mean-centering 제거 (uniform shift도 rail별 wc가 달라 cost에 영향을 주므로). reward는 변경하지 않음(reward_version 그대로 A). 추가 진단: reward-action correlation(상태 버킷별), cost sensitivity(b=0 vs b=1), eval b diversity, critic_probe first_step 메타데이터, brl/* 비용·행동 통계. export_wandb_run.py KEYS에 신규 키 반영. |
 | 2026-06-18 | b_rl | a[-1,1]->b[0,1] | A | False | obs_clip_diag | reward/cost/b_rl 매핑/warmup/actor·critic/기존 진단 변경 없음. 정규화된 obs(z-score)에 `[-5,5]` clip 추가 (StateNormalizer.normalize 및 get_local_observations의 is_fixed 경로 양쪽). clip 효과 측정을 위해 clip 전(z_preclip) 분포 기준으로 `obs/clip_ratio`, `obs/abs_max`, `obs/abs_p99` 로깅. 가설: heavy-tail per-rail feature(param_dw, jobs_from/to, nbr_reservation 등)가 actor tanh를 saturate시킨다는 의심을 obs/clip_ratio로 반증 가능하게 함. export_wandb_run.py KEYS에 `obs/*` 3개 추가. |
+
+# Contextual region b_rl action contract v1 / reward C
+
+- 2026-07-24: `b_rl / b_rl_0.0-1.0 / reward C /
+  contextual_region_b_rl_v1`. Changed the main contextual action mode to the
+  legacy region mapping `b_rl=0.5+0.5*a_applied` and
+  `cost=base+w*c*b_rl`; retained `exp_residual` as an explicit ablation.
+  Warm-up is exactly neutral (`a_applied=0`, `b_rl=0.5`).
+- Restored the existing region curriculum exactly: global step
+  `warmup_steps..40000`, geometric scale `0.05..1.0`. Replay stores the
+  deterministic policy action separately from the clipped, curriculum-scaled
+  applied action; critic, target critic, actor objective, and SALE consume
+  applied-action space.
+- Reward C replaces residual-action smoothing in the main mode with
+  `0.05*abs(delta b_rl)`. The exp-residual ablation retains its separate
+  `0.5*abs(delta residual)` weight. Action/reward/learner versions are bumped;
+  all earlier contextual checkpoints are intentionally incompatible and this
+  action mode must start as a fresh run.

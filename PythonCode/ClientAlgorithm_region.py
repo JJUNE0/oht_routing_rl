@@ -8,6 +8,7 @@ import torch
 
 import wandb
 from cocel_rl.algorithms.token_td7 import TokenTD7Learner
+from cocel_rl.algorithms.token_td7.numerics import assert_finite_arrays, assert_finite_tree
 from ClientAlgorithm import (
     ClientAlgorithm as PerRailClientAlgorithm,
     RunningRewardNormalizer,
@@ -21,13 +22,12 @@ EXP_META = {
     "action_range": "a[-1,1]_b[0,1]",
     "reward_version": "J",
     "centering": False,
-    "note": "tat_dense",
+    "note": "td7_full_fix",
     "description": (
-        "[reward_version J] step_reward = -rail_tat_penalty + w_tat_dense * g. "
-        "reward_version I(rail_tat_only)에서 actor gradient vanishing → NaN explosion 발생. "
-        "원인: sparse reward로 Q surface flat, grad/actor_norm 0.007~0.015로 처음부터 소멸. "
-        "global TAT dense signal(w=0.3)을 additive로 추가해 매 스텝 actor gradient 유지. "
-        "rail_tat_penalty는 그대로 유지(primary signal), g는 보조 dense signal."
+        "[Region TD7 actor/critic normalization hot-fix, fresh training] "
+        "Bounded single-projection attention과 SALE zs-to-zsa 연결을 유지한다. TD7의 "
+        "actor/critic AvgL1Norm 경로를 복원하고, downstream context normalization, "
+        "masked pre-tanh penalty, mean token-Q aggregation을 적용한다."
     ),
 }
 
@@ -43,11 +43,15 @@ def _make_run_name(exp_meta):
 def train_config():
     config = per_rail_train_config()
     config["resume"] = False
-    config["resume_ckpt_dir"] = "./checkpoints/region_td7/20260705-035239/checkpoint_5"  # 실제 재시작 시 경로 지정 필요
+    config["resume_ckpt_dir"] = ""
     config["save_dir"] = "./checkpoints/region_td7"
     config["buffer_capacity"] = 500_000
-    config["model_type"] = "region_td7_concat_attention"
+    config["model_type"] = "region_td7_bounded_attention_sale_actor_critic_v2"
     config["algorithm"]["name"] = "TD7"
+    config["algorithm"]["encoder_grad_clip"] = 1.0
+    config["algorithm"]["encoder_grad_abort_norm"] = 1_000.0
+    config["algorithm"]["failure_artifact_topk"] = 16
+    config["numeric_artifact_dir"] = "./results/numeric_failures"
     config["token_td7"] = {
         "embed_dim": 128,
         "num_heads": 4,
@@ -56,7 +60,7 @@ def train_config():
         "enabled": True,
         "target_size": 50,
         "min_size": 1,
-        "context_global_dim": 10,
+        "context_global_dim": 6,
     }
     config["curriculum"]["scale_end"] = 1.0
     config["exp_meta"] = dict(EXP_META)
@@ -71,18 +75,18 @@ class ClientAlgorithm(PerRailClientAlgorithm):
     def __init__(self):
         print("ClientAlgorithm_region start")
 
-        self.obs_dim = 18
+        self.obs_dim = 14  # 6 global + 8 rail (ClientAlgorithm._build_raw_obs 참고)
         self.act_dim = 1
         self.action_bound = [-1.0, 1.0]
         self.config = train_config()
-        self.global_obs_dim = int(self.config["region"].get("context_global_dim", 10))
+        self.global_obs_dim = int(self.config["region"].get("context_global_dim", 6))
         self.context_dim = self.global_obs_dim + self.obs_dim * 2
 
         print(f"obs_dim : {self.obs_dim}")
         print(f"act_dim : {self.act_dim}")
         print(f"action_bound : {self.action_bound}")
         print(f"context_dim : {self.context_dim}")
-        print("[Algo] region-token TD7 concat attention")
+        print("[Algo] region-token TD7 bounded attention + normalized actor/critic")
 
         self.learner = TokenTD7Learner(
             rail_dim=self.obs_dim,
@@ -146,15 +150,25 @@ class ClientAlgorithm(PerRailClientAlgorithm):
         self._timings = {}
         self._timing_steps = 0
 
+        # Checkpoints do not currently contain the replay buffer. After a
+        # successful resume, refill it with the restored policy before any
+        # optimizer update is allowed.
+        self._resume_loaded = False
+        self._resume_learning_started = False
+        self._resume_buffer_refill_active = False
+        self._resume_buffer_refill_start_step = None
+        self._resume_buffer_refill_completed_step = None
+
         self.reward_log_path = "./region_reward_log.csv"
         if not os.path.exists(self.reward_log_path):
             with open(self.reward_log_path, "w") as f:
                 f.write("step,sub_episode,tat,op_rate,sub_r,delta_r,baseline_r\n")
 
         if self.config["resume"]:
-            self.resume_checkpoint()
-            self.config["warmup_episodes"] = 0
-            self.config["warmup_steps"] = 0
+            self._resume_loaded = self.resume_checkpoint()
+            if self._resume_loaded:
+                self.config["warmup_episodes"] = 0
+                self.config["warmup_steps"] = 0
 
         self.wandb_ok = False
         try:
@@ -258,7 +272,24 @@ class ClientAlgorithm(PerRailClientAlgorithm):
         duplicate = len(flat) - len(unique)
         sizes = np.array([len(g) for g in groups], dtype=np.float32)
         if len(sizes) == 0:
-            raise RuntimeError("region partition produced no regions")
+            # 시뮬레이터 초기화/재연결 구간에는 RAILLINE_DIC가 잠시 비어 있을 수 있다.
+            # 이는 비정상 partition이 아니라 아직 action을 적용할 rail이 없는 상태다.
+            # 빈 캐시를 남겨 두면 다음 통신 구간에서 rail 목록이 생겼을 때 key 변경으로
+            # 정상적으로 partition을 다시 생성한다.
+            self._region_members = []
+            self._region_rail_to_region = {}
+            self._region_cache_key = tuple(sorted_rail_ids)
+            self._region_stats = {
+                "region/num_regions": 0.0,
+                "region/size_min": 0.0,
+                "region/size_mean": 0.0,
+                "region/size_max": 0.0,
+                "region/size_std": 0.0,
+                "region/unassigned_count": 0.0,
+                "region/duplicate_count": 0.0,
+            }
+            print("[Region] no rail lines available; skipping region action for this step.")
+            return
 
         self._region_members = [np.array(g, dtype=np.int64) for g in groups]
         self._region_rail_to_region = {
@@ -338,6 +369,12 @@ class ClientAlgorithm(PerRailClientAlgorithm):
             batched_mask[i, :n] = view["mask"]
             batched_context[i] = view["context"]
 
+        assert_finite_arrays(
+            "action/input",
+            (("rail_feat", batched_rail), ("context", batched_context)),
+            context=f"env_step={self.total_steps}",
+        )
+
         action, _ = self.learner.actor.get_action(
             batched_rail,
             batched_context,
@@ -347,9 +384,13 @@ class ClientAlgorithm(PerRailClientAlgorithm):
         action = np.asarray(action, dtype=np.float32) * scale
 
         finite_action_ratio = float(np.isfinite(action).mean()) if action.size else 1.0
-        if finite_action_ratio < 1.0:
-            print(f"[NUMERIC WARNING] non-finite region actions ratio={finite_action_ratio:.4f}")
-            action = np.nan_to_num(action, nan=0.0, posinf=1.0, neginf=-1.0)
+        assert_finite_arrays(
+            "action/output",
+            (("action", action), ("curriculum_scale", np.asarray(scale, dtype=np.float32))),
+            context=(
+                f"env_step={self.total_steps}, finite_action_ratio={finite_action_ratio:.6f}"
+            ),
+        )
         action = np.clip(action, self.action_bound[0], self.action_bound[1])
         action = action * batched_mask[:, :, None].astype(np.float32)
 
@@ -453,13 +494,7 @@ class ClientAlgorithm(PerRailClientAlgorithm):
         return np.asarray(region_rewards, dtype=np.float32)
 
     def _save_checkpoint(self):
-        if self._checkpoint_root is None:
-            run_dir = datetime.now().strftime("%Y%m%d-%H%M%S")
-            self._checkpoint_root = os.path.join(self.config["save_dir"], run_dir)
-            os.makedirs(self._checkpoint_root, exist_ok=True)
-        self._checkpoint_no += 1
-        ckpt_dir = os.path.join(self._checkpoint_root, f"checkpoint_{self._checkpoint_no}")
-        os.makedirs(ckpt_dir, exist_ok=True)
+        next_checkpoint_no = self._checkpoint_no + 1
         payload = {
             "learner": self.learner.get_params(),
             "meta_data": {
@@ -489,14 +524,30 @@ class ClientAlgorithm(PerRailClientAlgorithm):
                 "parameterDw": dict(self.parameterDw),
             },
         }
+        assert_finite_tree(
+            "checkpoint/save_full",
+            payload,
+            context=f"env_step={self.total_steps}, checkpoint={next_checkpoint_no}",
+        )
+
+        checkpoint_root = self._checkpoint_root
+        if checkpoint_root is None:
+            run_dir = datetime.now().strftime("%Y%m%d-%H%M%S")
+            checkpoint_root = os.path.join(self.config["save_dir"], run_dir)
+        ckpt_dir = os.path.join(checkpoint_root, f"checkpoint_{next_checkpoint_no}")
+        os.makedirs(ckpt_dir, exist_ok=True)
         torch.save(payload, os.path.join(ckpt_dir, "checkpoint.pt"))
         torch.save(self.learner.actor.state_dict(), os.path.join(ckpt_dir, "policy.pt"))
+        self._checkpoint_root = checkpoint_root
+        self._checkpoint_no = next_checkpoint_no
         print(f"[Checkpoint] region TD7 saved: {ckpt_dir}")
 
     _BEST_MIN_STEPS = 500  # 에피소드 최소 스텝 수 (이보다 짧으면 best 저장 안 함)
 
     def _maybe_save_best_checkpoint(self, pclient):
         """에피소드 return(매 스텝 reward 합산) 기준으로 best.pt 갱신."""
+        if self._resume_loaded and not self._resume_learning_started:
+            return
         if self.total_steps < self.config["warmup_steps"]:
             return
         if self._episode_failed:
@@ -518,12 +569,6 @@ class ClientAlgorithm(PerRailClientAlgorithm):
         best_completed = int(self.total_completed_jobs)
         best_queued = int(getattr(pclient, "QueuedCommandCount", 0))
 
-        if self._checkpoint_root is None:
-            run_dir = datetime.now().strftime("%Y%m%d-%H%M%S")
-            self._checkpoint_root = os.path.join(self.config["save_dir"], run_dir)
-            os.makedirs(self._checkpoint_root, exist_ok=True)
-        best_dir = os.path.join(self._checkpoint_root, "best")
-        os.makedirs(best_dir, exist_ok=True)
         payload = {
             "learner": self.learner.get_params(),
             "meta_data": {
@@ -559,8 +604,21 @@ class ClientAlgorithm(PerRailClientAlgorithm):
                 "parameterDw": dict(self.parameterDw),
             },
         }
+        assert_finite_tree(
+            "checkpoint/save_best_full",
+            payload,
+            context=f"env_step={self.total_steps}, episode={self._best_episode}",
+        )
+
+        checkpoint_root = self._checkpoint_root
+        if checkpoint_root is None:
+            run_dir = datetime.now().strftime("%Y%m%d-%H%M%S")
+            checkpoint_root = os.path.join(self.config["save_dir"], run_dir)
+        best_dir = os.path.join(checkpoint_root, "best")
+        os.makedirs(best_dir, exist_ok=True)
         torch.save(payload, os.path.join(best_dir, "checkpoint.pt"))
         torch.save(self.learner.actor.state_dict(), os.path.join(best_dir, "policy.pt"))
+        self._checkpoint_root = checkpoint_root
         print(
             f"[Best Checkpoint] ep={self._best_episode} | return={self._best_episode_return:.4f} "
             f"| TAT={best_tat:.3f} | completed={best_completed} | queued={best_queued} "
@@ -583,9 +641,14 @@ class ClientAlgorithm(PerRailClientAlgorithm):
         ckpt_path = os.path.join(self.config["resume_ckpt_dir"], "checkpoint.pt")
         if not os.path.exists(ckpt_path):
             print(f"[Resume] checkpoint not found at {ckpt_path}. starting fresh.")
-            return
+            return False
 
         ckpt = torch.load(ckpt_path, map_location=self.config["device"], weights_only=False)
+        assert_finite_tree(
+            "checkpoint/load_full",
+            ckpt,
+            context=f"path={ckpt_path}",
+        )
         self.learner.load_params(ckpt["learner"])
 
         meta = ckpt.get("meta_data", {})
@@ -611,10 +674,65 @@ class ClientAlgorithm(PerRailClientAlgorithm):
         if not meta.get("buffer_saved", False):
             print("[Resume] replay buffer was not saved; resuming with an empty buffer.")
 
+        buffer_capacity = int(self.learner.buffer.capacity)
+        self._resume_buffer_refill_active = self.learner.buffer.size < buffer_capacity
+        self._resume_buffer_refill_start_step = self.total_steps
+        self._resume_buffer_refill_completed_step = None
+        if self._resume_buffer_refill_active:
+            print(
+                "[Resume] replay refill mode enabled: "
+                f"size={self.learner.buffer.size}/{buffer_capacity}. "
+                "Optimizer updates are paused until the buffer is full; "
+                "policy rollout and transition collection continue."
+            )
+
         print(
             f"[Resume] loaded {ckpt_path} | total_steps={self.total_steps} "
             f"sub_step_count={self.sub_step_count} sub_episode_count={self.sub_episode_count}"
         )
+        return True
+
+    def _resume_buffer_fill_ratio(self):
+        capacity = max(1, int(self.learner.buffer.capacity))
+        return min(1.0, float(self.learner.buffer.size) / float(capacity))
+
+    def _update_resume_buffer_refill_state(self):
+        """Return True on the step that completes a resumed-buffer refill."""
+        if not self._resume_buffer_refill_active:
+            return False
+
+        size = int(self.learner.buffer.size)
+        capacity = int(self.learner.buffer.capacity)
+        if size < capacity:
+            if self.total_steps % 100 == 0:
+                print(
+                    "[Resume] replay refill in progress: "
+                    f"{size}/{capacity} ({100.0 * self._resume_buffer_fill_ratio():.1f}%). "
+                    "Inference/collection only; learner update paused."
+                )
+            return False
+
+        self._resume_buffer_refill_active = False
+        self._resume_buffer_refill_completed_step = self.total_steps
+        start_step = self._resume_buffer_refill_start_step
+        collected_steps = (
+            self.total_steps - start_step if start_step is not None else 0
+        )
+        print(
+            "[Resume] replay buffer refill complete: "
+            f"{size}/{capacity} after {collected_steps} environment steps. "
+            "Learner updates will resume on the next step."
+        )
+        self._wlog(
+            {
+                "resume/replay_refill_complete": 1.0,
+                "resume/replay_refill_steps": float(collected_steps),
+                "buffer/size": float(size),
+                "buffer/fill_ratio": 1.0,
+            },
+            step=self.total_steps,
+        )
+        return True
 
     def _log_region_diagnostics(
         self,
@@ -706,7 +824,13 @@ class ClientAlgorithm(PerRailClientAlgorithm):
             "episode": getattr(pclient, "episode_index", 0),
             "sub_episode": self.sub_episode_count,
             "phase/random": 0.0,
+            "phase/resume_buffer_refill": float(self._resume_buffer_refill_active),
             "buffer/size": self.learner.buffer.size,
+            "buffer/fill_ratio": self._resume_buffer_fill_ratio(),
+            "learner/update_enabled": float(
+                not self._resume_buffer_refill_active
+                and self.total_steps != self._resume_buffer_refill_completed_step
+            ),
             "reward/step_reward": float(getattr(self, "_last_step_reward", 0.0)),
             "reward/global_norm": float(getattr(self, "_last_g", 0.0)),
             "reward/local_norm": float(getattr(self, "_last_local_norm", 0.0)),
@@ -930,10 +1054,17 @@ class ClientAlgorithm(PerRailClientAlgorithm):
             self.total_steps += 1
             print(f"total step : {self.total_steps} (Buffer: {self.learner.buffer.size})")
 
-            if self.total_steps > self.config["update_after"]:
+            refill_completed_this_step = self._update_resume_buffer_refill_state()
+            learner_update_allowed = (
+                self.total_steps > self.config["update_after"]
+                and not self._resume_buffer_refill_active
+                and not refill_completed_this_step
+            )
+            if learner_update_allowed:
                 section_t0 = time.perf_counter()
                 self.learner.set_curriculum_scale(self._action_scale())
                 self.learner.learn()
+                self._resume_learning_started = True
                 self._t("learn", time.perf_counter() - section_t0)
                 if self.total_steps % 2 == 0:
                     print(
@@ -999,17 +1130,23 @@ class ClientAlgorithm(PerRailClientAlgorithm):
             and self.total_steps % 100 == 0
         ):
             section_t0 = time.perf_counter()
-            self._log_region_diagnostics(
-                pclient=pclient,
-                sorted_rail_ids=sorted_rail_ids,
-                views=current_views,
-                region_actions=region_actions,
-                rail_actions=rail_actions,
-                region_rewards=region_rewards,
-                cost_stats=cost_stats,
-                finite_action_ratio=finite_action_ratio,
-                done=done,
-            )
+            try:
+                self._log_region_diagnostics(
+                    pclient=pclient,
+                    sorted_rail_ids=sorted_rail_ids,
+                    views=current_views,
+                    region_actions=region_actions,
+                    rail_actions=rail_actions,
+                    region_rewards=region_rewards,
+                    cost_stats=cost_stats,
+                    finite_action_ratio=finite_action_ratio,
+                    done=done,
+                )
+            except FloatingPointError:
+                raise
+            except Exception as e:
+                # 진단은 관측용이다. 로깅 실패가 action 적용/학습 step을 무효화하면 안 된다.
+                print(f"[Region diagnostics] logging skipped: {e}")
             self._t("log", time.perf_counter() - section_t0)
 
         self._finish_timing_step(step_t0)
