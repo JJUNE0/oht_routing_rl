@@ -12,6 +12,7 @@ from cocel_rl.algorithms.contextual_td7 import (
     ContextualTD7Learner,
 )
 from cocel_rl.algorithms.contextual_td7.checkpoint import (
+    CHECKPOINT_VERSION,
     ContextualCheckpointError,
     load_contextual_checkpoint,
     save_contextual_checkpoint,
@@ -178,6 +179,67 @@ class ContextualCheckpointTests(unittest.TestCase):
                 source.critic.parameters(), restored.critic.parameters()
             ):
                 torch.testing.assert_close(left, right, rtol=0, atol=0)
+            source_q1 = dict(source.critic.q1.named_parameters())
+            source_q2 = dict(source.critic.q2.named_parameters())
+            restored_q1 = dict(restored.critic.q1.named_parameters())
+            restored_q2 = dict(restored.critic.q2.named_parameters())
+            for name in source_q1:
+                torch.testing.assert_close(
+                    source_q1[name], restored_q1[name], rtol=0, atol=0
+                )
+                torch.testing.assert_close(
+                    source_q2[name], restored_q2[name], rtol=0, atol=0
+                )
+            self.assertGreater(
+                restored.twin_parameter_diagnostics()[
+                    "critic/parameter_max_abs_diff"
+                ],
+                0.0,
+            )
+
+    def test_legacy_and_symmetric_checkpoint_resume_are_rejected(self):
+        learner, obs, reward = components()
+        with tempfile.TemporaryDirectory() as directory:
+            path = save_contextual_checkpoint(
+                Path(directory) / "checkpoint.pt", learner,
+                observation_builder=obs, reward_builder=reward,
+            )
+            payload = torch.load(path, weights_only=False)
+            legacy = dict(payload)
+            legacy["checkpoint_version"] = "contextual_td7_checkpoint_v2"
+            legacy_path = Path(directory) / "legacy.pt"
+            torch.save(legacy, legacy_path)
+            target, target_obs, target_reward = components(seed=99)
+            with self.assertRaisesRegex(
+                ContextualCheckpointError, "fresh independent twin-critic"
+            ):
+                load_contextual_checkpoint(
+                    legacy_path, target,
+                    observation_builder=target_obs,
+                    reward_builder=target_reward,
+                )
+
+            symmetric = dict(payload)
+            symmetric["checkpoint_version"] = CHECKPOINT_VERSION
+            symmetric["online_critic"] = {
+                key: value.clone()
+                for key, value in payload["online_critic"].items()
+            }
+            for key in list(symmetric["online_critic"]):
+                if key.startswith("q2."):
+                    symmetric["online_critic"][key] = symmetric[
+                        "online_critic"
+                    ]["q1." + key[3:]].clone()
+            symmetric_path = Path(directory) / "symmetric.pt"
+            torch.save(symmetric, symmetric_path)
+            with self.assertRaisesRegex(
+                ContextualCheckpointError, "symmetric twin-critic"
+            ):
+                load_contextual_checkpoint(
+                    symmetric_path, target,
+                    observation_builder=target_obs,
+                    reward_builder=target_reward,
+                )
 
     def test_hash_version_and_config_mismatch_rejected(self):
         learner, obs, reward = components()

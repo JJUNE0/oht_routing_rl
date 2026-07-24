@@ -14,6 +14,7 @@ import numpy as np
 import torch
 
 from cocel_rl.algorithms.contextual_td7 import (
+    ALGORITHM_VERSION,
     ContextualActor,
     ContextualLearnerConfig,
     ContextualNetworkConfig,
@@ -213,7 +214,10 @@ class ClientAlgorithm:
 
     @property
     def runtime_variant(self):
-        return f"{self.algorithm_variant}_{self.action_version}"
+        return (
+            f"{ALGORITHM_VERSION}_{self.algorithm_variant}_"
+            f"{self.action_version}"
+        )
 
     def _synchronize(self):
         if self.device.type == "cuda":

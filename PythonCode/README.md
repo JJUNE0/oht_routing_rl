@@ -106,6 +106,26 @@ checkpoints/<algorithm_variant>_<action_version>/
 
 run 이름과 config는 `contextual_wandb.py`의 `EXP_META`에서 생성됩니다.
 
+## Contextual twin-critic diagnostics
+
+`critic/q_abs_diff_mean` and `critic/q_abs_diff_max` are the mean and maximum
+absolute differences between Q1 and Q2 outputs for the current replay batch.
+`critic/q1_loss` and `critic/q2_loss` are the separate losses whose sum is
+`learner/critic_loss`. `critic/q1_grad_norm` and
+`critic/q2_grad_norm` are the finite, pre-clip L2 gradient norms of each
+Q-exclusive head.
+
+`critic/parameter_l2_distance` and
+`critic/parameter_max_abs_diff` compare corresponding trainable parameters in
+the Q1- and Q2-exclusive heads. They deliberately exclude the shared SALE
+state-action projection and the separately optimized contextual encoder.
+
+Actor metrics are stateful to avoid logging-interval/policy-delay aliasing.
+`learner/actor_updated_this_step` is the only current-step 0/1 flag.
+`learner/actor_loss_last`, `learner/actor_grad_norm_last`, and
+`learner/actor_last_update_step` retain the most recent real actor update, while
+`learner/actor_updates_total` is cumulative.
+
 ## 테스트
 
 ```powershell

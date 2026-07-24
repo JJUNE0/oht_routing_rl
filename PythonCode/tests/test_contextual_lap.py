@@ -62,6 +62,33 @@ class ContextualLAPTests(unittest.TestCase):
         with self.assertRaises(ContextualReplayError):
             replay.update_priorities([stale], [2.0])
 
+    def test_cached_priority_statistics_match_storage_and_duplicates_use_last(self):
+        replay = self.replay()
+        replay.push(make_snapshot(replay.topology, 0))
+        generation = int(replay._transition_generation[0])
+        key = ReplaySampleKey(0, generation, 3)
+        replay.update_priorities([key, key], [100.0, 10.0])
+        expected = max(10.0 ** replay.lap_alpha, replay.lap_min_priority)
+        self.assertAlmostEqual(
+            float(replay._priority[0, 3]), expected, places=6
+        )
+        self.assertAlmostEqual(
+            replay._priority_sum[0],
+            replay._priority[0].sum(dtype=np.float64),
+        )
+        self.assertAlmostEqual(
+            replay._priority_sq_sum[0],
+            np.square(replay._priority[0].astype(np.float64)).sum(),
+        )
+        diagnostics = replay.diagnostics()
+        active = replay._priority[replay._valid_transition_slots()]
+        self.assertAlmostEqual(
+            diagnostics["lap/priority_mean"], float(active.mean()), places=6
+        )
+        self.assertAlmostEqual(
+            diagnostics["lap/priority_std"], float(active.std()), places=6
+        )
+
     def test_uniform_mode_priority_update_is_explicit_error(self):
         topology = make_topology()
         replay = ContextualStepReplayBuffer(

@@ -89,6 +89,44 @@ class ContextualNetworkTests(unittest.TestCase):
         q2_ids = {id(parameter) for parameter in self.critic.q2.parameters()}
         self.assertTrue(q1_ids.isdisjoint(q2_ids))
 
+    def test_sale_twin_critics_are_independently_initialized(self):
+        torch.manual_seed(101)
+        critic = ContextualTwinCritic(
+            self.config, sale_embedding_dim=16, sale_feature_dim=16
+        )
+        q1 = dict(critic.q1.named_parameters())
+        q2 = dict(critic.q2.named_parameters())
+        self.assertEqual(q1.keys(), q2.keys())
+        self.assertTrue(
+            {id(value) for value in q1.values()}.isdisjoint(
+                {id(value) for value in q2.values()}
+            )
+        )
+        self.assertTrue(all(
+            left.untyped_storage().data_ptr()
+            != right.untyped_storage().data_ptr()
+            for left, right in zip(q1.values(), q2.values())
+        ))
+        max_difference = max(
+            float((q1[name] - q2[name]).detach().abs().max())
+            for name in q1
+        )
+        self.assertGreater(max_difference, 0.0)
+
+        batch = 7
+        state = torch.randn(batch, self.config.context_dim)
+        action = torch.randn(batch, self.config.action_dim).tanh()
+        sale_state = torch.randn(batch, 16)
+        sale_state_action = torch.randn(batch, 16)
+        output = critic(
+            state, action, sale_state, sale_state_action
+        )
+        self.assertTrue(torch.isfinite(output.q1).all())
+        self.assertTrue(torch.isfinite(output.q2).all())
+        self.assertGreater(
+            float((output.q1 - output.q2).detach().abs().mean()), 0.0
+        )
+
     def test_models_are_shared_across_batch_not_rail_specific(self):
         self.assertFalse(
             any("rail" in name.lower() for name, _ in self.actor.named_parameters())

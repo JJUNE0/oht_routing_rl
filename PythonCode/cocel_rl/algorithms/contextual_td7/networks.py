@@ -1,5 +1,4 @@
 from dataclasses import dataclass
-import copy
 
 import torch
 from torch import nn
@@ -256,6 +255,22 @@ class CriticHead(nn.Module):
         return self.network(state_action)
 
 
+def _sale_critic_head(input_dim: int, hidden_dim: int) -> nn.Sequential:
+    """Build one Q-exclusive SALE critic head.
+
+    Q1 and Q2 must call this constructor independently. Copying a head or its
+    state dict would preserve exact symmetry under the shared twin-Q loss.
+    """
+    return nn.Sequential(
+        nn.Linear(input_dim, hidden_dim),
+        nn.LayerNorm(hidden_dim),
+        nn.SiLU(),
+        nn.Linear(hidden_dim, hidden_dim),
+        nn.SiLU(),
+        nn.Linear(hidden_dim, 1),
+    )
+
+
 @dataclass(frozen=True)
 class TwinCriticOutput:
     q1: torch.Tensor
@@ -277,12 +292,12 @@ class ContextualTwinCritic(nn.Module):
                 sale_feature_dim,
             )
             input_dim = sale_feature_dim + 2 * sale_embedding_dim
-            self.q1 = nn.Sequential(
-                nn.Linear(input_dim, self.config.hidden_dim), nn.LayerNorm(self.config.hidden_dim),
-                nn.SiLU(), nn.Linear(self.config.hidden_dim, self.config.hidden_dim),
-                nn.SiLU(), nn.Linear(self.config.hidden_dim, 1),
+            self.q1 = _sale_critic_head(
+                input_dim, self.config.hidden_dim
             )
-            self.q2 = copy.deepcopy(self.q1)
+            self.q2 = _sale_critic_head(
+                input_dim, self.config.hidden_dim
+            )
         else:
             self.task_sa_projection = None
             self.q1 = CriticHead(self.config)

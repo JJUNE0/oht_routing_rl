@@ -5,6 +5,9 @@ from __future__ import annotations
 from datetime import datetime
 
 from cocel_rl.algorithms.contextual_td7 import (
+    ALGORITHM_VERSION,
+    CHECKPOINT_VERSION,
+    CRITIC_INITIALIZATION,
     LAP_VERSION,
     SALE_VERSION,
     contextual_algorithm_variant,
@@ -25,8 +28,13 @@ EXP_META = {
     "checkpoint_rng_version": "exploration_rng_v2",
     "send_cost_logging_version": "post_send_v2",
     "protocol_version": "single_end_time_v2",
-    "diagnostic_schema_version": "contextual_diag_v2",
+    "diagnostic_schema_version": "contextual_twin_critic_diag_v3",
     "centering": False,
+    "note": "twincritic",
+    "description": (
+        "Independent contextual TD7 twin-critic initialization and canonical "
+        "Q-divergence/actor-last-update diagnostics."
+    ),
 }
 
 
@@ -81,15 +89,22 @@ WANDB_METRIC_KEYS = (
     "replay/action_enabled_env_steps", "replay/reward_mean",
     "replay/reward_std", "replay/policy_action_std",
     "replay/applied_action_std", "replay/done_ratio",
-    "learner/critic_loss", "learner/actor_loss",
+    "learner/critic_loss",
+    "learner/actor_loss_last", "learner/actor_grad_norm_last",
+    "learner/actor_last_update_step", "learner/actor_updates_total",
+    "learner/actor_updated_this_step",
     "learner/encoder_joint_critic_loss",
     "learner/applied_action_scale",
     "learner/replay_policy_action_std",
     "learner/replay_applied_action_std",
     "learner/critic_action_matches_applied",
     "critic/q1_mean", "critic/q2_mean", "critic/q_min", "critic/q_max",
+    "critic/q_abs_diff_mean", "critic/q_abs_diff_max",
+    "critic/parameter_l2_distance", "critic/parameter_max_abs_diff",
+    "critic/q1_loss", "critic/q2_loss",
+    "critic/q1_grad_norm", "critic/q2_grad_norm",
     "critic/target_q_mean", "critic/td_error_mean", "critic/td_error_max",
-    "grad/encoder_norm", "grad/actor_norm", "grad/critic_norm",
+    "grad/encoder_norm", "grad/critic_norm",
     "update/learner_count", "update/actor_count", "update/target_count",
     "numeric/learner_finite_ratio",
     "sale/enabled", "sale/loss", "sale/zs_mean", "sale/zs_std",
@@ -124,9 +139,12 @@ def runtime_exp_meta(config) -> dict:
     lap = bool(config.lap_enabled)
     action_mode = str(config.action_mode)
     mode_version = action_version(action_mode)
-    meta["algorithm_version"] = (
+    meta["algorithm_version"] = ALGORITHM_VERSION
+    meta["algorithm_variant"] = (
         f"{contextual_algorithm_variant(sale, lap)}_{mode_version}"
     )
+    meta["critic_initialization"] = CRITIC_INITIALIZATION
+    meta["checkpoint_version"] = CHECKPOINT_VERSION
     meta["action_mode"] = action_mode
     meta["action_version"] = mode_version
     meta["sale"] = sale
@@ -150,11 +168,12 @@ def runtime_exp_meta(config) -> dict:
     meta["replay"] = (
         f"snapshot_{replay_mode}_{int(config.replay_capacity_env_steps)}"
     )
-    meta["note"] = f"contextual_sale{int(sale)}_lap{int(lap)}"
+    meta["note"] = f"twincritic_sale{int(sale)}_lap{int(lap)}"
     meta["description"] = (
         "Directional contextual TD7 with "
         f"SALE={'on' if sale else 'off'}, LAP={'on' if lap else 'off'}, "
         f"action_mode={action_mode}, critic_loss={config.critic_loss_mode}, "
+        "independently initialized Q1/Q2 heads, "
         f"reward C ({REWARD_VERSION}) control-space smoothing, "
         "single-field simulator end-time handshake, and fail-closed SimTime "
         "progress validation."

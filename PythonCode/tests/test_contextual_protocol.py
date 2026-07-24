@@ -1,10 +1,12 @@
+import json
+import tempfile
 import unittest
 from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import PClient
-from main_contextual import handle_command
+from main_contextual import SmokeReporter, handle_command
 
 
 class DummySocket:
@@ -13,6 +15,26 @@ class DummySocket:
 
 
 class ContextualProtocolTests(unittest.TestCase):
+    def test_smoke_reporter_keeps_bounded_rows_and_writes_periodically(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = f"{directory}/smoke.json"
+            reporter = SmokeReporter(path, "training", write_interval=10)
+            for step in range(25):
+                reporter.record_tick({
+                    "runtime/total_algorithm_ms": float(step),
+                    "runtime/send_cost_ms": 1.0,
+                    "runtime/nonfinite_count": 0.0,
+                })
+            self.assertFalse(hasattr(reporter, "rows"))
+            self.assertEqual(len(reporter.totals), 25)
+            with open(path, encoding="utf-8") as stream:
+                self.assertEqual(json.load(stream)["tick_count"], 20)
+            reporter.record_reset()
+            with open(path, encoding="utf-8") as stream:
+                payload = json.load(stream)
+            self.assertEqual(payload["tick_count"], 25)
+            self.assertEqual(payload["episode_reset_count"], 1)
+
     def test_pclient_sends_custom_end_time_once_per_handshake(self):
         noops = (
             "SendConnectMessage",

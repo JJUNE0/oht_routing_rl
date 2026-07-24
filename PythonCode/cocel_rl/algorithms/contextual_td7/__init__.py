@@ -1,4 +1,5 @@
 from .config import (
+    ALGORITHM_VERSION,
     ContextualLearnerConfig,
     ContextualNetworkConfig,
     contextual_algorithm_variant,
@@ -32,6 +33,7 @@ from .learner_types import ContextualLearnerUpdate
 from .targets import bellman_target, scale_policy_action, target_applied_action
 from .checkpoint import (
     CHECKPOINT_VERSION,
+    CRITIC_INITIALIZATION,
     ContextualCheckpointError,
     load_contextual_checkpoint,
     save_contextual_checkpoint,
@@ -47,6 +49,7 @@ from .sale import (
 
 __all__ = [
     "ActorOutput",
+    "ALGORITHM_VERSION",
     "ContextualActor",
     "ContextualEncoding",
     "ContextualNetworkConfig",
@@ -72,6 +75,7 @@ __all__ = [
     "scale_policy_action",
     "target_applied_action",
     "CHECKPOINT_VERSION",
+    "CRITIC_INITIALIZATION",
     "ContextualCheckpointError",
     "load_contextual_checkpoint",
     "save_contextual_checkpoint",

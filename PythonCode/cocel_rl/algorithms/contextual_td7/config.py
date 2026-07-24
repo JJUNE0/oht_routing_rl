@@ -3,6 +3,11 @@ from dataclasses import dataclass
 from contextual_action import ACTION_MODES, REGION_B_RL
 
 
+ALGORITHM_VERSION = (
+    "contextual_directional_td7_independent_twin_critic_v1"
+)
+
+
 def contextual_algorithm_variant(sale_enabled: bool, lap_enabled: bool) -> str:
     return {
         (True, True): "contextual_td7_sale_lap_v2",

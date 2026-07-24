@@ -31,6 +31,7 @@ class ContextualReplayError(RuntimeError):
 
 REPLAY_VERSION = "contextual_step_snapshot_uniform_v1"
 LAP_VERSION = "contextual_snapshot_lap_hierarchical_v1"
+LAP_PERFORMANCE_VERSION = "contextual_lap_cached_vectorized_v2"
 
 
 def _copy_array(name, values, shape, dtype=np.float32):
@@ -126,6 +127,22 @@ class ContextualStepReplayBuffer:
         self.action_version = str(action_version)
         self._priority = (
             np.zeros((self.capacity, self.controlled_count), np.float32)
+            if self.lap_enabled else None
+        )
+        self._priority_sum = (
+            np.zeros(self.capacity, np.float64)
+            if self.lap_enabled else None
+        )
+        self._priority_sq_sum = (
+            np.zeros(self.capacity, np.float64)
+            if self.lap_enabled else None
+        )
+        self._priority_min = (
+            np.zeros(self.capacity, np.float32)
+            if self.lap_enabled else None
+        )
+        self._priority_max = (
+            np.zeros(self.capacity, np.float32)
             if self.lap_enabled else None
         )
         self.max_priority = float(self.lap_min_priority)
@@ -283,6 +300,14 @@ class ContextualStepReplayBuffer:
         self._transition_valid[slot] = True
         if self.lap_enabled:
             self._priority[slot].fill(self.max_priority)
+            self._priority_sum[slot] = (
+                self.max_priority * self.controlled_count
+            )
+            self._priority_sq_sum[slot] = (
+                self.max_priority * self.max_priority * self.controlled_count
+            )
+            self._priority_min[slot] = self.max_priority
+            self._priority_max[slot] = self.max_priority
         self.push_count += 1
         return ReplaySampleKey(slot, generation, 0)
 
@@ -312,17 +337,56 @@ class ContextualStepReplayBuffer:
         return candidates[state_ok & next_ok]
 
     def validate_sample_keys(self, keys) -> None:
-        for key in keys:
-            valid = (
-                0 <= key.step_slot < self.capacity
-                and self._transition_valid[key.step_slot]
-                and self._transition_generation[key.step_slot] == key.generation
-                and 0 <= key.controlled_row < self.controlled_count
-                and key.step_slot in self._valid_transition_slots()
+        keys = tuple(keys)
+        if not keys:
+            return
+        slots = np.fromiter(
+            (key.step_slot for key in keys), dtype=np.int64, count=len(keys)
+        )
+        generations = np.fromiter(
+            (key.generation for key in keys), dtype=np.int64, count=len(keys)
+        )
+        rows = np.fromiter(
+            (key.controlled_row for key in keys),
+            dtype=np.int64,
+            count=len(keys),
+        )
+        in_bounds = (
+            (slots >= 0) & (slots < self.capacity)
+            & (rows >= 0) & (rows < self.controlled_count)
+        )
+        valid = in_bounds.copy()
+        bounded = np.flatnonzero(valid)
+        if bounded.size:
+            checked_slots = slots[bounded]
+            valid[bounded] &= (
+                self._transition_valid[checked_slots]
+                & (
+                    self._transition_generation[checked_slots]
+                    == generations[bounded]
+                )
             )
-            if not valid:
-                self.stale_key_reject_count += 1
-                raise ContextualReplayError(f"stale replay key: {key}")
+        bounded = np.flatnonzero(valid)
+        if bounded.size:
+            checked_slots = slots[bounded]
+            state_slots = self._state_slot[checked_slots]
+            next_slots = self._next_state_slot[checked_slots]
+            valid[bounded] &= (
+                self._state_valid[state_slots]
+                & (
+                    self._state_generation[state_slots]
+                    == self._state_gen_ref[checked_slots]
+                )
+                & self._state_valid[next_slots]
+                & (
+                    self._state_generation[next_slots]
+                    == self._next_state_gen_ref[checked_slots]
+                )
+            )
+        if not valid.all():
+            self.stale_key_reject_count += 1
+            bad = int(np.flatnonzero(~valid)[0])
+            raise ContextualReplayError(f"stale replay key: {keys[bad]}")
 
     def update_priorities(self, sample_keys, priorities) -> None:
         self.validate_sample_keys(sample_keys)
@@ -337,13 +401,42 @@ class ContextualStepReplayBuffer:
             np.power(np.maximum(values, 0.0), self.lap_alpha),
             self.lap_min_priority,
         ).astype(np.float32)
-        for key, value in zip(sample_keys, values):
-            self._priority[key.step_slot, key.controlled_row] = value
+        slots = np.fromiter(
+            (key.step_slot for key in sample_keys),
+            dtype=np.int64,
+            count=len(sample_keys),
+        )
+        rows = np.fromiter(
+            (key.controlled_row for key in sample_keys),
+            dtype=np.int64,
+            count=len(sample_keys),
+        )
+        # A sampled pair may occur more than once. Preserve the former
+        # sequential-update contract by retaining the last supplied value.
+        flat = slots * self.controlled_count + rows
+        _, reverse_positions = np.unique(flat[::-1], return_index=True)
+        positions = len(flat) - 1 - reverse_positions
+        slots = slots[positions]
+        rows = rows[positions]
+        values = values[positions]
+        old = self._priority[slots, rows].astype(np.float64)
+        values64 = values.astype(np.float64)
+        self._priority[slots, rows] = values
+        np.add.at(self._priority_sum, slots, values64 - old)
+        np.add.at(
+            self._priority_sq_sum,
+            slots,
+            np.square(values64) - np.square(old),
+        )
+        affected_slots = np.unique(slots)
+        affected = self._priority[affected_slots]
+        self._priority_min[affected_slots] = affected.min(axis=1)
+        self._priority_max[affected_slots] = affected.max(axis=1)
         valid_slots = self._valid_transition_slots()
         self.max_priority = (
             max(
                 self.lap_min_priority,
-                float(self._priority[valid_slots].max(initial=0.0)),
+                float(self._priority_max[valid_slots].max(initial=0.0)),
             )
             if valid_slots.size else self.lap_min_priority
         )
@@ -366,7 +459,7 @@ class ContextualStepReplayBuffer:
         # With replacement is explicit: any positive batch is allowed once one
         # environment snapshot exists.
         if self.lap_enabled:
-            step_sums = self._priority[valid_slots].sum(axis=1, dtype=np.float64)
+            step_sums = self._priority_sum[valid_slots]
             total_priority = float(step_sums.sum())
             if not np.isfinite(total_priority) or total_priority <= 0:
                 raise ContextualReplayError("invalid LAP total priority")
@@ -375,17 +468,24 @@ class ContextualStepReplayBuffer:
                 p=step_sums / total_priority,
             )
             controlled_rows = np.empty(int(batch_size), np.int64)
-            sample_probabilities = np.empty(int(batch_size), np.float64)
-            for index, slot in enumerate(transition_slots):
-                row_priority = self._priority[slot].astype(np.float64)
-                row_sum = float(row_priority.sum())
-                controlled_rows[index] = self.rng.choice(
-                    self.controlled_count, p=row_priority / row_sum
+            unique_slots, inverse = np.unique(
+                transition_slots, return_inverse=True
+            )
+            for group, slot in enumerate(unique_slots):
+                batch_rows = np.flatnonzero(inverse == group)
+                cdf = np.cumsum(
+                    self._priority[slot], dtype=np.float64
                 )
-                sample_probabilities[index] = (
-                    self._priority[slot, controlled_rows[index]]
-                    / total_priority
+                thresholds = self.rng.random(batch_rows.size) * cdf[-1]
+                controlled_rows[batch_rows] = np.searchsorted(
+                    cdf, thresholds, side="right"
                 )
+            sample_probabilities = (
+                self._priority[transition_slots, controlled_rows].astype(
+                    np.float64
+                )
+                / total_priority
+            )
         else:
             transition_slots = self.rng.choice(
                 valid_slots, size=int(batch_size), replace=True
@@ -547,7 +647,10 @@ class ContextualStepReplayBuffer:
         vectors = c * controlled_count * 3 * 4
         metadata = c * (7 * 8 + 4 + 1) + (2 * c) * (8 + 1)
         static_mapping = controlled_count * (1 + 2 * 10) * 8
-        priority = c * controlled_count * 4 if lap_enabled else 0
+        priority = (
+            c * controlled_count * 4 + c * (2 * 8 + 2 * 4)
+            if lap_enabled else 0
+        )
         return int(state + vectors + metadata + static_mapping + priority)
 
     @property
@@ -592,12 +695,25 @@ class ContextualStepReplayBuffer:
         }
         if self.lap_enabled:
             slots = self._valid_transition_slots()
-            active = self._priority[slots].reshape(-1)
+            count = slots.size * self.controlled_count
+            total = float(self._priority_sum[slots].sum())
+            total_sq = float(self._priority_sq_sum[slots].sum())
+            mean = total / count if count else 0.0
+            variance = (
+                max(0.0, total_sq / count - mean * mean)
+                if count else 0.0
+            )
             result.update({
-                "lap/priority_mean": float(active.mean()) if active.size else 0.0,
-                "lap/priority_std": float(active.std()) if active.size else 0.0,
-                "lap/priority_min": float(active.min()) if active.size else 0.0,
-                "lap/priority_max": float(active.max()) if active.size else 0.0,
+                "lap/priority_mean": mean,
+                "lap/priority_std": float(np.sqrt(variance)),
+                "lap/priority_min": (
+                    float(self._priority_min[slots].min())
+                    if slots.size else 0.0
+                ),
+                "lap/priority_max": (
+                    float(self._priority_max[slots].max())
+                    if slots.size else 0.0
+                ),
             })
         result.update(self._last_sample_diag)
         return result

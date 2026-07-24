@@ -20,7 +20,9 @@ from .targets import bellman_target, scale_policy_action, target_applied_action
 from .sale import SALEOnline, frozen_sale_copy
 
 
-LEARNER_VERSION = "contextual_td7_applied_action_contract_v3"
+LEARNER_VERSION = "contextual_td7_independent_twin_critic_v4"
+LEARNER_PERFORMANCE_VERSION = "contextual_td7_sparse_diagnostics_v1"
+DIAGNOSTICS_INTERVAL = 10
 
 
 def _observation_args(batch, *, next_state=False):
@@ -35,17 +37,11 @@ def _observation_args(batch, *, next_state=False):
     )
 
 
-def _grad_norm(parameters) -> float:
-    squares = []
-    for parameter in parameters:
-        if parameter.grad is not None:
-            gradient = parameter.grad.detach()
-            if not torch.isfinite(gradient).all():
-                raise FloatingPointError("non-finite gradient")
-            squares.append(torch.sum(gradient.double().square()))
-    if not squares:
-        return 0.0
-    return float(torch.sqrt(torch.stack(squares).sum()).cpu())
+def _clip_grad_norm(parameters, max_norm: float) -> float:
+    total = torch.nn.utils.clip_grad_norm_(
+        parameters, max_norm, error_if_nonfinite=True
+    )
+    return float(total.detach().cpu())
 
 
 def _parameter_distance(source, target) -> float:
@@ -54,6 +50,52 @@ def _parameter_distance(source, target) -> float:
         for left, right in zip(source.parameters(), target.parameters())
     ]
     return float(torch.sqrt(torch.stack(squares).sum()).cpu()) if squares else 0.0
+
+
+def _gradient_norm(parameters) -> float:
+    squares = [
+        torch.sum(parameter.grad.detach().double().square())
+        for parameter in parameters
+        if parameter.grad is not None
+    ]
+    return float(torch.sqrt(torch.stack(squares).sum()).cpu()) if squares else 0.0
+
+
+def _parameter_ids(parameters) -> set[int]:
+    return {id(parameter) for parameter in parameters}
+
+
+def _optimizer_parameter_ids(optimizer) -> tuple[list[int], set[int]]:
+    ordered = [
+        id(parameter)
+        for group in optimizer.param_groups
+        for parameter in group["params"]
+    ]
+    return ordered, set(ordered)
+
+
+def _twin_parameter_diagnostics(critic) -> dict[str, float]:
+    q1 = dict(critic.q1.named_parameters())
+    q2 = dict(critic.q2.named_parameters())
+    if q1.keys() != q2.keys():
+        raise RuntimeError("Q1/Q2 exclusive parameter schemas differ")
+    differences = [
+        (q1[name].detach().double() - q2[name].detach().double()).reshape(-1)
+        for name in q1
+    ]
+    if not differences:
+        raise RuntimeError("Q1/Q2 have no exclusive trainable parameters")
+    flattened = torch.cat(differences)
+    return {
+        # Q-specific trainable heads only; the shared SALE task projection and
+        # the external contextual encoder are intentionally excluded.
+        "critic/parameter_l2_distance": float(
+            torch.linalg.vector_norm(flattened).cpu()
+        ),
+        "critic/parameter_max_abs_diff": float(
+            flattened.abs().max().cpu()
+        ),
+    }
 
 
 class ContextualTD7Learner:
@@ -122,6 +164,7 @@ class ContextualTD7Learner:
             self.critic.parameters(), lr=self.config.critic_lr,
             eps=self.config.adam_eps,
         )
+        self._validate_optimizer_parameter_ownership()
         self.sale_optimizer = (
             torch.optim.Adam(
                 self.sale_online.parameters(), lr=self.config.sale_lr,
@@ -132,7 +175,18 @@ class ContextualTD7Learner:
         self.learner_update_count = 0
         self.actor_update_count = 0
         self.target_update_count = 0
+        self.last_actor_loss = 0.0
+        self.last_actor_grad_norm = 0.0
+        self.last_actor_update_step = 0
         self.last_diagnostics: dict[str, float] = {}
+        self._distance_diagnostics = {
+            "target/encoder_distance": 0.0,
+            "target/actor_distance": 0.0,
+            "target/critic_distance": 0.0,
+            "sale/fixed_online_distance": 0.0,
+            "sale/target_fixed_distance": 0.0,
+            **self.twin_parameter_diagnostics(),
+        }
         self.sale_update_count = 0
         self.sale_fixed_generation = 0
         self.current_target_q_min = float("inf")
@@ -140,6 +194,55 @@ class ContextualTD7Learner:
         self.fixed_target_q_min = float("inf")
         self.fixed_target_q_max = float("-inf")
         self.applied_action_scale = float(self.config.action_scale)
+
+    def optimizer_parameter_ownership(self) -> dict[str, set[int]]:
+        q1_ids = _parameter_ids(self.critic.q1.parameters())
+        q2_ids = _parameter_ids(self.critic.q2.parameters())
+        critic_ids = _parameter_ids(self.critic.parameters())
+        _, critic_optimizer_ids = _optimizer_parameter_ids(
+            self.critic_optimizer
+        )
+        return {
+            "q1": q1_ids,
+            "q2": q2_ids,
+            "shared_encoder": _parameter_ids(self.encoder.parameters()),
+            "critic_shared": critic_ids - q1_ids - q2_ids,
+            "critic_optimizer": critic_optimizer_ids,
+            "target_critic": _parameter_ids(
+                self.target_critic.parameters()
+            ),
+        }
+
+    def _validate_optimizer_parameter_ownership(self) -> None:
+        ownership = self.optimizer_parameter_ownership()
+        ordered, optimizer_ids = _optimizer_parameter_ids(
+            self.critic_optimizer
+        )
+        expected = (
+            ownership["q1"]
+            | ownership["q2"]
+            | ownership["critic_shared"]
+        )
+        if ownership["q1"] & ownership["q2"]:
+            raise RuntimeError("Q1 and Q2 share exclusive parameter objects")
+        if len(ordered) != len(optimizer_ids):
+            raise RuntimeError("critic optimizer contains duplicate parameters")
+        if optimizer_ids != expected:
+            raise RuntimeError(
+                "critic optimizer does not own every online critic parameter "
+                "exactly once"
+            )
+        if optimizer_ids & ownership["target_critic"]:
+            raise RuntimeError(
+                "target critic parameters must not belong to the optimizer"
+            )
+        if optimizer_ids & ownership["shared_encoder"]:
+            raise RuntimeError(
+                "contextual encoder is owned by its separate optimizer"
+            )
+
+    def twin_parameter_diagnostics(self) -> dict[str, float]:
+        return _twin_parameter_diagnostics(self.critic)
 
     def _sync(self):
         if self.device.type == "cuda":
@@ -232,10 +335,8 @@ class ContextualTD7Learner:
             sale_started = time.perf_counter()
             self.sale_optimizer.zero_grad(set_to_none=True)
             sale_loss.backward()
-            sale_grad = _grad_norm(self.sale_online.parameters())
-            torch.nn.utils.clip_grad_norm_(
-                self.sale_online.parameters(), self.config.encoder_grad_clip,
-                error_if_nonfinite=True,
+            sale_grad = _clip_grad_norm(
+                self.sale_online.parameters(), self.config.encoder_grad_clip
             )
             self.sale_optimizer.step()
             self._sync()
@@ -317,24 +418,21 @@ class ContextualTD7Learner:
             if self.config.resolved_critic_loss_mode == "huber"
             else F.mse_loss
         )
-        critic_loss = (
-            loss_function(q_pair.q1, target_q)
-            + loss_function(q_pair.q2, target_q)
-        )
+        q1_loss = loss_function(q_pair.q1, target_q)
+        q2_loss = loss_function(q_pair.q2, target_q)
+        critic_loss = q1_loss + q2_loss
         if not torch.isfinite(critic_loss):
             raise FloatingPointError("critic loss is non-finite")
         self.encoder_optimizer.zero_grad(set_to_none=True)
         self.critic_optimizer.zero_grad(set_to_none=True)
         critic_loss.backward()
-        encoder_grad = _grad_norm(self.encoder.parameters())
-        critic_grad = _grad_norm(self.critic.parameters())
-        torch.nn.utils.clip_grad_norm_(
-            self.encoder.parameters(), self.config.encoder_grad_clip,
-            error_if_nonfinite=True,
+        q1_grad = _gradient_norm(self.critic.q1.parameters())
+        q2_grad = _gradient_norm(self.critic.q2.parameters())
+        encoder_grad = _clip_grad_norm(
+            self.encoder.parameters(), self.config.encoder_grad_clip
         )
-        torch.nn.utils.clip_grad_norm_(
-            self.critic.parameters(), self.config.critic_grad_clip,
-            error_if_nonfinite=True,
+        critic_grad = _clip_grad_norm(
+            self.critic.parameters(), self.config.critic_grad_clip
         )
         self.encoder_optimizer.step()
         self.critic_optimizer.step()
@@ -360,10 +458,7 @@ class ContextualTD7Learner:
                 actor_state = self.encoder(
                     *_observation_args(batch), return_attention=False
                 ).state
-                actor_sale_zs = (
-                    self.sale_fixed.state(_observation_args(batch))
-                    if self.config.sale_enabled else None
-                )
+                actor_sale_zs = fixed_zs
             policy_output = self.actor(actor_state, actor_sale_zs)
             actor_applied = scale_policy_action(
                 policy_output.action, self.applied_action_scale
@@ -385,16 +480,17 @@ class ContextualTD7Learner:
             actor_loss = -q1_actor.mean() + pretanh_penalty
             self.actor_optimizer.zero_grad(set_to_none=True)
             actor_loss.backward()
-            actor_grad = _grad_norm(self.actor.parameters())
-            torch.nn.utils.clip_grad_norm_(
-                self.actor.parameters(), self.config.actor_grad_clip,
-                error_if_nonfinite=True,
+            actor_grad = _clip_grad_norm(
+                self.actor.parameters(), self.config.actor_grad_clip
             )
             self.actor_optimizer.step()
             for parameter, flag in zip(self.critic.parameters(), critic_flags):
                 parameter.requires_grad_(flag)
             self.actor_update_count += 1
             actor_loss_value = float(actor_loss.detach().cpu())
+            self.last_actor_loss = actor_loss_value
+            self.last_actor_grad_norm = actor_grad
+            self.last_actor_update_step = step
             policy_mean = float(policy_output.action.detach().mean().cpu())
             policy_std = float(policy_output.action.detach().std().cpu())
             applied_mean = float(actor_applied.detach().mean().cpu())
@@ -405,9 +501,37 @@ class ContextualTD7Learner:
         target_updated = step % self.config.target_update_interval == 0
         if target_updated:
             self._hard_update_targets()
+        if (
+            step == 1
+            or target_updated
+            or step % DIAGNOSTICS_INTERVAL == 0
+        ):
+            self._distance_diagnostics.update({
+                "target/encoder_distance": _parameter_distance(
+                    self.encoder, self.target_encoder
+                ),
+                "target/actor_distance": _parameter_distance(
+                    self.actor, self.target_actor
+                ),
+                "target/critic_distance": _parameter_distance(
+                    self.critic, self.target_critic
+                ),
+                "sale/fixed_online_distance": (
+                    _parameter_distance(self.sale_fixed, self.sale_online)
+                    if self.config.sale_enabled else 0.0
+                ),
+                "sale/target_fixed_distance": (
+                    _parameter_distance(
+                        self.sale_target_fixed, self.sale_fixed
+                    )
+                    if self.config.sale_enabled else 0.0
+                ),
+                **self.twin_parameter_diagnostics(),
+            })
 
         td1 = (q_pair.q1.detach() - target_q).abs()
         td2 = (q_pair.q2.detach() - target_q).abs()
+        q_abs_diff = (q_pair.q1.detach() - q_pair.q2.detach()).abs()
         finite_values = (
             critic_loss.detach(), q_pair.q1.detach(), q_pair.q2.detach(),
             target_q.detach(), td1, td2,
@@ -417,7 +541,13 @@ class ContextualTD7Learner:
         ).mean().cpu())
         diagnostics = {
             "learner/critic_loss": float(critic_loss.detach().cpu()),
-            "learner/actor_loss": actor_loss_value,
+            "learner/actor_loss_last": self.last_actor_loss,
+            "learner/actor_grad_norm_last": self.last_actor_grad_norm,
+            "learner/actor_last_update_step": float(
+                self.last_actor_update_step
+            ),
+            "learner/actor_updates_total": float(self.actor_update_count),
+            "learner/actor_updated_this_step": float(actor_updated),
             # The contextual encoder is optimized jointly by the critic
             # objective; there is no independent encoder loss.
             "learner/encoder_joint_critic_loss": float(
@@ -425,6 +555,12 @@ class ContextualTD7Learner:
             ),
             "critic/q1_mean": float(q_pair.q1.detach().mean().cpu()),
             "critic/q2_mean": float(q_pair.q2.detach().mean().cpu()),
+            "critic/q_abs_diff_mean": float(q_abs_diff.mean().cpu()),
+            "critic/q_abs_diff_max": float(q_abs_diff.max().cpu()),
+            "critic/q1_loss": float(q1_loss.detach().cpu()),
+            "critic/q2_loss": float(q2_loss.detach().cpu()),
+            "critic/q1_grad_norm": q1_grad,
+            "critic/q2_grad_norm": q2_grad,
             "critic/q_min": float(
                 torch.minimum(q_pair.q1, q_pair.q2).detach().min().cpu()
             ),
@@ -440,17 +576,8 @@ class ContextualTD7Learner:
                 torch.maximum(td1, td2).max().cpu()
             ),
             "grad/encoder_norm": encoder_grad,
-            "grad/actor_norm": actor_grad,
             "grad/critic_norm": critic_grad,
-            "target/encoder_distance": _parameter_distance(
-                self.encoder, self.target_encoder
-            ),
-            "target/actor_distance": _parameter_distance(
-                self.actor, self.target_actor
-            ),
-            "target/critic_distance": _parameter_distance(
-                self.critic, self.target_critic
-            ),
+            **self._distance_diagnostics,
             "update/learner_count": float(self.learner_update_count),
             "update/actor_count": float(self.actor_update_count),
             "update/target_count": float(self.target_update_count),
@@ -496,14 +623,6 @@ class ContextualTD7Learner:
             ),
             "timing/sale_forward_ms": sale_forward_ms,
             "timing/sale_backward_ms": sale_backward_ms,
-            "sale/fixed_online_distance": (
-                _parameter_distance(self.sale_fixed, self.sale_online)
-                if self.config.sale_enabled else 0.0
-            ),
-            "sale/target_fixed_distance": (
-                _parameter_distance(self.sale_target_fixed, self.sale_fixed)
-                if self.config.sale_enabled else 0.0
-            ),
             "lap/enabled": float(self.config.lap_enabled),
             "lap/td_error_mean": float(td_priority.mean().cpu()),
             "lap/td_error_max": float(td_priority.max().cpu()),

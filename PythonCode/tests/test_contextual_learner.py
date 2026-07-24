@@ -81,6 +81,21 @@ class ContextualLearnerTests(unittest.TestCase):
             for a, b in zip(online.parameters(), target.parameters()):
                 self.assertTrue(torch.equal(a, b))
                 self.assertIsNot(a, b)
+        for online_head, target_head in (
+            (learner.critic.q1, learner.target_critic.q1),
+            (learner.critic.q2, learner.target_critic.q2),
+        ):
+            for online, target in zip(
+                online_head.parameters(), target_head.parameters()
+            ):
+                torch.testing.assert_close(online, target, rtol=0, atol=0)
+                self.assertIsNot(online, target)
+        self.assertGreater(
+            learner.twin_parameter_diagnostics()[
+                "critic/parameter_max_abs_diff"
+            ],
+            0.0,
+        )
 
     def test_critic_encoder_actor_delay_and_hard_target_updates(self):
         learner = ContextualTD7Learner(
@@ -189,7 +204,12 @@ class ContextualLearnerTests(unittest.TestCase):
     def test_optimizer_parameter_ownership_is_disjoint(self):
         learner = ContextualTD7Learner(
             make_replay(), network_config=SMALL_NETWORK,
-            config=self.config(),
+            config=replace(
+                self.config(),
+                sale_enabled=True,
+                sale_embedding_dim=16,
+                sale_feature_dim=16,
+            ),
         )
         groups = []
         for optimizer in (
@@ -205,6 +225,99 @@ class ContextualLearnerTests(unittest.TestCase):
         self.assertFalse(groups[0] & groups[1])
         self.assertFalse(groups[0] & groups[2])
         self.assertFalse(groups[1] & groups[2])
+        ownership = learner.optimizer_parameter_ownership()
+        self.assertFalse(ownership["q1"] & ownership["q2"])
+        self.assertEqual(
+            ownership["critic_optimizer"],
+            ownership["q1"]
+            | ownership["q2"]
+            | ownership["critic_shared"],
+        )
+        self.assertFalse(
+            ownership["critic_optimizer"] & ownership["target_critic"]
+        )
+        self.assertFalse(
+            ownership["critic_optimizer"] & ownership["shared_encoder"]
+        )
+        self.assertGreater(len(ownership["critic_shared"]), 0)
+        for online_head, target_head in (
+            (learner.critic.q1, learner.target_critic.q1),
+            (learner.critic.q2, learner.target_critic.q2),
+        ):
+            for online, target in zip(
+                online_head.parameters(), target_head.parameters()
+            ):
+                torch.testing.assert_close(online, target, rtol=0, atol=0)
+                self.assertIsNot(online, target)
+        target_q1 = dict(learner.target_critic.q1.named_parameters())
+        target_q2 = dict(learner.target_critic.q2.named_parameters())
+        self.assertGreater(max(
+            float(
+                (target_q1[name] - target_q2[name])
+                .detach().abs().max()
+            )
+            for name in target_q1
+        ), 0.0)
+
+    def test_twin_gradients_outputs_and_parameters_remain_diverse(self):
+        learner = ContextualTD7Learner(
+            make_replay(), network_config=SMALL_NETWORK,
+            config=self.config(), seed=41,
+        )
+        initial = learner.twin_parameter_diagnostics()
+        self.assertGreater(initial["critic/parameter_l2_distance"], 0.0)
+        self.assertGreater(
+            initial["critic/parameter_max_abs_diff"], 0.0
+        )
+        result = learner.update()
+        diagnostics = result.diagnostics
+        for key in (
+            "critic/q_abs_diff_mean",
+            "critic/q_abs_diff_max",
+            "critic/q1_loss",
+            "critic/q2_loss",
+            "critic/q1_grad_norm",
+            "critic/q2_grad_norm",
+            "critic/parameter_l2_distance",
+            "critic/parameter_max_abs_diff",
+        ):
+            self.assertTrue(np.isfinite(diagnostics[key]), key)
+        self.assertGreater(diagnostics["critic/q_abs_diff_mean"], 0.0)
+        self.assertGreater(diagnostics["critic/q1_grad_norm"], 0.0)
+        self.assertGreater(diagnostics["critic/q2_grad_norm"], 0.0)
+        self.assertGreater(
+            diagnostics["critic/parameter_l2_distance"], 0.0
+        )
+
+    def test_actor_last_update_diagnostics_survive_non_actor_steps(self):
+        learner = ContextualTD7Learner(
+            make_replay(), network_config=SMALL_NETWORK,
+            config=self.config(), seed=43,
+        )
+        first = learner.update().diagnostics
+        self.assertEqual(
+            first["learner/actor_updated_this_step"], 0.0
+        )
+        self.assertEqual(first["learner/actor_updates_total"], 0.0)
+        second = learner.update().diagnostics
+        self.assertEqual(
+            second["learner/actor_updated_this_step"], 1.0
+        )
+        self.assertEqual(second["learner/actor_updates_total"], 1.0)
+        self.assertEqual(
+            second["learner/actor_last_update_step"], 2.0
+        )
+        third = learner.update().diagnostics
+        self.assertEqual(
+            third["learner/actor_updated_this_step"], 0.0
+        )
+        for key in (
+            "learner/actor_loss_last",
+            "learner/actor_grad_norm_last",
+            "learner/actor_last_update_step",
+            "learner/actor_updates_total",
+        ):
+            self.assertEqual(third[key], second[key])
 
     def test_target_q_bounds_roll_with_hard_target_generation(self):
         learner = ContextualTD7Learner(

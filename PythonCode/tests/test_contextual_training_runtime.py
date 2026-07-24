@@ -143,6 +143,33 @@ def training_runtime(**overrides):
 
 
 class ContextualTrainingRuntimeTests(unittest.TestCase):
+    def test_default_checkpoint_root_isolated_by_runtime_variant(self):
+        sale_lap_region = ClientAlgorithm(ContextualRuntimeConfig())
+        uniform_region = ClientAlgorithm(
+            ContextualRuntimeConfig(sale_enabled=False, lap_enabled=False)
+        )
+        sale_lap_residual = ClientAlgorithm(
+            ContextualRuntimeConfig(action_mode=EXP_RESIDUAL)
+        )
+
+        variants = {
+            sale_lap_region.runtime_variant,
+            uniform_region.runtime_variant,
+            sale_lap_residual.runtime_variant,
+        }
+        roots = {
+            sale_lap_region.checkpoint_root,
+            uniform_region.checkpoint_root,
+            sale_lap_residual.checkpoint_root,
+        }
+        self.assertEqual(len(variants), 3)
+        self.assertEqual(len(roots), 3)
+        for runtime in (
+            sale_lap_region, uniform_region, sale_lap_residual
+        ):
+            self.assertIn(runtime.algorithm_variant, runtime.runtime_variant)
+            self.assertIn(runtime.action_version, runtime.runtime_variant)
+
     def test_wandb_tick_is_logged_only_after_send_timing_is_recorded(self):
         runtime, pclient = training_runtime(
             warmup_steps=0, normalizer_freeze_steps=1,
@@ -549,6 +576,24 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
 
     def test_wandb_schema_matches_export_and_runtime_config(self):
         self.assertEqual(set(WANDB_METRIC_KEYS), set(EXPORT_COLUMNS) - {"_step"})
+        twin_metrics = {
+            "critic/q_abs_diff_mean",
+            "critic/q_abs_diff_max",
+            "critic/parameter_l2_distance",
+            "critic/parameter_max_abs_diff",
+            "critic/q1_loss",
+            "critic/q2_loss",
+            "critic/q1_grad_norm",
+            "critic/q2_grad_norm",
+            "learner/actor_loss_last",
+            "learner/actor_grad_norm_last",
+            "learner/actor_last_update_step",
+            "learner/actor_updates_total",
+            "learner/actor_updated_this_step",
+        }
+        self.assertTrue(twin_metrics <= set(WANDB_METRIC_KEYS))
+        self.assertNotIn("learner/actor_loss", WANDB_METRIC_KEYS)
+        self.assertNotIn("grad/actor_norm", WANDB_METRIC_KEYS)
         config = ContextualRuntimeConfig(
             mode="training", action_enabled=True, action_scale=0.05,
             wandb_enabled=True, device="cpu",
@@ -575,6 +620,11 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
         meta = runtime_exp_meta(config)
         self.assertEqual(captured["config"]["EXP_META"], meta)
         self.assertEqual(captured["notes"], meta["description"])
+        self.assertEqual(
+            meta["algorithm_version"],
+            "contextual_directional_td7_independent_twin_critic_v1",
+        )
+        self.assertEqual(meta["critic_initialization"], "independent")
         logger.log({"env/step": 3.0, "not/exported": 9.0}, 3)
         self.assertEqual(captured["payload"], {"env/step": 3.0})
         logger.finish_failed("boom", 3)

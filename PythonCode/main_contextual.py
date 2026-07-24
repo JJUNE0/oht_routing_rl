@@ -23,6 +23,7 @@ from contextual_action import ACTION_MODES, REGION_B_RL
 HOST = "127.0.0.1"
 PORT = 9100
 EXPECTED_SIMULATION_STATES = {0, 1, 2, 3, 4, 5, 6}
+RUNTIME_PERFORMANCE_VERSION = "contextual_runtime_bounded_reporting_v1"
 
 
 def parse_args():
@@ -81,6 +82,7 @@ def parse_args():
         "--critic-loss-mode", choices=("auto", "huber", "mse"), default="auto"
     )
     parser.add_argument("--wandb-log-interval", type=int, default=10)
+    parser.add_argument("--console-log-interval", type=int, default=100)
     parser.add_argument("--early-stop-queued-threshold", type=float, default=500.0)
     parser.add_argument("--early-stop-tat-threshold", type=float, default=500.0)
     parser.add_argument("--early-stop-min-episode-steps", type=int, default=100)
@@ -99,6 +101,12 @@ def parse_args():
         default=None,
         help="Continuously write aggregated live smoke metrics as JSON.",
     )
+    parser.add_argument(
+        "--smoke-report-interval",
+        type=int,
+        default=100,
+        help="Write the smoke summary every N active ticks.",
+    )
     return parser.parse_args()
 
 
@@ -112,16 +120,41 @@ def read_port(path="wpconfig.json"):
 
 
 class SmokeReporter:
-    def __init__(self, path, mode):
+    _MAX_KEYS = (
+        "cost/all_baseline_abs_error_max",
+        "boundary/cost_baseline_abs_error_max",
+        "runtime/observation_build_calls_per_tick",
+        "runtime/nonfinite_count",
+    )
+
+    def __init__(self, path, mode, write_interval=100):
+        if int(write_interval) <= 0:
+            raise ValueError("smoke report interval must be positive")
         self.path = Path(path)
         self.mode = mode
-        self.rows = []
+        self.write_interval = int(write_interval)
+        self.tick_count = 0
+        self.totals = []
+        self.last = {}
+        self.maxima = {key: 0.0 for key in self._MAX_KEYS}
         self.reset_count = 0
         self.socket_send_count = 0
 
     def record_tick(self, diagnostics):
-        self.rows.append(dict(diagnostics))
-        self._write()
+        self.tick_count += 1
+        self.last = dict(diagnostics)
+        total = (
+            self.last.get("runtime/total_algorithm_ms", np.nan)
+            + self.last.get("runtime/send_cost_ms", 0.0)
+        )
+        if np.isfinite(total):
+            self.totals.append(float(total))
+        for key in self._MAX_KEYS:
+            self.maxima[key] = max(
+                self.maxima[key], float(self.last.get(key, 0.0))
+            )
+        if self.tick_count % self.write_interval == 0:
+            self._write()
 
     def record_reset(self):
         self.reset_count += 1
@@ -131,19 +164,10 @@ class SmokeReporter:
         self.socket_send_count += 1
 
     def _write(self):
-        totals = np.asarray(
-            [
-                row.get("runtime/total_algorithm_ms", np.nan)
-                + row.get("runtime/send_cost_ms", 0.0)
-                for row in self.rows
-            ],
-            dtype=np.float64,
-        )
-        totals = totals[np.isfinite(totals)]
-        last = self.rows[-1] if self.rows else {}
+        totals = np.asarray(self.totals, dtype=np.float64)
         payload = {
             "mode": self.mode,
-            "tick_count": len(self.rows),
+            "tick_count": self.tick_count,
             "episode_reset_count": self.reset_count,
             "socket_send_count": self.socket_send_count,
             "runtime_total_ms": {
@@ -151,16 +175,8 @@ class SmokeReporter:
                 "p95": float(np.percentile(totals, 95)) if totals.size else None,
                 "p99": float(np.percentile(totals, 99)) if totals.size else None,
             },
-            "last": last,
-            "max": {
-                key: float(max(row.get(key, 0.0) for row in self.rows))
-                for key in (
-                    "cost/all_baseline_abs_error_max",
-                    "boundary/cost_baseline_abs_error_max",
-                    "runtime/observation_build_calls_per_tick",
-                    "runtime/nonfinite_count",
-                )
-            } if self.rows else {},
+            "last": self.last,
+            "max": dict(self.maxima) if self.tick_count else {},
         }
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(
@@ -169,7 +185,7 @@ class SmokeReporter:
         )
 
 
-def send_active_data(pclient, client, reporter=None):
+def send_active_data(pclient, client, reporter=None, log_interval=100):
     pclient.RecieveSimulationActiveData()
     client.Algorithm(pclient)
     started = time.perf_counter()
@@ -190,14 +206,15 @@ def send_active_data(pclient, client, reporter=None):
         if client.config.action_enabled and warmup_remaining == 0
         else "warmup"
     )
-    print(
-        "[main-contextual] "
-        f"step={step}, episode={client.episode_id}, "
-        f"episode_step={client.episode_steps}, action={action_state}, "
-        f"warmup_remaining={warmup_remaining}, "
-        f"replay_steps={replay_steps}, learner_updates={learner_updates}",
-        flush=True,
-    )
+    if step % int(log_interval) == 0:
+        print(
+            "[main-contextual] "
+            f"step={step}, episode={client.episode_id}, "
+            f"episode_step={client.episode_steps}, action={action_state}, "
+            f"warmup_remaining={warmup_remaining}, "
+            f"replay_steps={replay_steps}, learner_updates={learner_updates}",
+            flush=True,
+        )
 
 
 def handle_command(
@@ -206,10 +223,14 @@ def handle_command(
     client,
     reporter=None,
     sim_end_time=45_000,
+    console_log_interval=100,
 ):
     if command == 0:
-        pclient.WriteAdminLog("Contextual SendAndReceiveRailLineCost.")
-        send_active_data(pclient, client, reporter)
+        if client.total_steps % int(console_log_interval) == 0:
+            pclient.WriteAdminLog("Contextual SendAndReceiveRailLineCost.")
+        send_active_data(
+            pclient, client, reporter, log_interval=console_log_interval
+        )
     elif command == 1:
         pclient.WriteAdminLog("Contextual simulation end signal (v=1).")
         client.on_terminal()
@@ -253,6 +274,8 @@ def main():
     args = parse_args()
     if args.sim_end_time <= 0:
         raise ValueError("--sim-end-time must be positive")
+    if args.console_log_interval <= 0:
+        raise ValueError("--console-log-interval must be positive")
     config_kwargs = {
         "mode": args.mode,
         "action_enabled": args.action_enabled,
@@ -293,7 +316,9 @@ def main():
         config_kwargs["device"] = args.device
     client = ClientAlgorithm(ContextualRuntimeConfig(**config_kwargs))
     reporter = (
-        SmokeReporter(args.smoke_report, args.mode)
+        SmokeReporter(
+            args.smoke_report, args.mode, args.smoke_report_interval
+        )
         if args.smoke_report is not None
         else None
     )
@@ -333,13 +358,23 @@ def main():
                 print(HOST)
                 print(port)
                 pclient.WriteAdminLog("Socket 서버와 연결되었습니다. ")
+                command_count = 0
                 try:
                     while True:
-                        print(datetime.now().strftime("%Y.%m.%d - %H:%M:%S"))
-                        print("RecieveSimulationStandardData.")
-                        pclient.WriteAdminLog("RecieveSimulationStandardData.")
                         command = pclient.RecieveSimulationStandardData()
-                        print("v: ", command)
+                        command_count += 1
+                        if (
+                            command != 0
+                            or command_count % args.console_log_interval == 0
+                        ):
+                            print(datetime.now().strftime("%Y.%m.%d - %H:%M:%S"))
+                            print(
+                                "[main-contextual] "
+                                f"command={command}, count={command_count}"
+                            )
+                            pclient.WriteAdminLog(
+                                "RecieveSimulationStandardData."
+                            )
                         if command not in EXPECTED_SIMULATION_STATES:
                             pending = pclient.PeekPending(64)
                             preview = " ".join(
@@ -355,6 +390,7 @@ def main():
                             client,
                             reporter,
                             sim_end_time=args.sim_end_time,
+                            console_log_interval=args.console_log_interval,
                         )
                 except ContextualTrainingFailure:
                     raise
