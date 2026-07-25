@@ -45,7 +45,7 @@ def parse_args():
         default=0.05,
         help="Fixed applied-action scale for exp_residual mode only.",
     )
-    parser.add_argument("--curriculum-end-step", type=int, default=40_000)
+    parser.add_argument("--curriculum-end-step", type=int, default=20_000)
     parser.add_argument("--curriculum-scale-start", type=float, default=0.05)
     parser.add_argument("--curriculum-scale-end", type=float, default=1.0)
     parser.add_argument(
@@ -63,7 +63,7 @@ def parse_args():
     parser.add_argument("--normalizer-freeze-steps", type=int, default=10_000)
     parser.add_argument("--device", default=None)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--replay-capacity-env-steps", type=int, default=1_000)
+    parser.add_argument("--replay-capacity-env-steps", type=int, default=10_000)
     parser.add_argument("--batch-size", type=int, default=1_024)
     parser.add_argument("--minimum-replay-env-steps", type=int, default=100)
     parser.add_argument(

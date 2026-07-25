@@ -52,7 +52,7 @@ class ContextualRuntimeConfig:
     action_enabled: bool = False
     action_mode: str = REGION_B_RL
     action_scale: float = 0.05
-    curriculum_end_step: int = 40_000
+    curriculum_end_step: int = 20_000
     curriculum_scale_start: float = 0.05
     curriculum_scale_end: float = 1.0
     curriculum_shape: str = "geometric"
@@ -66,7 +66,7 @@ class ContextualRuntimeConfig:
     topology_audit_path: str | None = None
     exploration_noise_std: float = 0.10
     exploration_noise_clip: float = 0.20
-    replay_capacity_env_steps: int = 1_000
+    replay_capacity_env_steps: int = 10_000
     batch_size: int = 1_024
     minimum_replay_env_steps: int = 100
     minimum_action_enabled_env_steps: int = 100

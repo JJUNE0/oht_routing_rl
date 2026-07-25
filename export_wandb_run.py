@@ -3,10 +3,11 @@
 import argparse
 import csv
 
-from PythonCode.contextual_wandb import WANDB_METRIC_KEYS
+from PythonCode.contextual_wandb import EXP_META, WANDB_METRIC_KEYS
 
 
 EXPORT_COLUMNS = ("_step",) + WANDB_METRIC_KEYS
+EXPORT_SCHEMA_VERSION = EXP_META["diagnostic_schema_version"]
 
 
 def main():

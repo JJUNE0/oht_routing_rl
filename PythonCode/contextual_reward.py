@@ -12,7 +12,7 @@ from contextual_action import ACTION_MODES, EXP_RESIDUAL, REGION_B_RL
 from contextual_observation import RunningFeatureNormalizer
 from contextual_topology import ContextualTopology
 
-REWARD_VERSION = "contextual_controlled_reward_v3"
+REWARD_VERSION = "contextual_controlled_reward_v4_balanced_global_local"
 
 
 class ContextualRewardError(RuntimeError):
@@ -21,8 +21,8 @@ class ContextualRewardError(RuntimeError):
 
 @dataclass(frozen=True)
 class ContextualRewardConfig:
-    global_alpha: float = 0.7
-    local_alpha: float = 0.3
+    global_alpha: float = 0.5
+    local_alpha: float = 0.5
     rail_tat_weight: float = 1.0
     action_mode: str = REGION_B_RL
     smooth_b_rl_weight: float = 0.05

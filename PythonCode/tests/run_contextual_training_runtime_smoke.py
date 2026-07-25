@@ -20,8 +20,10 @@ EXP_META = {
     "action_version": "contextual_region_b_rl_v1",
     "cost_structure": "b_rl",
     "action_range": "0.0-1.0",
-    "reward_version": "C",
-    "reward_contract_version": "contextual_controlled_reward_v3",
+    "reward_version": "D",
+    "reward_contract_version": (
+        "contextual_controlled_reward_v4_balanced_global_local"
+    ),
     "centering": False,
     "note": "runtime_fake1500",
     "description": (

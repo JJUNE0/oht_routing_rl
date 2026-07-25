@@ -13,15 +13,17 @@ from cocel_rl.algorithms.contextual_td7 import (
     contextual_algorithm_variant,
 )
 from contextual_action import REGION_B_RL, action_version
-from contextual_reward import REWARD_VERSION
+from contextual_reward import ContextualRewardConfig, REWARD_VERSION
 
 EXP_META = {
     "cost_structure": "b_rl",
     "action_range": "b_rl_0.0-1.0",
     "topology": "directed_10in_10out_controlled_centers_v2",
     "observation": "contextual_obs_controlled_v1",
-    "reward_version": "C",
+    "reward_version": "D",
     "reward_contract_version": REWARD_VERSION,
+    "reward_global_alpha": 0.5,
+    "reward_local_alpha": 0.5,
     "action_scale": 0.05,
     "exploration_noise_std": 0.10,
     "resume_refill_version": "global_step_v2",
@@ -30,10 +32,11 @@ EXP_META = {
     "protocol_version": "single_end_time_v2",
     "diagnostic_schema_version": "contextual_twin_critic_diag_v3",
     "centering": False,
-    "note": "twincritic",
+    "note": "replay10000",
     "description": (
-        "Independent contextual TD7 twin-critic initialization and canonical "
-        "Q-divergence/actor-last-update diagnostics."
+        "Balanced global/local contextual reward D with a 10,000-step replay "
+        "horizon; runtime curriculum and variant details are generated from "
+        "the effective config."
     ),
 }
 
@@ -135,6 +138,7 @@ WANDB_METRIC_KEYS = (
 
 def runtime_exp_meta(config) -> dict:
     meta = dict(EXP_META)
+    reward_config = ContextualRewardConfig()
     sale = bool(config.sale_enabled)
     lap = bool(config.lap_enabled)
     action_mode = str(config.action_mode)
@@ -153,6 +157,12 @@ def runtime_exp_meta(config) -> dict:
     meta["lap_version"] = LAP_VERSION
     meta["critic_loss_mode"] = config.critic_loss_mode
     meta["action_scale"] = float(config.action_scale)
+    meta["reward_global_alpha"] = float(reward_config.global_alpha)
+    meta["reward_local_alpha"] = float(reward_config.local_alpha)
+    meta["curriculum_end_step"] = int(config.curriculum_end_step)
+    meta["replay_capacity_env_steps"] = int(
+        config.replay_capacity_env_steps
+    )
     if action_mode == REGION_B_RL:
         meta["cost_structure"] = "b_rl"
         meta["action_range"] = (
@@ -168,13 +178,17 @@ def runtime_exp_meta(config) -> dict:
     meta["replay"] = (
         f"snapshot_{replay_mode}_{int(config.replay_capacity_env_steps)}"
     )
-    meta["note"] = f"twincritic_sale{int(sale)}_lap{int(lap)}"
+    meta["note"] = f"replay{int(config.replay_capacity_env_steps)}"
     meta["description"] = (
         "Directional contextual TD7 with "
         f"SALE={'on' if sale else 'off'}, LAP={'on' if lap else 'off'}, "
         f"action_mode={action_mode}, critic_loss={config.critic_loss_mode}, "
         "independently initialized Q1/Q2 heads, "
-        f"reward C ({REWARD_VERSION}) control-space smoothing, "
+        f"reward D ({REWARD_VERSION}, global/local="
+        f"{reward_config.global_alpha:g}/{reward_config.local_alpha:g}), "
+        f"replay_capacity={int(config.replay_capacity_env_steps)}, "
+        f"curriculum_end_step={int(config.curriculum_end_step)}, "
+        "control-space smoothing, "
         "single-field simulator end-time handshake, and fail-closed SimTime "
         "progress validation."
     )
