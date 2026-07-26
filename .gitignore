@@ -15,6 +15,7 @@ __pycache__/
 
 PythonCode/log/
 PythonCode/checkpoints/
+PythonCode/results/
 PythonCode/wandb/
 PythonCode/*.db
 PythonCode/*.log

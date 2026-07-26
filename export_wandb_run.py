@@ -2,8 +2,15 @@
 
 import argparse
 import csv
+import sys
+from pathlib import Path
 
-from PythonCode.contextual_wandb import EXP_META, WANDB_METRIC_KEYS
+PROJECT_ROOT = Path(__file__).resolve().parent
+PYTHON_CODE_DIR = PROJECT_ROOT / "PythonCode"
+if str(PYTHON_CODE_DIR) not in sys.path:
+    sys.path.insert(0, str(PYTHON_CODE_DIR))
+
+from contextual_wandb import EXP_META, WANDB_METRIC_KEYS
 
 
 EXPORT_COLUMNS = ("_step",) + WANDB_METRIC_KEYS
@@ -19,7 +26,9 @@ def main():
 
     run = wandb.Api().run(args.run_path)
     rows = run.scan_history(keys=list(EXPORT_COLUMNS))
-    with open(args.output, "w", newline="", encoding="utf-8-sig") as stream:
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open("w", newline="", encoding="utf-8-sig") as stream:
         writer = csv.DictWriter(stream, fieldnames=EXPORT_COLUMNS)
         writer.writeheader()
         for row in rows:
