@@ -12,7 +12,11 @@ from cocel_rl.algorithms.contextual_td7 import (
     SALE_VERSION,
     contextual_algorithm_variant,
 )
-from contextual_action import REGION_B_RL, action_version
+from contextual_action import (
+    EXPLORATION_SCHEDULE_VERSION,
+    REGION_B_RL,
+    action_version,
+)
 from contextual_reward import ContextualRewardConfig, REWARD_VERSION
 
 EXP_META = {
@@ -26,17 +30,20 @@ EXP_META = {
     "reward_local_alpha": 0.5,
     "action_scale": 0.05,
     "exploration_noise_std": 0.10,
+    "exploration_noise_final_std": 0.02,
+    "exploration_noise_anneal_steps": 100_000,
+    "exploration_schedule_version": EXPLORATION_SCHEDULE_VERSION,
     "resume_refill_version": "global_step_v2",
     "checkpoint_rng_version": "exploration_rng_v2",
     "send_cost_logging_version": "post_send_v2",
     "protocol_version": "single_end_time_v2",
-    "diagnostic_schema_version": "contextual_twin_critic_diag_v3",
+    "diagnostic_schema_version": "contextual_action_temporal_diag_v4",
     "centering": False,
-    "note": "replay10000",
+    "note": "noiseanneal",
     "description": (
-        "Balanced global/local contextual reward D with a 10,000-step replay "
-        "horizon; runtime curriculum and variant details are generated from "
-        "the effective config."
+        "Separates deterministic-policy and exploratory temporal deltas while "
+        "linearly annealing exploration noise from 0.10 to 0.02 over 100,000 "
+        "post-warmup environment steps."
     ),
 }
 
@@ -58,7 +65,12 @@ WANDB_METRIC_KEYS = (
     "protocol/stale_sim_time_ticks",
     "action/policy_mean", "action/policy_std", "action/policy_min",
     "action/policy_max", "action/policy_saturation_ratio",
+    "action/policy_temporal_delta_mean",
+    "action/policy_temporal_delta_std",
     "action/exploratory_mean", "action/exploratory_std",
+    "action/exploratory_temporal_delta_mean",
+    "action/exploratory_temporal_delta_std",
+    "action/exploration_noise_std",
     "action/applied_mean", "action/applied_std",
     "action/applied_temporal_std",
     "action/applied_controlled_mean", "action/applied_controlled_std",
@@ -174,6 +186,17 @@ def runtime_exp_meta(config) -> dict:
         meta["cost_structure"] = "baseline_exp_residual"
         meta["action_range"] = f"{float(config.action_scale):g}-scaled"
     meta["exploration_noise_std"] = float(config.exploration_noise_std)
+    meta["exploration_noise_final_std"] = float(
+        min(config.exploration_noise_std, config.exploration_noise_final_std)
+    )
+    meta["exploration_noise_anneal_steps"] = int(
+        config.exploration_noise_anneal_steps
+    )
+    meta["exploration_noise_anneal_start_step"] = int(config.warmup_steps)
+    meta["exploration_noise_anneal_end_step"] = int(
+        config.warmup_steps + config.exploration_noise_anneal_steps
+    )
+    meta["exploration_schedule_version"] = EXPLORATION_SCHEDULE_VERSION
     replay_mode = "lap" if lap else "uniform"
     meta["replay"] = (
         f"snapshot_{replay_mode}_{int(config.replay_capacity_env_steps)}"
@@ -188,6 +211,10 @@ def runtime_exp_meta(config) -> dict:
         f"{reward_config.global_alpha:g}/{reward_config.local_alpha:g}), "
         f"replay_capacity={int(config.replay_capacity_env_steps)}, "
         f"curriculum_end_step={int(config.curriculum_end_step)}, "
+        f"exploration={float(config.exploration_noise_std):g}->"
+        f"{meta['exploration_noise_final_std']:g} over global steps "
+        f"{int(config.warmup_steps)}.."
+        f"{int(config.warmup_steps + config.exploration_noise_anneal_steps)}, "
         "control-space smoothing, "
         "single-field simulator end-time handshake, and fail-closed SimTime "
         "progress validation."
@@ -208,6 +235,12 @@ class ContextualWandbLogger:
         assert meta["action_scale"] == float(config.action_scale)
         assert meta["exploration_noise_std"] == float(
             config.exploration_noise_std
+        )
+        assert meta["exploration_noise_final_std"] == float(
+            min(
+                config.exploration_noise_std,
+                config.exploration_noise_final_std,
+            )
         )
         runtime_config = dict(vars(config))
         runtime_config["EXP_META"] = meta

@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import random
 import socket
 import sys
 import time
@@ -12,6 +13,7 @@ from pathlib import Path
 
 import PClient
 import numpy as np
+import torch
 from ClientAlgorithm_contextual import (
     ClientAlgorithm,
     ContextualRuntimeConfig,
@@ -24,6 +26,28 @@ HOST = "127.0.0.1"
 PORT = 9100
 EXPECTED_SIMULATION_STATES = {0, 1, 2, 3, 4, 5, 6}
 RUNTIME_PERFORMANCE_VERSION = "contextual_runtime_bounded_reporting_v1"
+
+
+def seed_everything(seed):
+    seed = int(seed)
+    if seed < 0:
+        raise ValueError("--seed must be non-negative")
+
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+    if hasattr(torch, "use_deterministic_algorithms"):
+        try:
+            torch.use_deterministic_algorithms(True, warn_only=True)
+        except TypeError:
+            torch.use_deterministic_algorithms(True)
 
 
 def parse_args():
@@ -57,7 +81,24 @@ def parse_args():
     parser.add_argument(
         "--smooth-exp-residual-weight", type=float, default=0.5
     )
-    parser.add_argument("--exploration-noise-std", type=float, default=0.10)
+    parser.add_argument(
+        "--exploration-noise-std",
+        type=float,
+        default=0.10,
+        help="Exploration noise std at global environment step 0.",
+    )
+    parser.add_argument(
+        "--exploration-noise-final-std",
+        type=float,
+        default=0.02,
+        help="Final exploration noise std after annealing.",
+    )
+    parser.add_argument(
+        "--exploration-noise-anneal-steps",
+        type=int,
+        default=100_000,
+        help="Post-warmup env steps over which noise reaches its final std.",
+    )
     parser.add_argument("--exploration-noise-clip", type=float, default=0.20)
     parser.add_argument("--warmup-steps", type=int, default=10_000)
     parser.add_argument("--normalizer-freeze-steps", type=int, default=10_000)
@@ -276,6 +317,7 @@ def main():
         raise ValueError("--sim-end-time must be positive")
     if args.console_log_interval <= 0:
         raise ValueError("--console-log-interval must be positive")
+    seed_everything(args.seed)
     config_kwargs = {
         "mode": args.mode,
         "action_enabled": args.action_enabled,
@@ -291,6 +333,10 @@ def main():
         "normalizer_freeze_steps": args.normalizer_freeze_steps,
         "seed": args.seed,
         "exploration_noise_std": args.exploration_noise_std,
+        "exploration_noise_final_std": args.exploration_noise_final_std,
+        "exploration_noise_anneal_steps": (
+            args.exploration_noise_anneal_steps
+        ),
         "exploration_noise_clip": args.exploration_noise_clip,
         "replay_capacity_env_steps": args.replay_capacity_env_steps,
         "batch_size": args.batch_size,
@@ -328,6 +374,11 @@ def main():
         f"action_mode={args.action_mode}, "
         f"action_scale={client._action_scale()}, "
         f"warmup_steps={args.warmup_steps}, "
+        f"exploration_noise={args.exploration_noise_std}->"
+        f"{min(args.exploration_noise_std, args.exploration_noise_final_std)}"
+        f"@global[{args.warmup_steps},"
+        f"{args.warmup_steps + args.exploration_noise_anneal_steps}], "
+        f"seed={args.seed}, "
         f"device={client.device}"
     )
 

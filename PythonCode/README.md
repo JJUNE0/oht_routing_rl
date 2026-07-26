@@ -51,6 +51,8 @@ cost               = base + w × c × b_rl
 저장소 루트에서:
 
 ```powershell
+conda activate aicc
+
 python .\PythonCode\main_contextual.py `
   --mode training `
   --action-enabled `
@@ -58,15 +60,28 @@ python .\PythonCode\main_contextual.py `
   --sale `
   --lap `
   --critic-loss-mode auto `
+  --seed 0 `
   --exploration-noise-std 0.10 `
+  --exploration-noise-final-std 0.02 `
+  --exploration-noise-anneal-steps 100000 `
+  --exploration-noise-clip 0.20 `
   --warmup-steps 10000 `
   --normalizer-freeze-steps 10000 `
+  --curriculum-end-step 20000 `
+  --curriculum-scale-start 0.05 `
+  --curriculum-scale-end 1.0 `
+  --curriculum-shape geometric `
+  --smooth-b-rl-weight 0.05 `
   --minimum-replay-env-steps 100 `
   --minimum-action-enabled-env-steps 100 `
-  --replay-capacity-env-steps 1000 `
+  --replay-capacity-env-steps 10000 `
   --batch-size 1024 `
+  --updates-per-env-step 1 `
+  --learn-every-env-steps 1 `
   --sim-end-time 45000 `
-  --wandb
+  --wandb `
+  --smoke-report .\contextual_training_noiseanneal_seed0.json `
+  --checkpoint-root .\checkpoints\contextual_noiseanneal_seed0
 ```
 
 실행 후 simulator GUI에서 Python 연동을 활성화하고 Run을 시작합니다.

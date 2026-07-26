@@ -13,6 +13,16 @@ if str(PYTHON_CODE_DIR) not in sys.path:
 from contextual_wandb import EXP_META, WANDB_METRIC_KEYS
 
 
+TEMPORAL_ACTION_COLUMNS = (
+    "action/policy_temporal_delta_mean",
+    "action/policy_temporal_delta_std",
+    "action/exploratory_temporal_delta_mean",
+    "action/exploratory_temporal_delta_std",
+    "action/exploration_noise_std",
+)
+if not set(TEMPORAL_ACTION_COLUMNS).issubset(WANDB_METRIC_KEYS):
+    raise RuntimeError("temporal action diagnostics are missing from W&B schema")
+
 EXPORT_COLUMNS = ("_step",) + WANDB_METRIC_KEYS
 EXPORT_SCHEMA_VERSION = EXP_META["diagnostic_schema_version"]
 

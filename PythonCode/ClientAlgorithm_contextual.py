@@ -28,6 +28,7 @@ from cocel_rl.algorithms.contextual_td7 import (
 from contextual_action import (
     ACTION_MODES,
     EXP_RESIDUAL,
+    EXPLORATION_SCHEDULE_VERSION,
     REGION_B_RL,
     action_version,
     apply_controlled_action,
@@ -65,6 +66,8 @@ class ContextualRuntimeConfig:
     topology_cache_path: str | None = None
     topology_audit_path: str | None = None
     exploration_noise_std: float = 0.10
+    exploration_noise_final_std: float = 0.02
+    exploration_noise_anneal_steps: int = 100_000
     exploration_noise_clip: float = 0.20
     replay_capacity_env_steps: int = 10_000
     batch_size: int = 1_024
@@ -118,13 +121,19 @@ class ContextualRuntimeConfig:
             or self.smooth_exp_residual_weight < 0
         ):
             raise ValueError("smooth penalty weights must be non-negative")
-        if not np.isfinite(self.exploration_noise_std) or self.exploration_noise_std < 0:
-            raise ValueError("exploration_noise_std must be finite and non-negative")
+        if (
+            not np.isfinite(self.exploration_noise_std)
+            or self.exploration_noise_std < 0
+            or not np.isfinite(self.exploration_noise_final_std)
+            or self.exploration_noise_final_std < 0
+        ):
+            raise ValueError("exploration noise stds must be finite and non-negative")
         positive = (
             self.replay_capacity_env_steps, self.batch_size,
             self.minimum_replay_env_steps,
             self.minimum_action_enabled_env_steps,
             self.updates_per_env_step, self.learn_every_env_steps,
+            self.exploration_noise_anneal_steps,
             self.latest_checkpoint_interval,
             self.periodic_checkpoint_interval, self.wandb_log_interval,
         )
@@ -174,6 +183,8 @@ class ClientAlgorithm:
         self.episode_steps = 0
         self.last_observation = None
         self.last_controlled_action = None
+        self.last_policy_action = None
+        self.last_exploratory_action = None
         self.last_diagnostics: dict[str, float] = {}
         self.reward_builder = None
         self.transition_aligner = None
@@ -414,6 +425,20 @@ class ClientAlgorithm:
             "curriculum_scale_end": self.config.curriculum_scale_end,
             "curriculum_shape": self.config.curriculum_shape,
             "exploration_noise_std": self.config.exploration_noise_std,
+            "exploration_noise_final_std": (
+                self.config.exploration_noise_final_std
+            ),
+            "exploration_noise_anneal_steps": (
+                self.config.exploration_noise_anneal_steps
+            ),
+            "exploration_noise_anneal_start_step": self.config.warmup_steps,
+            "exploration_noise_anneal_end_step": (
+                self.config.warmup_steps
+                + self.config.exploration_noise_anneal_steps
+            ),
+            "exploration_schedule_version": (
+                EXPLORATION_SCHEDULE_VERSION
+            ),
             "runtime_env_step": self.total_steps,
             "episode_id": self.episode_id,
             "action_enabled_env_steps": self.action_enabled_env_steps,
@@ -470,6 +495,8 @@ class ClientAlgorithm:
             )
         self.last_observation = None
         self.last_controlled_action = None
+        self.last_policy_action = None
+        self.last_exploratory_action = None
         self._last_sim_time = None
         self._stale_sim_time_ticks = 0
         if self.transition_aligner is not None:
@@ -481,6 +508,8 @@ class ClientAlgorithm:
         """Idempotently remove state that could create a post-failure transition."""
         self.last_observation = None
         self.last_controlled_action = None
+        self.last_policy_action = None
+        self.last_exploratory_action = None
         self._last_replay_summary = {}
         self._last_replay_push_ms = 0.0
         if self.transition_aligner is not None:
@@ -589,6 +618,8 @@ class ClientAlgorithm:
         self.episode_steps = 0
         self.last_observation = None
         self.last_controlled_action = None
+        self.last_policy_action = None
+        self.last_exploratory_action = None
         self.last_diagnostics = {}
         self._last_sim_time = None
         self._stale_sim_time_ticks = 0
@@ -667,6 +698,32 @@ class ClientAlgorithm:
         return float(
             scale_start * (scale_end / scale_start) ** progress
         )
+
+    def _exploration_noise_std(self) -> float:
+        start = float(self.config.exploration_noise_std)
+        if start == 0.0:
+            return 0.0
+        final = min(start, float(self.config.exploration_noise_final_std))
+        post_warmup_step = max(
+            0, self.total_steps - self.config.warmup_steps
+        )
+        progress = np.clip(
+            post_warmup_step / self.config.exploration_noise_anneal_steps,
+            0.0,
+            1.0,
+        )
+        return float(start + (final - start) * progress)
+
+    @staticmethod
+    def _temporal_delta(current, previous) -> tuple[float, float]:
+        if previous is None:
+            delta = np.zeros_like(current)
+        else:
+            previous = np.asarray(previous)
+            if previous.shape != current.shape:
+                raise RuntimeError("temporal action shape changed between ticks")
+            delta = current - previous
+        return float(delta.mean()), float(delta.std())
 
     def _cost_components(
         self, pclient
@@ -867,6 +924,7 @@ class ClientAlgorithm:
             )
             timing.update(inference_timing)
         controlled_action = deterministic_policy.copy()
+        exploration_noise_std = self._exploration_noise_std()
         should_apply = (
             self.config.action_enabled
             and self.total_steps >= self.config.warmup_steps
@@ -876,7 +934,7 @@ class ClientAlgorithm:
         if self.config.mode == "training" and should_apply:
             noise = self.exploration_rng.normal(
                 0.0,
-                self.config.exploration_noise_std,
+                exploration_noise_std,
                 size=controlled_action.shape,
             )
             noise = np.clip(
@@ -888,10 +946,18 @@ class ClientAlgorithm:
                 controlled_action + noise, -1.0, 1.0
             ).astype(np.float32)
 
+        policy_delta_mean, policy_delta_std = self._temporal_delta(
+            deterministic_policy, self.last_policy_action
+        )
+        exploratory_delta_mean, exploratory_delta_std = self._temporal_delta(
+            controlled_action, self.last_exploratory_action
+        )
         if not np.array_equal(
             observation.controlled_rail_ids, self.topology.controlled_rail_ids
         ):
             raise RuntimeError("actor action/control rail row alignment failed")
+        self.last_policy_action = deterministic_policy.copy()
+        self.last_exploratory_action = controlled_action.copy()
         self.last_controlled_action = controlled_action.copy()
         current_action_scale = self._action_scale()
         t0 = time.perf_counter()
@@ -997,8 +1063,13 @@ class ClientAlgorithm:
             "action/policy_saturation_ratio": float(
                 (np.abs(deterministic_policy) >= 0.999).mean()
             ),
+            "action/policy_temporal_delta_mean": policy_delta_mean,
+            "action/policy_temporal_delta_std": policy_delta_std,
             "action/exploratory_mean": float(controlled_action.mean()),
             "action/exploratory_std": float(controlled_action.std()),
+            "action/exploratory_temporal_delta_mean": exploratory_delta_mean,
+            "action/exploratory_temporal_delta_std": exploratory_delta_std,
+            "action/exploration_noise_std": exploration_noise_std,
             "action/applied_mean": float(applied_action.mean()),
             "action/applied_std": float(applied_action.std()),
             "action/applied_temporal_std": float(

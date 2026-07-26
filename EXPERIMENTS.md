@@ -612,3 +612,21 @@ architectural stabilization change is selected.
 - This follow-up changes reward balance, replay horizon, and curriculum
   duration together, so it is a multi-factor follow-up rather than a clean
   replay-only ablation.
+
+# 2026-07-26 - Exploration annealing and policy-jitter diagnostics
+
+- Action behavior version:
+  `contextual_exploration_linear_anneal_v1`. Training exploration noise now
+  remains at `0.10` through warm-up, then follows a linear schedule from
+  `0.10` at global step `warmup_steps` to `0.02` at global step
+  `warmup_steps + 100,000`, remaining at `0.02` afterward. Setting the initial
+  std to zero keeps exploration disabled for deterministic checkpoint
+  evaluation.
+- Diagnostic schema: `contextual_action_temporal_diag_v4`. Added separate
+  signed per-rail temporal-delta mean/std metrics for deterministic policy
+  action and clipped exploratory action, plus the effective exploration std.
+  Temporal state resets at episode, reconnect, and training-failure
+  boundaries.
+- Reward D, region `b_rl` mapping, replay contents, learner update equations,
+  SALE, and LAP are unchanged. No simulator or W&B run was launched for this
+  implementation change.

@@ -25,7 +25,7 @@ class ContextualRewardConfig:
     local_alpha: float = 0.5
     rail_tat_weight: float = 1.0
     action_mode: str = REGION_B_RL
-    smooth_b_rl_weight: float = 0.05
+    smooth_b_rl_weight: float = 0.5
     smooth_exp_residual_weight: float = 0.5
     tat_weight: float = 9.2
     op_weight: float = 5.0
