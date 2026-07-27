@@ -19,6 +19,7 @@ from ClientAlgorithm_contextual import (
     ContextualRuntimeConfig,
     ContextualTrainingFailure,
 )
+from cocel_rl.algorithms.contextual_td7 import read_contextual_runtime_config
 from contextual_action import ACTION_MODES, REGION_B_RL
 
 
@@ -26,6 +27,19 @@ HOST = "127.0.0.1"
 PORT = 9100
 EXPECTED_SIMULATION_STATES = {0, 1, 2, 3, 4, 5, 6}
 RUNTIME_PERFORMANCE_VERSION = "contextual_runtime_bounded_reporting_v1"
+RESUME_RUNTIME_CONFIG_VERSION = "contextual_resume_full_runtime_config_v1"
+RESUME_LAUNCH_CONTROL_FIELDS = {
+    "mode",
+    "action_enabled",
+    "device",
+    "topology_cache_path",
+    "topology_audit_path",
+    "checkpoint_root",
+    "resume_checkpoint_path",
+    "rail_tat_diagnostic_path",
+    "rail_tat_diagnostic_max_step",
+    "wandb_enabled",
+}
 
 
 def seed_everything(seed):
@@ -48,6 +62,30 @@ def seed_everything(seed):
             torch.use_deterministic_algorithms(True, warn_only=True)
         except TypeError:
             torch.use_deterministic_algorithms(True)
+
+
+def restore_checkpoint_runtime_config(config_kwargs, checkpoint_path):
+    """Apply saved experiment settings while preserving launch controls."""
+    saved, complete = read_contextual_runtime_config(checkpoint_path)
+    valid_fields = set(ContextualRuntimeConfig.__dataclass_fields__)
+    restored = []
+    for key, value in saved.items():
+        if key not in valid_fields or key in RESUME_LAUNCH_CONTROL_FIELDS:
+            continue
+        config_kwargs[key] = value
+        restored.append(key)
+    source = "full" if complete else "legacy-partial"
+    print(
+        "[checkpoint-config] "
+        f"version={RESUME_RUNTIME_CONFIG_VERSION}, source={source}, "
+        f"restored={','.join(sorted(restored)) or 'none'}"
+    )
+    if not complete:
+        print(
+            "[checkpoint-config] v3 checkpoint does not contain every runtime "
+            "setting; unavailable fields retain the current CLI/default value."
+        )
+    return config_kwargs
 
 
 def parse_args():
@@ -130,6 +168,24 @@ def parse_args():
     parser.add_argument("--max-stale-sim-time-ticks", type=int, default=5)
     parser.add_argument("--checkpoint-root", default=None)
     parser.add_argument("--resume-checkpoint", default=None)
+    parser.add_argument(
+        "--rail-tat-diagnostic",
+        default=None,
+        help=(
+            "Append rail-TAT completion diagnostics as JSON Lines. "
+            "Defaults to CHECKPOINT_ROOT/diagnostics/"
+            "rail_tat_completion.jsonl."
+        ),
+    )
+    parser.add_argument(
+        "--rail-tat-diagnostic-max-step",
+        type=int,
+        default=1_000,
+        help=(
+            "Write rail-TAT JSONL only while global_step is below this "
+            "exclusive cutoff. Zero disables event logging."
+        ),
+    )
     parser.add_argument(
         "--sim-end-time",
         type=int,
@@ -317,7 +373,6 @@ def main():
         raise ValueError("--sim-end-time must be positive")
     if args.console_log_interval <= 0:
         raise ValueError("--console-log-interval must be positive")
-    seed_everything(args.seed)
     config_kwargs = {
         "mode": args.mode,
         "action_enabled": args.action_enabled,
@@ -357,9 +412,18 @@ def main():
         "max_stale_sim_time_ticks": args.max_stale_sim_time_ticks,
         "checkpoint_root": args.checkpoint_root,
         "resume_checkpoint_path": args.resume_checkpoint,
+        "rail_tat_diagnostic_path": args.rail_tat_diagnostic,
+        "rail_tat_diagnostic_max_step": (
+            args.rail_tat_diagnostic_max_step
+        ),
     }
     if args.device:
         config_kwargs["device"] = args.device
+    if args.resume_checkpoint:
+        config_kwargs = restore_checkpoint_runtime_config(
+            config_kwargs, args.resume_checkpoint
+        )
+    seed_everything(config_kwargs["seed"])
     client = ClientAlgorithm(ContextualRuntimeConfig(**config_kwargs))
     reporter = (
         SmokeReporter(
@@ -373,13 +437,19 @@ def main():
         f"mode={args.mode}, action_enabled={args.action_enabled}, "
         f"action_mode={args.action_mode}, "
         f"action_scale={client._action_scale()}, "
-        f"warmup_steps={args.warmup_steps}, "
-        f"exploration_noise={args.exploration_noise_std}->"
-        f"{min(args.exploration_noise_std, args.exploration_noise_final_std)}"
-        f"@global[{args.warmup_steps},"
-        f"{args.warmup_steps + args.exploration_noise_anneal_steps}], "
-        f"seed={args.seed}, "
+        f"warmup_steps={client.config.warmup_steps}, "
+        f"exploration_noise={client.config.exploration_noise_std}->"
+        f"{min(client.config.exploration_noise_std, client.config.exploration_noise_final_std)}"
+        f"@global[{client.config.warmup_steps},"
+        f"{client.config.warmup_steps + client.config.exploration_noise_anneal_steps}], "
+        f"seed={client.config.seed}, "
         f"device={client.device}"
+    )
+    print(
+        "[main-contextual] rail_tat_diagnostic="
+        f"{client.rail_tat_diagnostic_path}, "
+        f"global_step<"
+        f"{client.config.rail_tat_diagnostic_max_step}"
     )
 
     port = read_port()

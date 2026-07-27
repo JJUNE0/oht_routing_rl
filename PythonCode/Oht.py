@@ -1,4 +1,17 @@
 
+from enum import IntEnum
+
+
+class OHTState(IntEnum):
+    IDLE = 0
+    STAGE = 1
+    MOVE_TO_LOAD = 2
+    LOADING = 3
+    MOVE_TO_UNLOAD = 4
+    UNLOADING = 5
+    NULL = 6
+
+
 class Oht:
     # OHT의 ID
     ID = 0
@@ -6,7 +19,7 @@ class Oht:
     # OHT의 State
     # 0: IDLE, 1: STAGE, 2: MOVE_TO_LOAD, 3: LOADING, 4: MOVE_TO_UNLOAD, 5:
     # UNLOADING, 6: NULL 6은 사용 x
-    State = 0
+    State = int(OHTState.IDLE)
 
     # RailLine 시작점에서 OHT의 현재 위치까지의 거리
     CurrentDistance = -1

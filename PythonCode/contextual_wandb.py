@@ -24,7 +24,7 @@ EXP_META = {
     "action_range": "b_rl_0.0-1.0",
     "topology": "directed_10in_10out_controlled_centers_v2",
     "observation": "contextual_obs_controlled_v1",
-    "reward_version": "D",
+    "reward_version": "E",
     "reward_contract_version": REWARD_VERSION,
     "reward_global_alpha": 0.5,
     "reward_local_alpha": 0.5,
@@ -37,13 +37,13 @@ EXP_META = {
     "checkpoint_rng_version": "exploration_rng_v2",
     "send_cost_logging_version": "post_send_v2",
     "protocol_version": "single_end_time_v2",
-    "diagnostic_schema_version": "contextual_action_temporal_diag_v4",
+    "diagnostic_schema_version": "contextual_rail_tat_diag_v6",
     "centering": False,
-    "note": "noiseanneal",
+    "note": "railtatv7",
     "description": (
-        "Separates deterministic-policy and exploratory temporal deltas while "
-        "linearly annealing exploration noise from 0.10 to 0.02 over 100,000 "
-        "post-warmup environment steps."
+        "Rail-TAT v7 treats 5->3 as completion/restart, sums OHTTat segments "
+        "across JobID resets, and attributes only packet-to-packet rail-time "
+        "deltas after each OHT cycle boundary."
     ),
 }
 
@@ -90,7 +90,9 @@ WANDB_METRIC_KEYS = (
     "reward/smooth_control_delta_mean", "reward/smooth_control_delta_max",
     "reward/step_reward", "reward/global_norm", "reward/local_norm",
     "reward/rail_tat", "reward/rail_tat_event_count",
-    "reward/rail_tat_sum", "reward/rail_tat_mean", "reward/rail_tat_max",
+    "reward/rail_tat_sum", "reward/rail_tat_mean",
+    "reward/rail_tat_vector_mean", "reward/rail_tat_event_mean",
+    "reward/rail_tat_max",
     "reward/alpha", "reward/marg_tat", "reward/backlog",
     "reward/smooth_mean",
     "curriculum/action_scale",
@@ -201,13 +203,12 @@ def runtime_exp_meta(config) -> dict:
     meta["replay"] = (
         f"snapshot_{replay_mode}_{int(config.replay_capacity_env_steps)}"
     )
-    meta["note"] = f"replay{int(config.replay_capacity_env_steps)}"
     meta["description"] = (
-        "Directional contextual TD7 with "
+        f"{EXP_META['description']} Directional contextual TD7 with "
         f"SALE={'on' if sale else 'off'}, LAP={'on' if lap else 'off'}, "
         f"action_mode={action_mode}, critic_loss={config.critic_loss_mode}, "
         "independently initialized Q1/Q2 heads, "
-        f"reward D ({REWARD_VERSION}, global/local="
+        f"reward E ({REWARD_VERSION}, global/local="
         f"{reward_config.global_alpha:g}/{reward_config.local_alpha:g}), "
         f"replay_capacity={int(config.replay_capacity_env_steps)}, "
         f"curriculum_end_step={int(config.curriculum_end_step)}, "

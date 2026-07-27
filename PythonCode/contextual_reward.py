@@ -2,17 +2,28 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Mapping
+from typing import Callable, Mapping
 
 import numpy as np
 
+from Oht import OHTState
 from contextual_action import ACTION_MODES, EXP_RESIDUAL, REGION_B_RL
 from contextual_observation import RunningFeatureNormalizer
 from contextual_topology import ContextualTopology
 
-REWARD_VERSION = "contextual_controlled_reward_v4_balanced_global_local"
+REWARD_VERSION = (
+    "contextual_controlled_reward_v7_oht_cycle_segments_boundary_delta"
+)
+
+ACTIVE_OHT_CYCLE_STATES = frozenset({
+    int(OHTState.MOVE_TO_LOAD),
+    int(OHTState.LOADING),
+    int(OHTState.MOVE_TO_UNLOAD),
+    int(OHTState.UNLOADING),
+})
 
 
 class ContextualRewardError(RuntimeError):
@@ -73,6 +84,7 @@ class ControlledRewardBatch:
     local_normalized: np.ndarray
     local_component: np.ndarray
     rail_tat_penalty: np.ndarray
+    rail_tat_event_count: int
     smooth_control_delta: np.ndarray
     smooth_penalty: np.ndarray
     controlled_rail_ids: np.ndarray
@@ -82,6 +94,97 @@ class ControlledRewardBatch:
     episode_id: int
 
 
+@dataclass
+class OHTCycleTracker:
+    oht_id: int
+    cycle_active: bool = False
+    bootstrapped: bool = False
+    cycle_start_step: int | None = None
+    previous_state: int | None = None
+    current_state: int | None = None
+    latest_job_id: int = 0
+    previous_job_ids: set[int] = field(default_factory=set)
+    closed_segment_oht_tat_sum: float = 0.0
+    current_segment_last_valid_oht_tat: float | None = None
+    current_segment_last_state5_oht_tat: float | None = None
+    current_segment_job_id: int = 0
+    tat_segment_count: int = 0
+    cycle_tat_valid: bool = True
+    last_valid_cmd_tat: float | None = None
+    last_tat_skip_reason: str | None = None
+    rail_time_by_id: dict[int, float] = field(default_factory=dict)
+    route_count: int = 0
+    route_time: float = 0.0
+    pass_delta_count: int = 0
+    boundary_carry_count: int = 0
+    boundary_carry_time: float = 0.0
+    boundary_time_subtracted: float = 0.0
+    ambiguous_pass_count: int = 0
+    invalid_pass_delta_count: int = 0
+
+    def clear_cycle(self) -> None:
+        self.cycle_active = False
+        self.bootstrapped = False
+        self.cycle_start_step = None
+        self.closed_segment_oht_tat_sum = 0.0
+        self.current_segment_last_valid_oht_tat = None
+        self.current_segment_last_state5_oht_tat = None
+        self.current_segment_job_id = 0
+        self.tat_segment_count = 0
+        self.cycle_tat_valid = True
+        self.last_valid_cmd_tat = None
+        self.last_tat_skip_reason = None
+        self.rail_time_by_id.clear()
+        self.route_count = 0
+        self.route_time = 0.0
+        self.pass_delta_count = 0
+        self.boundary_carry_count = 0
+        self.boundary_carry_time = 0.0
+        self.boundary_time_subtracted = 0.0
+        self.ambiguous_pass_count = 0
+        self.invalid_pass_delta_count = 0
+
+    @property
+    def last_valid_oht_tat(self) -> float | None:
+        """Compatibility alias used by diagnostics and older tests."""
+        return self.current_segment_last_valid_oht_tat
+
+    @property
+    def last_unloading_oht_tat(self) -> float | None:
+        """Compatibility alias used by diagnostics and older tests."""
+        return self.current_segment_last_state5_oht_tat
+
+
+@dataclass
+class RailPassTemporalTracker:
+    """Packet-to-packet state for one OHT's current rail occurrence."""
+
+    inflight_rail_id: int | None = None
+    inflight_state: int | None = None
+    inflight_elapsed: float | None = None
+
+    def clear(self) -> None:
+        self.inflight_rail_id = None
+        self.inflight_state = None
+        self.inflight_elapsed = None
+
+
+@dataclass(frozen=True)
+class CycleRewardOutcome:
+    reward_applied: bool
+    skip_reason: str | None
+    effective_oht_tat: float | None = None
+    signed_excess: float | None = None
+    cycle_reward_unclipped: float = 0.0
+    cycle_reward_clipped: float = 0.0
+    reward_rail_count: int = 0
+    controlled_reward_count: int = 0
+    uncontrolled_reward_count: int = 0
+    reward_sum: float = 0.0
+    reward_min: float = 0.0
+    reward_max: float = 0.0
+
+
 class ContextualRewardBuilder:
     """Build one reward row per controlled rail from the post-action snapshot."""
 
@@ -89,9 +192,31 @@ class ContextualRewardBuilder:
         self,
         topology: ContextualTopology,
         config: ContextualRewardConfig | None = None,
+        *,
+        completion_diagnostic_path: str | Path | None = None,
+        global_step_provider: Callable[[], int] | None = None,
+        completion_diagnostic_max_global_step: int | None = None,
     ):
         self.topology = topology
         self.config = config or ContextualRewardConfig()
+        self.completion_diagnostic_path = (
+            Path(completion_diagnostic_path)
+            if completion_diagnostic_path is not None
+            else None
+        )
+        self._global_step_provider = global_step_provider
+        self.completion_diagnostic_max_global_step = (
+            int(completion_diagnostic_max_global_step)
+            if completion_diagnostic_max_global_step is not None
+            else None
+        )
+        if (
+            self.completion_diagnostic_max_global_step is not None
+            and self.completion_diagnostic_max_global_step < 0
+        ):
+            raise ValueError(
+                "completion_diagnostic_max_global_step must be non-negative"
+            )
         self.local_normalizer = RunningFeatureNormalizer(
             1, epsilon=self.config.normalizer_epsilon, clip=self.config.local_clip
         )
@@ -99,7 +224,8 @@ class ContextualRewardBuilder:
             1, epsilon=self.config.normalizer_epsilon, clip=self.config.global_clip
         )
         self.reward_steps = 0
-        self._oht_route_accum: dict[int, list[tuple[int, float]]] = {}
+        self._oht_cycle_trackers: dict[int, OHTCycleTracker] = {}
+        self._rail_pass_trackers: dict[int, RailPassTemporalTracker] = {}
         self._reset_temporal()
 
     def _reset_temporal(self) -> None:
@@ -108,7 +234,9 @@ class ContextualRewardBuilder:
         self._prev_tat_sum = 0.0
         self._prev_op_rate: float | None = None
         self._tat_ema = 0.0
-        self._oht_route_accum.clear()
+        self._last_rail_tat_event_count = 0
+        self._oht_cycle_trackers.clear()
+        self._rail_pass_trackers.clear()
 
     def reset_episode(self) -> None:
         """Clear only episode-temporal state; training statistics persist."""
@@ -197,46 +325,984 @@ class ContextualRewardBuilder:
             raise ContextualRewardError("local reward input contains NaN or Inf")
         return result
 
-    def _rail_tat(self, pclient) -> np.ndarray:
+    def _rail_tat(
+        self,
+        pclient,
+        *,
+        env_step: int,
+        episode_id: int = 0,
+    ) -> np.ndarray:
         credit: dict[int, float] = {}
+        event_count = 0
         for oht_id, oht in getattr(pclient, "OHT_DIC", {}).items():
-            route = self._oht_route_accum.setdefault(int(oht_id), [])
-            for pass_time in (getattr(oht, "PassTimes", None) or []):
-                rail_id = int(getattr(pass_time, "ID"))
-                elapsed = float(getattr(pass_time, "PassTime"))
-                if not np.isfinite(elapsed):
-                    raise ContextualRewardError("rail pass time contains NaN or Inf")
-                route.append((rail_id, elapsed))
-            completions = getattr(oht, "CmdCompleteTat", None)
-            if not completions:
+            oht_id = int(oht_id)
+            current_state = int(getattr(oht, "State", OHTState.NULL))
+            current_job_id = int(getattr(oht, "JobID", 0) or 0)
+            pass_times = list(getattr(oht, "PassTimes", None) or [])
+            not_pass_times = list(getattr(oht, "NotPassTimes", None) or [])
+            entries = self._oht_tat_entries(oht)
+            selected, selection_reason = self._select_oht_tat_entry(oht, entries)
+            current_oht_tat = self._finite_positive_attr(selected, "OHTTat")
+            current_cmd_tat = self._finite_positive_attr(selected, "CmdTat")
+            tracker = self._oht_cycle_trackers.get(oht_id)
+
+            if tracker is None:
+                tracker = OHTCycleTracker(
+                    oht_id=oht_id,
+                    previous_state=current_state,
+                    current_state=current_state,
+                    latest_job_id=current_job_id,
+                )
+                self._oht_cycle_trackers[oht_id] = tracker
+                self._rail_pass_trackers[oht_id] = RailPassTemporalTracker()
+                if current_state in ACTIVE_OHT_CYCLE_STATES:
+                    self._start_oht_cycle(
+                        tracker,
+                        env_step=env_step,
+                        state=current_state,
+                        job_id=current_job_id,
+                        bootstrapped=True,
+                    )
+                    self._consume_rail_snapshot(
+                        oht_id,
+                        pass_times,
+                        not_pass_times,
+                        tracker,
+                        boundary=True,
+                        env_step=env_step,
+                        episode_id=episode_id,
+                    )
+                    self._update_cycle_tat(
+                        tracker,
+                        current_state,
+                        current_oht_tat,
+                        current_cmd_tat,
+                        selection_reason,
+                    )
+                    self._write_cycle_diagnostic(
+                        "oht_cycle_bootstrapped",
+                        env_step=env_step,
+                        episode_id=episode_id,
+                        tracker=tracker,
+                        previous_state=current_state,
+                        current_state=current_state,
+                        previous_job_id=current_job_id,
+                        current_job_id=current_job_id,
+                        current_oht_tat=current_oht_tat,
+                        current_cmd_tat=current_cmd_tat,
+                        entries=entries,
+                        reward_applied=False,
+                        skip_reason=selection_reason,
+                    )
+                else:
+                    self._consume_rail_snapshot(
+                        oht_id,
+                        pass_times,
+                        not_pass_times,
+                        None,
+                        boundary=False,
+                        env_step=env_step,
+                        episode_id=episode_id,
+                    )
                 continue
-            total_time = sum(elapsed for _, elapsed in route)
-            values = completions.values() if hasattr(completions, "values") else completions
-            for completion in values:
-                cmd_tat = float(getattr(completion, "CmdTat", 0) or 0)
-                if cmd_tat <= 0:
-                    continue
-                excess = (cmd_tat - self.config.tat_reference) / self.config.tat_reference
-                if route and total_time > 0:
-                    for rail_id, elapsed in route:
-                        credit[rail_id] = credit.get(rail_id, 0.0) + excess * (
-                            elapsed / total_time
+
+            previous_state = int(tracker.current_state)
+            previous_job_id = int(tracker.latest_job_id)
+            tracker.previous_state = previous_state
+            tracker.current_state = current_state
+
+            # A state-5 boundary owns the previous cycle. Current state-2/3
+            # values must not overwrite its final TAT or ledger.
+            if (
+                previous_state == int(OHTState.UNLOADING)
+                and current_state
+                in {
+                    int(OHTState.IDLE),
+                    int(OHTState.MOVE_TO_LOAD),
+                    int(OHTState.LOADING),
+                }
+            ):
+                restarting = current_state in {
+                    int(OHTState.MOVE_TO_LOAD),
+                    int(OHTState.LOADING),
+                }
+                old_passes, new_passes, ambiguous = (
+                    self._split_boundary_passes(
+                        pass_times,
+                        previous_state=previous_state,
+                        current_state=current_state,
+                        restarting=restarting,
+                    )
+                )
+                tracker.ambiguous_pass_count += ambiguous
+                if ambiguous:
+                    self._write_cycle_diagnostic(
+                        "rail_boundary_ambiguous",
+                        env_step=env_step,
+                        episode_id=episode_id,
+                        tracker=tracker,
+                        previous_state=previous_state,
+                        current_state=current_state,
+                        previous_job_id=previous_job_id,
+                        current_job_id=current_job_id,
+                        current_oht_tat=current_oht_tat,
+                        current_cmd_tat=current_cmd_tat,
+                        entries=entries,
+                        reward_applied=False,
+                        skip_reason="unattributable_boundary_pass",
+                    )
+                self._consume_rail_snapshot(
+                    oht_id,
+                    old_passes,
+                    [],
+                    tracker,
+                    boundary=False,
+                    env_step=env_step,
+                    episode_id=episode_id,
+                )
+                outcome = self._finalize_oht_cycle(tracker, credit)
+                if outcome.reward_applied:
+                    event_count += outcome.controlled_reward_count
+                event = (
+                    "oht_cycle_restarted"
+                    if restarting else "oht_cycle_completed"
+                )
+                self._write_cycle_diagnostic(
+                    event,
+                    env_step=env_step,
+                    episode_id=episode_id,
+                    tracker=tracker,
+                    previous_state=previous_state,
+                    current_state=current_state,
+                    previous_job_id=previous_job_id,
+                    current_job_id=current_job_id,
+                    current_oht_tat=current_oht_tat,
+                    current_cmd_tat=current_cmd_tat,
+                    entries=entries,
+                    reward_applied=outcome.reward_applied,
+                    skip_reason=outcome.skip_reason,
+                    outcome=outcome,
+                )
+                if not outcome.reward_applied:
+                    self._write_cycle_diagnostic(
+                        "oht_cycle_skipped",
+                        env_step=env_step,
+                        episode_id=episode_id,
+                        tracker=tracker,
+                        previous_state=previous_state,
+                        current_state=current_state,
+                        previous_job_id=previous_job_id,
+                        current_job_id=current_job_id,
+                        current_oht_tat=current_oht_tat,
+                        current_cmd_tat=current_cmd_tat,
+                        entries=entries,
+                        reward_applied=False,
+                        skip_reason=outcome.skip_reason,
+                        outcome=outcome,
+                    )
+                tracker.clear_cycle()
+                tracker.previous_state = previous_state
+                tracker.current_state = current_state
+                tracker.latest_job_id = current_job_id
+                if restarting:
+                    self._start_oht_cycle(
+                        tracker,
+                        env_step=env_step,
+                        state=current_state,
+                        job_id=current_job_id,
+                        bootstrapped=False,
+                    )
+                    self._consume_rail_snapshot(
+                        oht_id,
+                        new_passes,
+                        not_pass_times,
+                        tracker,
+                        boundary=True,
+                        env_step=env_step,
+                        episode_id=episode_id,
+                    )
+                    self._update_cycle_tat(
+                        tracker,
+                        current_state,
+                        current_oht_tat,
+                        current_cmd_tat,
+                        selection_reason,
+                    )
+                else:
+                    self._consume_rail_snapshot(
+                        oht_id,
+                        [],
+                        not_pass_times,
+                        None,
+                        boundary=True,
+                        env_step=env_step,
+                        episode_id=episode_id,
+                    )
+                continue
+
+            if tracker.cycle_active:
+                if current_state in ACTIVE_OHT_CYCLE_STATES:
+                    self._consume_rail_snapshot(
+                        oht_id,
+                        pass_times,
+                        not_pass_times,
+                        tracker,
+                        boundary=False,
+                        env_step=env_step,
+                        episode_id=episode_id,
+                    )
+                    if (
+                        current_job_id != tracker.current_segment_job_id
+                        and previous_state != int(OHTState.UNLOADING)
+                    ):
+                        old_segment_job_id = tracker.current_segment_job_id
+                        self._close_tat_segment(tracker)
+                        self._write_cycle_diagnostic(
+                            "oht_tat_segment_closed",
+                            env_step=env_step,
+                            episode_id=episode_id,
+                            tracker=tracker,
+                            previous_state=previous_state,
+                            current_state=current_state,
+                            previous_job_id=old_segment_job_id,
+                            current_job_id=current_job_id,
+                            current_oht_tat=current_oht_tat,
+                            current_cmd_tat=current_cmd_tat,
+                            entries=entries,
+                            reward_applied=False,
+                            skip_reason=tracker.last_tat_skip_reason,
+                        )
+                        self._start_tat_segment(
+                            tracker, current_job_id, increment=True
+                        )
+                        self._write_cycle_diagnostic(
+                            "oht_tat_segment_started",
+                            env_step=env_step,
+                            episode_id=episode_id,
+                            tracker=tracker,
+                            previous_state=previous_state,
+                            current_state=current_state,
+                            previous_job_id=old_segment_job_id,
+                            current_job_id=current_job_id,
+                            current_oht_tat=current_oht_tat,
+                            current_cmd_tat=current_cmd_tat,
+                            entries=entries,
+                            reward_applied=False,
+                            skip_reason=selection_reason,
+                        )
+                    unexplained_reset = self._update_cycle_tat(
+                        tracker,
+                        current_state,
+                        current_oht_tat,
+                        current_cmd_tat,
+                        selection_reason,
+                    )
+                    if unexplained_reset:
+                        self._write_cycle_diagnostic(
+                            "oht_tat_reset_unexplained",
+                            env_step=env_step,
+                            episode_id=episode_id,
+                            tracker=tracker,
+                            previous_state=previous_state,
+                            current_state=current_state,
+                            previous_job_id=previous_job_id,
+                            current_job_id=current_job_id,
+                            current_oht_tat=current_oht_tat,
+                            current_cmd_tat=current_cmd_tat,
+                            entries=entries,
+                            reward_applied=False,
+                            skip_reason="unexplained_oht_tat_reset",
+                        )
+                    if current_job_id != previous_job_id:
+                        if previous_job_id:
+                            tracker.previous_job_ids.add(previous_job_id)
+                        tracker.latest_job_id = current_job_id
+                        self._write_cycle_diagnostic(
+                            "oht_job_changed",
+                            env_step=env_step,
+                            episode_id=episode_id,
+                            tracker=tracker,
+                            previous_state=previous_state,
+                            current_state=current_state,
+                            previous_job_id=previous_job_id,
+                            current_job_id=current_job_id,
+                            current_oht_tat=current_oht_tat,
+                            current_cmd_tat=current_cmd_tat,
+                            entries=entries,
+                            reward_applied=False,
+                            skip_reason=selection_reason,
+                        )
+                    if (
+                        previous_state != int(OHTState.UNLOADING)
+                        and current_state == int(OHTState.UNLOADING)
+                    ):
+                        self._write_cycle_diagnostic(
+                            "oht_unloading",
+                            env_step=env_step,
+                            episode_id=episode_id,
+                            tracker=tracker,
+                            previous_state=previous_state,
+                            current_state=current_state,
+                            previous_job_id=previous_job_id,
+                            current_job_id=current_job_id,
+                            current_oht_tat=current_oht_tat,
+                            current_cmd_tat=current_cmd_tat,
+                            entries=entries,
+                            reward_applied=False,
+                            skip_reason=selection_reason,
                         )
                 else:
-                    fallback = (
-                        getattr(oht, "RouteList")[0]
-                        if getattr(oht, "RouteList", None) else None
+                    self._write_cycle_diagnostic(
+                        "oht_cycle_aborted",
+                        env_step=env_step,
+                        episode_id=episode_id,
+                        tracker=tracker,
+                        previous_state=previous_state,
+                        current_state=current_state,
+                        previous_job_id=previous_job_id,
+                        current_job_id=current_job_id,
+                        current_oht_tat=current_oht_tat,
+                        current_cmd_tat=current_cmd_tat,
+                        entries=entries,
+                        reward_applied=False,
+                        skip_reason="active_cycle_left_without_state_5_completion",
                     )
-                    if fallback is not None:
-                        fallback = int(fallback)
-                        credit[fallback] = credit.get(fallback, 0.0) + excess
-            route.clear()
+                    tracker.clear_cycle()
+                    tracker.latest_job_id = current_job_id
+                    self._consume_rail_snapshot(
+                        oht_id,
+                        pass_times,
+                        not_pass_times,
+                        None,
+                        boundary=True,
+                        env_step=env_step,
+                        episode_id=episode_id,
+                    )
+            elif (
+                previous_state == int(OHTState.IDLE)
+                and current_state == int(OHTState.MOVE_TO_LOAD)
+            ):
+                self._start_oht_cycle(
+                    tracker,
+                    env_step=env_step,
+                    state=current_state,
+                    job_id=current_job_id,
+                    bootstrapped=False,
+                )
+                _, start_passes, ambiguous = self._split_boundary_passes(
+                    pass_times,
+                    previous_state=previous_state,
+                    current_state=current_state,
+                    restarting=True,
+                )
+                tracker.ambiguous_pass_count += ambiguous
+                if ambiguous:
+                    self._write_cycle_diagnostic(
+                        "rail_boundary_ambiguous",
+                        env_step=env_step,
+                        episode_id=episode_id,
+                        tracker=tracker,
+                        previous_state=previous_state,
+                        current_state=current_state,
+                        previous_job_id=previous_job_id,
+                        current_job_id=current_job_id,
+                        current_oht_tat=current_oht_tat,
+                        current_cmd_tat=current_cmd_tat,
+                        entries=entries,
+                        reward_applied=False,
+                        skip_reason="unattributable_cycle_start_pass",
+                    )
+                self._consume_rail_snapshot(
+                    oht_id,
+                    start_passes,
+                    not_pass_times,
+                    tracker,
+                    boundary=True,
+                    env_step=env_step,
+                    episode_id=episode_id,
+                )
+                self._update_cycle_tat(
+                    tracker,
+                    current_state,
+                    current_oht_tat,
+                    current_cmd_tat,
+                    selection_reason,
+                )
+                self._write_cycle_diagnostic(
+                    "oht_cycle_start",
+                    env_step=env_step,
+                    episode_id=episode_id,
+                    tracker=tracker,
+                    previous_state=previous_state,
+                    current_state=current_state,
+                    previous_job_id=previous_job_id,
+                    current_job_id=current_job_id,
+                    current_oht_tat=current_oht_tat,
+                    current_cmd_tat=current_cmd_tat,
+                    entries=entries,
+                    reward_applied=False,
+                    skip_reason=selection_reason,
+                )
+            elif current_state in ACTIVE_OHT_CYCLE_STATES:
+                self._start_oht_cycle(
+                    tracker,
+                    env_step=env_step,
+                    state=current_state,
+                    job_id=current_job_id,
+                    bootstrapped=True,
+                )
+                self._consume_rail_snapshot(
+                    oht_id,
+                    pass_times,
+                    not_pass_times,
+                    tracker,
+                    boundary=True,
+                    env_step=env_step,
+                    episode_id=episode_id,
+                )
+                self._update_cycle_tat(
+                    tracker,
+                    current_state,
+                    current_oht_tat,
+                    current_cmd_tat,
+                    selection_reason,
+                )
+                self._write_cycle_diagnostic(
+                    "oht_cycle_bootstrapped",
+                    env_step=env_step,
+                    episode_id=episode_id,
+                    tracker=tracker,
+                    previous_state=previous_state,
+                    current_state=current_state,
+                    previous_job_id=previous_job_id,
+                    current_job_id=current_job_id,
+                    current_oht_tat=current_oht_tat,
+                    current_cmd_tat=current_cmd_tat,
+                    entries=entries,
+                    reward_applied=False,
+                    skip_reason="active_without_idle_to_move_to_load",
+                )
+            else:
+                self._consume_rail_snapshot(
+                    oht_id,
+                    pass_times,
+                    not_pass_times,
+                    None,
+                    boundary=False,
+                    env_step=env_step,
+                    episode_id=episode_id,
+                )
+
+            tracker.latest_job_id = current_job_id
         result = np.asarray(
             [credit.get(int(rail_id), 0.0)
              for rail_id in self.topology.controlled_rail_ids],
             dtype=np.float64,
         )
+        self._last_rail_tat_event_count = int(event_count)
         return result * self.config.rail_tat_weight
+
+    @staticmethod
+    def _oht_tat_entries(oht) -> dict[int, object]:
+        values = getattr(oht, "CmdCompleteTat", None)
+        if hasattr(values, "items"):
+            return {int(key): value for key, value in values.items()}
+        return {
+            int(getattr(value, "CmdID", 0) or 0): value
+            for value in (values or [])
+        }
+
+    @staticmethod
+    def _select_oht_tat_entry(oht, entries):
+        if not entries:
+            return None, "missing_tat_entry"
+        candidates = {
+            int(candidate)
+            for candidate in (
+                getattr(oht, "JobID", 0),
+                getattr(oht, "DispatchedCommand", 0),
+            )
+            if int(candidate or 0) in entries
+        }
+        if len(candidates) == 1:
+            return entries[next(iter(candidates))], None
+        if len(candidates) > 1:
+            return None, "job_and_dispatched_command_conflict"
+        if len(entries) == 1:
+            return next(iter(entries.values())), None
+        return None, "ambiguous_tat_entries"
+
+    @staticmethod
+    def _finite_positive_attr(value, name) -> float | None:
+        if value is None:
+            return None
+        result = float(getattr(value, name, 0) or 0)
+        return result if np.isfinite(result) and result > 0 else None
+
+    @staticmethod
+    def _start_oht_cycle(
+        tracker,
+        *,
+        env_step,
+        state,
+        job_id,
+        bootstrapped,
+    ) -> None:
+        tracker.clear_cycle()
+        tracker.cycle_active = True
+        tracker.bootstrapped = bool(bootstrapped)
+        tracker.cycle_start_step = int(env_step)
+        tracker.current_state = int(state)
+        tracker.latest_job_id = int(job_id)
+        tracker.previous_job_ids.clear()
+        ContextualRewardBuilder._start_tat_segment(
+            tracker, int(job_id), increment=True
+        )
+
+    @staticmethod
+    def _start_tat_segment(tracker, job_id, *, increment) -> None:
+        tracker.current_segment_job_id = int(job_id)
+        tracker.current_segment_last_valid_oht_tat = None
+        tracker.current_segment_last_state5_oht_tat = None
+        if increment:
+            tracker.tat_segment_count += 1
+
+    @staticmethod
+    def _close_tat_segment(tracker) -> None:
+        value = tracker.current_segment_last_valid_oht_tat
+        if value is None:
+            tracker.cycle_tat_valid = False
+            tracker.last_tat_skip_reason = "missing_closed_segment_oht_tat"
+            return
+        tracker.closed_segment_oht_tat_sum += float(value)
+
+    @staticmethod
+    def _split_boundary_passes(
+        pass_times,
+        *,
+        previous_state,
+        current_state,
+        restarting,
+    ):
+        if not restarting:
+            old = [
+                item for item in pass_times
+                if int(getattr(item, "State")) in ACTIVE_OHT_CYCLE_STATES
+            ]
+            ambiguous = len(pass_times) - len(old)
+            return old, [], ambiguous
+        new_states = {int(current_state)}
+        if int(current_state) == int(OHTState.LOADING):
+            new_states.add(int(OHTState.MOVE_TO_LOAD))
+        first_new = next(
+            (
+                index for index, item in enumerate(pass_times)
+                if int(getattr(item, "State")) in new_states
+            ),
+            None,
+        )
+        if first_new is None:
+            old_states = (
+                {int(OHTState.MOVE_TO_UNLOAD), int(OHTState.UNLOADING)}
+                if int(previous_state) == int(OHTState.UNLOADING)
+                else set()
+            )
+            old = [
+                item for item in pass_times
+                if int(getattr(item, "State")) in old_states
+            ]
+            return old, [], len(pass_times) - len(old)
+        old_candidates = pass_times[:first_new]
+        new_candidates = pass_times[first_new:]
+        old_states = (
+            {int(OHTState.MOVE_TO_UNLOAD), int(OHTState.UNLOADING)}
+            if int(previous_state) == int(OHTState.UNLOADING)
+            else set()
+        )
+        old = [
+            item for item in old_candidates
+            if int(getattr(item, "State")) in old_states
+        ]
+        new = [
+            item for item in new_candidates
+            if int(getattr(item, "State")) in new_states
+        ]
+        ambiguous = (
+            len(old_candidates) - len(old)
+            + len(new_candidates) - len(new)
+        )
+        return old, new, ambiguous
+
+    def _consume_rail_snapshot(
+        self,
+        oht_id,
+        completed,
+        current_inflight,
+        ledger,
+        *,
+        boundary,
+        env_step,
+        episode_id,
+    ) -> None:
+        temporal = self._rail_pass_trackers.setdefault(
+            int(oht_id), RailPassTemporalTracker()
+        )
+        previous_id = temporal.inflight_rail_id
+        previous_elapsed = temporal.inflight_elapsed
+        previous_consumed = False
+
+        def invalid_delta(item, reason):
+            if ledger is not None:
+                ledger.invalid_pass_delta_count += 1
+                self._write_cycle_diagnostic(
+                    "rail_pass_invalid_delta",
+                    env_step=env_step,
+                    episode_id=episode_id,
+                    tracker=ledger,
+                    previous_state=ledger.previous_state
+                    if ledger.previous_state is not None else ledger.current_state,
+                    current_state=ledger.current_state,
+                    previous_job_id=ledger.latest_job_id,
+                    current_job_id=ledger.latest_job_id,
+                    current_oht_tat=None,
+                    current_cmd_tat=None,
+                    entries={},
+                    reward_applied=False,
+                    skip_reason=reason,
+                )
+
+        def add_delta(item, delta):
+            if not np.isfinite(delta) or delta < 0:
+                invalid_delta(item, "negative_or_nonfinite_rail_delta")
+                return
+            if delta == 0 or ledger is None:
+                return
+            state = int(getattr(item, "State"))
+            if state not in ACTIVE_OHT_CYCLE_STATES:
+                return
+            rail_id = int(getattr(item, "ID"))
+            ledger.rail_time_by_id[rail_id] = (
+                ledger.rail_time_by_id.get(rail_id, 0.0) + float(delta)
+            )
+            ledger.route_count += 1
+            ledger.route_time += float(delta)
+            ledger.pass_delta_count += 1
+
+        for index, item in enumerate(completed):
+            rail_id = int(getattr(item, "ID"))
+            total = float(getattr(item, "PassTime"))
+            if not np.isfinite(total) or total < 0:
+                invalid_delta(item, "invalid_completed_pass_time")
+                continue
+            if index == 0 and previous_id is not None:
+                if rail_id == previous_id and previous_elapsed is not None:
+                    delta = total - previous_elapsed
+                    previous_consumed = True
+                    if ledger is not None and boundary:
+                        ledger.boundary_time_subtracted += float(previous_elapsed)
+                else:
+                    if ledger is not None:
+                        ledger.ambiguous_pass_count += 1
+                        self._write_cycle_diagnostic(
+                            "rail_boundary_ambiguous",
+                            env_step=env_step,
+                            episode_id=episode_id,
+                            tracker=ledger,
+                            previous_state=ledger.previous_state
+                            if ledger.previous_state is not None
+                            else ledger.current_state,
+                            current_state=ledger.current_state,
+                            previous_job_id=ledger.latest_job_id,
+                            current_job_id=ledger.latest_job_id,
+                            current_oht_tat=None,
+                            current_cmd_tat=None,
+                            entries={},
+                            reward_applied=False,
+                            skip_reason="completed_pass_did_not_match_inflight",
+                        )
+                    continue
+            else:
+                delta = total
+            add_delta(item, delta)
+
+        inflight_items = list(current_inflight or [])
+        if len(inflight_items) > 1:
+            if ledger is not None:
+                ledger.ambiguous_pass_count += len(inflight_items) - 1
+            inflight_items = inflight_items[:1]
+        if not inflight_items:
+            if completed or previous_consumed or boundary:
+                temporal.clear()
+            return
+
+        item = inflight_items[0]
+        rail_id = int(getattr(item, "ID"))
+        elapsed = float(getattr(item, "PassTime"))
+        if not np.isfinite(elapsed) or elapsed < 0:
+            invalid_delta(item, "invalid_inflight_pass_time")
+            temporal.clear()
+            return
+        same_occurrence = (
+            not previous_consumed
+            and previous_id == rail_id
+            and previous_elapsed is not None
+        )
+        if same_occurrence:
+            delta = elapsed - previous_elapsed
+            if delta < 0:
+                invalid_delta(item, "nonmonotonic_inflight_pass_time")
+                return
+            if ledger is not None and boundary:
+                ledger.boundary_carry_count += 1
+                ledger.boundary_carry_time += float(previous_elapsed)
+                ledger.boundary_time_subtracted += float(previous_elapsed)
+                self._write_cycle_diagnostic(
+                    "rail_boundary_baseline",
+                    env_step=env_step,
+                    episode_id=episode_id,
+                    tracker=ledger,
+                    previous_state=ledger.previous_state
+                    if ledger.previous_state is not None else ledger.current_state,
+                    current_state=ledger.current_state,
+                    previous_job_id=ledger.latest_job_id,
+                    current_job_id=ledger.latest_job_id,
+                    current_oht_tat=None,
+                    current_cmd_tat=None,
+                    entries={},
+                    reward_applied=False,
+                    skip_reason=None,
+                )
+        elif boundary:
+            delta = 0.0
+            if ledger is not None:
+                ledger.boundary_carry_count += 1
+                ledger.boundary_carry_time += elapsed
+                ledger.boundary_time_subtracted += elapsed
+                self._write_cycle_diagnostic(
+                    "rail_boundary_baseline",
+                    env_step=env_step,
+                    episode_id=episode_id,
+                    tracker=ledger,
+                    previous_state=ledger.previous_state
+                    if ledger.previous_state is not None else ledger.current_state,
+                    current_state=ledger.current_state,
+                    previous_job_id=ledger.latest_job_id,
+                    current_job_id=ledger.latest_job_id,
+                    current_oht_tat=None,
+                    current_cmd_tat=None,
+                    entries={},
+                    reward_applied=False,
+                    skip_reason="new_inflight_occurrence_at_boundary",
+                )
+        else:
+            delta = elapsed
+        add_delta(item, delta)
+        temporal.inflight_rail_id = rail_id
+        temporal.inflight_state = int(getattr(item, "State"))
+        temporal.inflight_elapsed = elapsed
+
+    @staticmethod
+    def _update_cycle_tat(
+        tracker,
+        state,
+        oht_tat,
+        cmd_tat,
+        selection_reason,
+    ) -> bool:
+        unexplained_reset = False
+        if oht_tat is not None:
+            previous = tracker.current_segment_last_valid_oht_tat
+            if previous is not None and float(oht_tat) + 1e-9 < previous:
+                tracker.cycle_tat_valid = False
+                tracker.last_tat_skip_reason = "unexplained_oht_tat_reset"
+                unexplained_reset = True
+            tracker.current_segment_last_valid_oht_tat = float(oht_tat)
+            if not unexplained_reset:
+                tracker.last_tat_skip_reason = None
+            if int(state) == int(OHTState.UNLOADING):
+                tracker.current_segment_last_state5_oht_tat = float(oht_tat)
+        elif selection_reason is not None:
+            tracker.last_tat_skip_reason = str(selection_reason)
+        if cmd_tat is not None:
+            tracker.last_valid_cmd_tat = float(cmd_tat)
+        return unexplained_reset
+
+    def _finalize_oht_cycle(self, tracker, credit) -> CycleRewardOutcome:
+        if tracker.bootstrapped:
+            return CycleRewardOutcome(False, "bootstrapped_incomplete_cycle")
+        if not tracker.cycle_tat_valid:
+            return CycleRewardOutcome(
+                False, tracker.last_tat_skip_reason or "invalid_cycle_tat"
+            )
+        if tracker.current_segment_last_state5_oht_tat is None:
+            return CycleRewardOutcome(False, (
+                tracker.last_tat_skip_reason or "missing_final_state_5_oht_tat"
+            ))
+        if (
+            not tracker.rail_time_by_id
+            or not np.isfinite(tracker.route_time)
+            or tracker.route_time <= 0
+        ):
+            return CycleRewardOutcome(False, "missing_valid_cycle_route")
+        effective_oht_tat = (
+            tracker.closed_segment_oht_tat_sum
+            + tracker.current_segment_last_state5_oht_tat
+        )
+        excess = (
+            effective_oht_tat - self.config.tat_reference
+        ) / self.config.tat_reference
+        controlled = set(
+            int(value) for value in self.topology.controlled_rail_ids
+        )
+        actual_controlled_rewards = []
+        for rail_id, elapsed in tracker.rail_time_by_id.items():
+            penalty = excess * elapsed / tracker.route_time
+            credit[rail_id] = credit.get(rail_id, 0.0) + penalty
+            if rail_id in controlled:
+                actual_controlled_rewards.append(
+                    -penalty * self.config.rail_tat_weight
+                )
+        controlled_count = sum(
+            rail_id in controlled for rail_id in tracker.rail_time_by_id
+        )
+        values = np.asarray(actual_controlled_rewards, dtype=np.float64)
+        return CycleRewardOutcome(
+            True,
+            None,
+            effective_oht_tat=float(effective_oht_tat),
+            signed_excess=float(excess),
+            cycle_reward_unclipped=float(
+                -excess * self.config.rail_tat_weight
+            ),
+            cycle_reward_clipped=float(
+                -excess * self.config.rail_tat_weight
+            ),
+            reward_rail_count=len(tracker.rail_time_by_id),
+            controlled_reward_count=int(controlled_count),
+            uncontrolled_reward_count=(
+                len(tracker.rail_time_by_id) - int(controlled_count)
+            ),
+            reward_sum=float(values.sum()) if values.size else 0.0,
+            reward_min=float(values.min()) if values.size else 0.0,
+            reward_max=float(values.max()) if values.size else 0.0,
+        )
+
+    def _write_cycle_diagnostic(
+        self,
+        event,
+        *,
+        env_step,
+        episode_id,
+        tracker,
+        previous_state,
+        current_state,
+        previous_job_id,
+        current_job_id,
+        current_oht_tat,
+        current_cmd_tat,
+        entries,
+        reward_applied,
+        skip_reason,
+        outcome=None,
+    ) -> None:
+        if self.completion_diagnostic_path is None:
+            return
+        global_step = (
+            int(self._global_step_provider())
+            if self._global_step_provider is not None
+            else None
+        )
+        if (
+            global_step is not None
+            and self.completion_diagnostic_max_global_step is not None
+            and global_step >= self.completion_diagnostic_max_global_step
+        ):
+            return
+        outcome = outcome or CycleRewardOutcome(
+            bool(reward_applied), skip_reason
+        )
+        effective_oht_tat = outcome.effective_oht_tat
+        cycle_elapsed = (
+            int(env_step) - int(tracker.cycle_start_step)
+            if tracker.cycle_start_step is not None else None
+        )
+        record = {
+            "event": str(event),
+            "global_step": global_step,
+            "env_step": int(env_step),
+            "episode_step": int(env_step),
+            "episode_id": int(episode_id),
+            "oht_id": int(tracker.oht_id),
+            "previous_state": int(previous_state),
+            "current_state": int(current_state),
+            "previous_job_id": int(previous_job_id),
+            "current_job_id": int(current_job_id),
+            "last_oht_tat": tracker.last_unloading_oht_tat
+            if tracker.last_unloading_oht_tat is not None
+            else tracker.last_valid_oht_tat,
+            "current_oht_tat": current_oht_tat,
+            "cmd_tat": current_cmd_tat,
+            "tat_entry_ids": sorted(entries),
+            "tat_segment_count": int(tracker.tat_segment_count),
+            "closed_segment_oht_tat_sum": float(
+                tracker.closed_segment_oht_tat_sum
+            ),
+            "final_segment_state5_oht_tat": (
+                tracker.current_segment_last_state5_oht_tat
+            ),
+            "effective_cycle_oht_tat": effective_oht_tat,
+            "reward_oht_tat_used": effective_oht_tat
+            if outcome.reward_applied else None,
+            "cycle_elapsed_time": cycle_elapsed,
+            "oht_tat_elapsed_error": (
+                float(effective_oht_tat - cycle_elapsed)
+                if effective_oht_tat is not None
+                and cycle_elapsed is not None else None
+            ),
+            "tat_reference": float(self.config.tat_reference),
+            "signed_excess": outcome.signed_excess,
+            "cycle_reward_unclipped": outcome.cycle_reward_unclipped,
+            "cycle_reward_clipped": outcome.cycle_reward_clipped,
+            "route_count": int(tracker.route_count),
+            "route_time": float(tracker.route_time),
+            "reward_rail_count": int(outcome.reward_rail_count),
+            "controlled_reward_count": int(
+                outcome.controlled_reward_count
+            ),
+            "uncontrolled_reward_count": int(
+                outcome.uncontrolled_reward_count
+            ),
+            "reward_sum": float(outcome.reward_sum),
+            "reward_min": float(outcome.reward_min),
+            "reward_max": float(outcome.reward_max),
+            "pass_delta_count": int(tracker.pass_delta_count),
+            "boundary_carry_count": int(tracker.boundary_carry_count),
+            "boundary_carry_time": float(tracker.boundary_carry_time),
+            "boundary_time_subtracted": float(
+                tracker.boundary_time_subtracted
+            ),
+            "ambiguous_pass_count": int(tracker.ambiguous_pass_count),
+            "invalid_pass_delta_count": int(
+                tracker.invalid_pass_delta_count
+            ),
+            "bootstrapped": bool(tracker.bootstrapped),
+            "reward_applied": bool(reward_applied),
+            "skip_reason": skip_reason,
+        }
+        self.completion_diagnostic_path.parent.mkdir(
+            parents=True, exist_ok=True
+        )
+        with self.completion_diagnostic_path.open(
+            "a", encoding="utf-8", newline="\n"
+        ) as stream:
+            json.dump(
+                record,
+                stream,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            stream.write("\n")
+            stream.flush()
 
     def build(
         self,
@@ -278,7 +1344,11 @@ class ContextualRewardBuilder:
 
         global_component = self.config.global_alpha * global_norm
         local_component = self.config.local_alpha * local_norm
-        rail_tat = self._rail_tat(pclient)
+        rail_tat = self._rail_tat(
+            pclient,
+            env_step=env_step,
+            episode_id=episode_id,
+        )
         if self.config.action_mode == REGION_B_RL:
             control_delta = np.abs(
                 (0.5 + 0.5 * action) - (0.5 + 0.5 * previous)
@@ -306,6 +1376,7 @@ class ContextualRewardBuilder:
             frozen_arrays[name] = array
         return ControlledRewardBatch(
             **frozen_arrays,
+            rail_tat_event_count=int(self._last_rail_tat_event_count),
             global_raw=float(global_raw),
             global_normalized=float(global_norm),
             global_component=float(global_component),
@@ -316,6 +1387,12 @@ class ContextualRewardBuilder:
         )
 
     def diagnostics(self, batch: ControlledRewardBatch) -> dict[str, float]:
+        rail_tat_sum = float(batch.rail_tat_penalty.sum())
+        rail_tat_vector_mean = float(batch.rail_tat_penalty.mean())
+        rail_tat_event_mean = (
+            rail_tat_sum / batch.rail_tat_event_count
+            if batch.rail_tat_event_count > 0 else 0.0
+        )
         return {
             "reward/global_raw": batch.global_raw,
             "reward/global_normalized": batch.global_normalized,
@@ -328,8 +1405,14 @@ class ContextualRewardBuilder:
             "reward/local_normalized_std": float(batch.local_normalized.std()),
             "reward/local_component_mean": float(batch.local_component.mean()),
             "reward/local_component_std": float(batch.local_component.std()),
-            "reward/rail_tat_penalty_mean": float(batch.rail_tat_penalty.mean()),
+            "reward/rail_tat_penalty_mean": rail_tat_vector_mean,
             "reward/rail_tat_penalty_max": float(batch.rail_tat_penalty.max()),
+            "reward/rail_tat_event_count": float(
+                batch.rail_tat_event_count
+            ),
+            "reward/rail_tat_sum": rail_tat_sum,
+            "reward/rail_tat_vector_mean": rail_tat_vector_mean,
+            "reward/rail_tat_event_mean": float(rail_tat_event_mean),
             "reward/smooth_penalty_mean": float(batch.smooth_penalty.mean()),
             "reward/smooth_penalty_max": float(batch.smooth_penalty.max()),
             "reward/smooth_control_delta_mean": float(

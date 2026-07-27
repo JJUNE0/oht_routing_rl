@@ -36,6 +36,7 @@ from .checkpoint import (
     CRITIC_INITIALIZATION,
     ContextualCheckpointError,
     load_contextual_checkpoint,
+    read_contextual_runtime_config,
     save_contextual_checkpoint,
 )
 from .replay_buffer import LAP_VERSION
@@ -78,6 +79,7 @@ __all__ = [
     "CRITIC_INITIALIZATION",
     "ContextualCheckpointError",
     "load_contextual_checkpoint",
+    "read_contextual_runtime_config",
     "save_contextual_checkpoint",
     "LAP_VERSION",
     "SALE_VERSION",

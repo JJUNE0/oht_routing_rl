@@ -7,7 +7,7 @@ import os
 import time
 import traceback
 from collections import defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import numpy as np
@@ -79,6 +79,8 @@ class ContextualRuntimeConfig:
     periodic_checkpoint_interval: int = 5_000
     checkpoint_root: str | None = None
     resume_checkpoint_path: str | None = None
+    rail_tat_diagnostic_path: str | None = None
+    rail_tat_diagnostic_max_step: int = 1_000
     wandb_enabled: bool = False
     wandb_log_interval: int = 10
     sale_enabled: bool = True
@@ -146,6 +148,10 @@ class ContextualRuntimeConfig:
             or self.max_stale_sim_time_ticks <= 0
         ):
             raise ValueError("early-stop/watchdog settings are invalid")
+        if self.rail_tat_diagnostic_max_step < 0:
+            raise ValueError(
+                "rail_tat_diagnostic_max_step must be non-negative"
+            )
 
 
 class ClientAlgorithm:
@@ -212,6 +218,12 @@ class ClientAlgorithm:
             self.config.checkpoint_root
             or root / "checkpoints" / self.runtime_variant
         )
+        self.rail_tat_diagnostic_path = Path(
+            self.config.rail_tat_diagnostic_path
+            or self.checkpoint_root
+            / "diagnostics"
+            / "rail_tat_completion.jsonl"
+        )
 
     @property
     def algorithm_variant(self):
@@ -247,6 +259,11 @@ class ClientAlgorithm:
                             self.config.smooth_exp_residual_weight
                         ),
                     ),
+                    completion_diagnostic_path=self.rail_tat_diagnostic_path,
+                    global_step_provider=lambda: self.total_steps,
+                    completion_diagnostic_max_global_step=(
+                        self.config.rail_tat_diagnostic_max_step
+                    ),
                 )
                 self.transition_aligner = ContextualTransitionAligner(
                     self.topology, self.reward_builder
@@ -276,6 +293,11 @@ class ClientAlgorithm:
                 smooth_exp_residual_weight=(
                     self.config.smooth_exp_residual_weight
                 ),
+            ),
+            completion_diagnostic_path=self.rail_tat_diagnostic_path,
+            global_step_provider=lambda: self.total_steps,
+            completion_diagnostic_max_global_step=(
+                self.config.rail_tat_diagnostic_max_step
             ),
         )
         self.transition_aligner = ContextualTransitionAligner(
@@ -472,6 +494,7 @@ class ClientAlgorithm:
             observation_builder=self.observation_builder,
             reward_builder=self.reward_builder,
             runtime_metadata=self._runtime_checkpoint_metadata(kind),
+            runtime_config=asdict(self.config),
             exploration_rng=self.exploration_rng,
         )
         return self.last_checkpoint_path
@@ -1102,16 +1125,22 @@ class ClientAlgorithm:
                     "reward/local_normalized_mean"
                 ],
                 "reward/rail_tat": reward_diagnostics[
-                    "reward/rail_tat_penalty_mean"
+                    "reward/rail_tat_vector_mean"
                 ],
-                "reward/rail_tat_event_count": float(
-                    np.count_nonzero(completed.reward.rail_tat_penalty)
-                ),
-                "reward/rail_tat_sum": float(
-                    completed.reward.rail_tat_penalty.sum()
-                ),
+                "reward/rail_tat_event_count": reward_diagnostics[
+                    "reward/rail_tat_event_count"
+                ],
+                "reward/rail_tat_sum": reward_diagnostics[
+                    "reward/rail_tat_sum"
+                ],
                 "reward/rail_tat_mean": reward_diagnostics[
-                    "reward/rail_tat_penalty_mean"
+                    "reward/rail_tat_vector_mean"
+                ],
+                "reward/rail_tat_vector_mean": reward_diagnostics[
+                    "reward/rail_tat_vector_mean"
+                ],
+                "reward/rail_tat_event_mean": reward_diagnostics[
+                    "reward/rail_tat_event_mean"
                 ],
                 "reward/rail_tat_max": reward_diagnostics[
                     "reward/rail_tat_penalty_max"

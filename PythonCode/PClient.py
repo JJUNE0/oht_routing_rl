@@ -53,6 +53,12 @@ class PClient:
        secData ={}
 
        episode_index = 0
+
+       @staticmethod
+       def _store_oht_command_tat(oht, cmd_id, command_time):
+           """Preserve every active-command TAT entry in the current packet."""
+           oht.CmdCompleteTat[int(cmd_id)] = command_time
+
        def __init__(self, socket, sim_end_time=45000):
            self.client_socket = socket
            self.requested_end_time = int(sim_end_time)
@@ -553,11 +559,9 @@ class PClient:
                            oct.OHTWorkTimeByCommand = 0.0
                        
                        
-                       if  cmdID in self.OHT_DIC[id].CmdCompleteTat:
-                           a=0;
-                       else :
-                           self.OHT_DIC[id].CmdCompleteTat = {};
-                       self.OHT_DIC[id].CmdCompleteTat[cmdID] = oct
+                       self._store_oht_command_tat(
+                           self.OHT_DIC[id], cmdID, oct
+                       )
                        commandCount+=1;
  
                    ohtIndividualTatRaw = self.GetBase10Value_3(recieveMessage, railLineIndex)
