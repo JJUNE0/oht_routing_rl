@@ -630,3 +630,16 @@ architectural stabilization change is selected.
 - Reward D, region `b_rl` mapping, replay contents, learner update equations,
   SALE, and LAP are unchanged. No simulator or W&B run was launched for this
   implementation change.
+
+# 2026-07-27 - Episode-local deterministic policy burn-in
+
+- Action behavior version: `deterministic_policy_burnin_v1`. Every training
+  episode suppresses exploration, replay insertion, and learner updates for
+  its first 2,000 steps. A restored/trained actor rolls out deterministically;
+  a never-trained actor uses the zero-residual baseline fallback.
+- The replay buffer persists across episode resets. At the burn-in boundary,
+  only transition-alignment state is clean: reward/TAT history and the last
+  applied action remain continuous, and the first stored transition begins
+  with the first post-burn-in observation and action.
+- Reward E, topology, actor/critic architecture, TD7 targets, optimizers,
+  replay sampling, and action curriculum equations are unchanged.

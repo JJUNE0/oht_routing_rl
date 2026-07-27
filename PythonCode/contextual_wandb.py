@@ -35,15 +35,16 @@ EXP_META = {
     "exploration_schedule_version": EXPLORATION_SCHEDULE_VERSION,
     "resume_refill_version": "global_step_v2",
     "checkpoint_rng_version": "exploration_rng_v2",
+    "episode_burnin_version": "deterministic_policy_burnin_v1",
     "send_cost_logging_version": "post_send_v2",
     "protocol_version": "single_end_time_v2",
     "diagnostic_schema_version": "contextual_rail_tat_diag_v6",
     "centering": False,
-    "note": "railtatv7",
+    "note": "epburnin",
     "description": (
-        "Rail-TAT v7 treats 5->3 as completion/restart, sums OHTTat segments "
-        "across JobID resets, and attributes only packet-to-packet rail-time "
-        "deltas after each OHT cycle boundary."
+        "Episode-local deterministic policy burn-in excludes transient "
+        "transitions and learner updates while preserving replay and temporal "
+        "reward/action history."
     ),
 }
 
@@ -60,7 +61,9 @@ def _make_run_name(exp_meta):
 WANDB_METRIC_KEYS = (
     "env/step", "env/episode", "env/sim_time", "env/tat", "env/operation_rate",
     "env/queued", "env/waiting", "env/transferring", "env/completed",
-    "env/termination_reason",
+    "env/termination_reason", "episode/step",
+    "burnin/active", "burnin/remaining_steps",
+    "burnin/has_trained_policy", "burnin/action_source",
     "termination/done", "termination/by_queue", "termination/by_tat",
     "protocol/stale_sim_time_ticks",
     "action/policy_mean", "action/policy_std", "action/policy_min",
@@ -102,7 +105,7 @@ WANDB_METRIC_KEYS = (
     "job/mean_wait_priority", "job/mean_reassign", "job/queued",
     "oht/idle_count", "oht/move_to_load", "oht/move_to_unload",
     "oht/loading", "oht/unloading",
-    "replay/size_env_steps", "replay/size_logical_transitions",
+    "replay/size", "replay/size_env_steps", "replay/size_logical_transitions",
     "replay/action_enabled_env_steps", "replay/reward_mean",
     "replay/reward_std", "replay/policy_action_std",
     "replay/applied_action_std", "replay/done_ratio",
@@ -123,6 +126,7 @@ WANDB_METRIC_KEYS = (
     "critic/target_q_mean", "critic/td_error_mean", "critic/td_error_max",
     "grad/encoder_norm", "grad/critic_norm",
     "update/learner_count", "update/actor_count", "update/target_count",
+    "learner/updates",
     "numeric/learner_finite_ratio",
     "sale/enabled", "sale/loss", "sale/zs_mean", "sale/zs_std",
     "sale/zs_abs_mean", "sale/zsa_mean", "sale/zsa_std",
@@ -194,6 +198,7 @@ def runtime_exp_meta(config) -> dict:
     meta["exploration_noise_anneal_steps"] = int(
         config.exploration_noise_anneal_steps
     )
+    meta["episode_burnin_steps"] = int(config.episode_burnin_steps)
     meta["exploration_noise_anneal_start_step"] = int(config.warmup_steps)
     meta["exploration_noise_anneal_end_step"] = int(
         config.warmup_steps + config.exploration_noise_anneal_steps
@@ -216,6 +221,7 @@ def runtime_exp_meta(config) -> dict:
         f"{meta['exploration_noise_final_std']:g} over global steps "
         f"{int(config.warmup_steps)}.."
         f"{int(config.warmup_steps + config.exploration_noise_anneal_steps)}, "
+        f"episode_burnin_steps={int(config.episode_burnin_steps)}, "
         "control-space smoothing, "
         "single-field simulator end-time handshake, and fail-closed SimTime "
         "progress validation."

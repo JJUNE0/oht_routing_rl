@@ -8,6 +8,7 @@ import time
 import traceback
 from collections import defaultdict, deque
 from dataclasses import asdict, dataclass
+from numbers import Integral
 from pathlib import Path
 
 import numpy as np
@@ -60,6 +61,7 @@ class ContextualRuntimeConfig:
     smooth_b_rl_weight: float = 0.05
     smooth_exp_residual_weight: float = 0.5
     warmup_steps: int = 10_000
+    episode_burnin_steps: int = 2_000
     normalizer_freeze_steps: int = 10_000
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     seed: int = 0
@@ -106,8 +108,17 @@ class ContextualRuntimeConfig:
             or self.action_scale > 1.0
         ):
             raise ValueError("action_scale must be finite and in [0, 1]")
-        if self.warmup_steps < 0 or self.normalizer_freeze_steps < 0:
-            raise ValueError("warmup/freeze steps must be non-negative")
+        if (
+            isinstance(self.episode_burnin_steps, bool)
+            or not isinstance(self.episode_burnin_steps, Integral)
+        ):
+            raise ValueError("episode_burnin_steps must be an integer")
+        if (
+            self.warmup_steps < 0
+            or self.episode_burnin_steps < 0
+            or self.normalizer_freeze_steps < 0
+        ):
+            raise ValueError("warmup/burn-in/freeze steps must be non-negative")
         if self.mode == "training" and self.action_scale <= 0:
             raise ValueError("training mode requires positive action_scale")
         if (
@@ -195,6 +206,7 @@ class ClientAlgorithm:
         self.reward_builder = None
         self.transition_aligner = None
         self.episode_id = 0
+        self.checkpoint_loaded = False
         self.replay_buffer = None
         self.learner = None
         self.action_enabled_env_steps = 0
@@ -213,6 +225,8 @@ class ClientAlgorithm:
         self._resume_requires_refill = False
         self._last_sim_time: float | None = None
         self._stale_sim_time_ticks = 0
+        self._burnin_last_applied_action = None
+        self._burnin_previous_applied_action = None
         root = Path(__file__).resolve().parent.parent
         self.checkpoint_root = Path(
             self.config.checkpoint_root
@@ -362,6 +376,7 @@ class ClientAlgorithm:
                     "curriculum_scale_end": self.config.curriculum_scale_end,
                     "curriculum_shape": self.config.curriculum_shape,
                     "exploration_noise_std": self.config.exploration_noise_std,
+                    "episode_burnin_steps": self.config.episode_burnin_steps,
                 },
                 exploration_rng=self.exploration_rng,
                 exploration_seed=self.config.seed,
@@ -373,6 +388,7 @@ class ClientAlgorithm:
                 runtime_metadata.get("episode_id", self.episode_id)
             )
             self.transition_aligner.episode_id = self.episode_id
+            self.checkpoint_loaded = True
             self._resume_requires_refill = True
             self.action_enabled_env_steps = 0
 
@@ -446,6 +462,7 @@ class ClientAlgorithm:
             "curriculum_scale_start": self.config.curriculum_scale_start,
             "curriculum_scale_end": self.config.curriculum_scale_end,
             "curriculum_shape": self.config.curriculum_shape,
+            "episode_burnin_steps": self.config.episode_burnin_steps,
             "exploration_noise_std": self.config.exploration_noise_std,
             "exploration_noise_final_std": (
                 self.config.exploration_noise_final_std
@@ -522,6 +539,8 @@ class ClientAlgorithm:
         self.last_exploratory_action = None
         self._last_sim_time = None
         self._stale_sim_time_ticks = 0
+        self._burnin_last_applied_action = None
+        self._burnin_previous_applied_action = None
         if self.transition_aligner is not None:
             self.transition_aligner.reset(self.episode_id)
         if self.reward_builder is not None:
@@ -646,6 +665,8 @@ class ClientAlgorithm:
         self.last_diagnostics = {}
         self._last_sim_time = None
         self._stale_sim_time_ticks = 0
+        self._burnin_last_applied_action = None
+        self._burnin_previous_applied_action = None
         if self.transition_aligner is not None:
             self.transition_aligner.reset(self.episode_id)
         if self.reward_builder is not None:
@@ -736,6 +757,41 @@ class ClientAlgorithm:
             1.0,
         )
         return float(start + (final - start) * progress)
+
+    def _burnin_active(self) -> bool:
+        return bool(
+            self.config.mode == "training"
+            and self.episode_steps < self.config.episode_burnin_steps
+        )
+
+    def _has_trained_policy(self) -> bool:
+        return bool(
+            self.checkpoint_loaded
+            or (
+                self.learner is not None
+                and int(getattr(self.learner, "learner_update_count", 0)) > 0
+            )
+        )
+
+    def _advance_burnin_reward_history(self, pclient) -> None:
+        """Advance reward/TAT state without staging or storing a transition."""
+        if (
+            self.config.episode_burnin_steps <= 0
+            or self.episode_steps <= 0
+            or self.episode_steps > self.config.episode_burnin_steps
+            or self._burnin_last_applied_action is None
+        ):
+            return
+        self.reward_builder.build(
+            pclient,
+            applied_action=self._burnin_last_applied_action,
+            previous_applied_action=self._burnin_previous_applied_action,
+            env_step=self.episode_steps - 1,
+            episode_id=self.episode_id,
+        )
+        self.transition_aligner.previous_applied_action = (
+            self._burnin_last_applied_action.reshape(-1, 1).copy()
+        )
 
     @staticmethod
     def _temporal_delta(current, previous) -> tuple[float, float]:
@@ -916,6 +972,9 @@ class ClientAlgorithm:
         observation_build_ms = (time.perf_counter() - t0) * 1000.0
         self.last_observation = observation
 
+        burnin_active = self._burnin_active()
+        has_trained_policy = self._has_trained_policy()
+        self._advance_burnin_reward_history(pclient)
         completed = self.transition_aligner.complete_previous(
             observation=observation,
             pclient=pclient,
@@ -937,7 +996,14 @@ class ClientAlgorithm:
         deterministic_policy = np.zeros(
             len(self.topology.controlled_rail_ids), dtype=np.float32
         )
-        if self.config.mode in {"actor_inference", "training"}:
+        use_actor = (
+            self.config.mode == "actor_inference"
+            or (
+                self.config.mode == "training"
+                and (not burnin_active or has_trained_policy)
+            )
+        )
+        if use_actor:
             deterministic_policy, inference_timing = self._actor_inference(
                 observation,
                 attention_diagnostics=(
@@ -947,14 +1013,26 @@ class ClientAlgorithm:
             )
             timing.update(inference_timing)
         controlled_action = deterministic_policy.copy()
-        exploration_noise_std = self._exploration_noise_std()
+        exploration_noise_std = (
+            0.0 if burnin_active else self._exploration_noise_std()
+        )
         should_apply = (
             self.config.action_enabled
-            and self.total_steps >= self.config.warmup_steps
+            and (
+                (burnin_active and has_trained_policy)
+                or (
+                    not burnin_active
+                    and self.total_steps >= self.config.warmup_steps
+                )
+            )
             and not self.training_failed
             and not done
         )
-        if self.config.mode == "training" and should_apply:
+        if (
+            self.config.mode == "training"
+            and should_apply
+            and not burnin_active
+        ):
             noise = self.exploration_rng.normal(
                 0.0,
                 exploration_noise_std,
@@ -1012,7 +1090,8 @@ class ClientAlgorithm:
             gate_states, gate_open = self._training_gate()
             try:
                 if (
-                    gate_open
+                    not burnin_active
+                    and gate_open
                     and self.total_steps
                     % self.config.learn_every_env_steps == 0
                 ):
@@ -1041,7 +1120,7 @@ class ClientAlgorithm:
             if completed is not None:
                 self._on_completed_transition(completed)
 
-        if not done:
+        if not done and not burnin_active:
             self.transition_aligner.stage_current(
                 observation=observation,
                 controlled_action=deterministic_policy,
@@ -1053,6 +1132,16 @@ class ClientAlgorithm:
             )
         else:
             self.transition_aligner.pending = None
+        if burnin_active:
+            self._burnin_previous_applied_action = (
+                None
+                if self._burnin_last_applied_action is None
+                else self._burnin_last_applied_action.copy()
+            )
+            self._burnin_last_applied_action = applied_action.copy()
+            self.transition_aligner.previous_applied_action = (
+                applied_action.reshape(-1, 1).copy()
+            )
 
         self.total_steps += 1
         self.episode_steps += 1
@@ -1108,6 +1197,29 @@ class ClientAlgorithm:
             ),
             "replay/action_enabled_env_steps": float(
                 self.action_enabled_env_steps
+            ),
+            "replay/size": float(
+                self.replay_buffer.size_env_steps
+                if self.replay_buffer is not None else 0
+            ),
+            "episode/step": float(self.episode_steps - 1),
+            "burnin/active": float(burnin_active),
+            "burnin/remaining_steps": float(
+                max(
+                    0,
+                    self.config.episode_burnin_steps
+                    - (self.episode_steps - 1),
+                )
+                if burnin_active else 0
+            ),
+            "burnin/has_trained_policy": float(has_trained_policy),
+            "burnin/action_source": float(
+                1 if burnin_active and has_trained_policy
+                else 2 if burnin_active
+                else 0
+            ),
+            "learner/updates": float(
+                getattr(self.learner, "learner_update_count", 0)
             ),
         }
         if completed is not None:

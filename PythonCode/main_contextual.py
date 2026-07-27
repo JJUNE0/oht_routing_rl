@@ -139,6 +139,7 @@ def parse_args():
     )
     parser.add_argument("--exploration-noise-clip", type=float, default=0.20)
     parser.add_argument("--warmup-steps", type=int, default=10_000)
+    parser.add_argument("--episode-burnin-steps", type=int, default=2_000)
     parser.add_argument("--normalizer-freeze-steps", type=int, default=10_000)
     parser.add_argument("--device", default=None)
     parser.add_argument("--seed", type=int, default=0)
@@ -385,6 +386,7 @@ def main():
         "smooth_b_rl_weight": args.smooth_b_rl_weight,
         "smooth_exp_residual_weight": args.smooth_exp_residual_weight,
         "warmup_steps": args.warmup_steps,
+        "episode_burnin_steps": args.episode_burnin_steps,
         "normalizer_freeze_steps": args.normalizer_freeze_steps,
         "seed": args.seed,
         "exploration_noise_std": args.exploration_noise_std,
@@ -438,6 +440,7 @@ def main():
         f"action_mode={args.action_mode}, "
         f"action_scale={client._action_scale()}, "
         f"warmup_steps={client.config.warmup_steps}, "
+        f"episode_burnin_steps={client.config.episode_burnin_steps}, "
         f"exploration_noise={client.config.exploration_noise_std}->"
         f"{min(client.config.exploration_noise_std, client.config.exploration_noise_final_std)}"
         f"@global[{client.config.warmup_steps},"
