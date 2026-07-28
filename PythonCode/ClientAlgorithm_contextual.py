@@ -22,6 +22,10 @@ from cocel_rl.algorithms.contextual_td7 import (
     ContextualStepReplayBuffer,
     ContextualTD7Learner,
     DirectionalContextEncoder,
+    REPLAY_SAMPLING_MODES,
+    REPLAY_SAMPLING_RAIL,
+    REPLAY_SAMPLING_SNAPSHOT,
+    REPLAY_SAMPLING_VERSION,
     contextual_algorithm_variant,
     load_contextual_checkpoint,
     save_contextual_checkpoint,
@@ -72,6 +76,7 @@ class ContextualRuntimeConfig:
     exploration_noise_anneal_steps: int = 100_000
     exploration_noise_clip: float = 0.20
     replay_capacity_env_steps: int = 10_000
+    replay_sampling_mode: str = REPLAY_SAMPLING_RAIL
     batch_size: int = 1_024
     minimum_replay_env_steps: int = 100
     minimum_action_enabled_env_steps: int = 100
@@ -102,6 +107,17 @@ class ContextualRuntimeConfig:
             raise ValueError("training mode requires explicit action_enabled")
         if self.action_mode not in ACTION_MODES:
             raise ValueError(f"action_mode must be one of {ACTION_MODES}")
+        if self.replay_sampling_mode not in REPLAY_SAMPLING_MODES:
+            raise ValueError(
+                f"replay_sampling_mode must be one of {REPLAY_SAMPLING_MODES}"
+            )
+        if (
+            self.replay_sampling_mode == REPLAY_SAMPLING_SNAPSHOT
+            and self.lap_enabled
+        ):
+            raise ValueError(
+                "snapshot replay sampling currently requires lap_enabled=False"
+            )
         if (
             not np.isfinite(self.action_scale)
             or self.action_scale < 0.0
@@ -251,10 +267,13 @@ class ClientAlgorithm:
 
     @property
     def runtime_variant(self):
-        return (
+        base = (
             f"{ALGORITHM_VERSION}_{self.algorithm_variant}_"
             f"{self.action_version}"
         )
+        if self.config.replay_sampling_mode == REPLAY_SAMPLING_RAIL:
+            return base
+        return f"{base}_{REPLAY_SAMPLING_VERSION}"
 
     def _synchronize(self):
         if self.device.type == "cuda":
@@ -331,6 +350,7 @@ class ClientAlgorithm:
             seed=self.config.seed,
             lap_enabled=self.config.lap_enabled,
             action_version=self.action_version,
+            sampling_mode=self.config.replay_sampling_mode,
         )
         learner_config = ContextualLearnerConfig(
             action_mode=self.config.action_mode,
@@ -438,7 +458,15 @@ class ClientAlgorithm:
             "gate/normalizers_frozen": self._normalizers_frozen(),
             "gate/minimum_replay": (
                 self.replay_buffer.size_env_steps
-                >= self.config.minimum_replay_env_steps
+                >= max(
+                    self.config.minimum_replay_env_steps,
+                    (
+                        self.config.batch_size
+                        if self.config.replay_sampling_mode
+                        == REPLAY_SAMPLING_SNAPSHOT
+                        else 0
+                    ),
+                )
             ),
             "gate/minimum_action_enabled": (
                 self.action_enabled_env_steps

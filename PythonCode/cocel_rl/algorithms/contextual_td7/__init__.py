@@ -21,6 +21,10 @@ from .networks import (
 from .replay_buffer import (
     ContextualReplayError,
     ContextualStepReplayBuffer,
+    REPLAY_SAMPLING_MODES,
+    REPLAY_SAMPLING_RAIL,
+    REPLAY_SAMPLING_SNAPSHOT,
+    REPLAY_SAMPLING_VERSION,
     snapshot_from_transition,
 )
 from .replay_types import (
@@ -66,6 +70,10 @@ __all__ = [
     "ContextualReplayError",
     "ContextualStepReplayBuffer",
     "ContextualStepSnapshot",
+    "REPLAY_SAMPLING_MODES",
+    "REPLAY_SAMPLING_RAIL",
+    "REPLAY_SAMPLING_SNAPSHOT",
+    "REPLAY_SAMPLING_VERSION",
     "ReplaySampleKey",
     "snapshot_from_transition",
     "ContextualLearnerConfig",

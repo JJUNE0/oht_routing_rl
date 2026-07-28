@@ -9,6 +9,7 @@ from cocel_rl.algorithms.contextual_td7 import (
     CHECKPOINT_VERSION,
     CRITIC_INITIALIZATION,
     LAP_VERSION,
+    REPLAY_SAMPLING_VERSION,
     SALE_VERSION,
     contextual_algorithm_variant,
 )
@@ -40,11 +41,12 @@ EXP_META = {
     "protocol_version": "single_end_time_v2",
     "diagnostic_schema_version": "contextual_rail_tat_diag_v6",
     "centering": False,
-    "note": "epburnin",
+    "replay_sampling_version": REPLAY_SAMPLING_VERSION,
+    "note": "replaymode",
     "description": (
-        "Episode-local deterministic policy burn-in excludes transient "
-        "transitions and learner updates while preserving replay and temporal "
-        "reward/action history."
+        "Adds an explicit choice between the original per-rail replay "
+        "sampler and uniform full-snapshot sampling without changing learner "
+        "update equations."
     ),
 }
 
@@ -173,6 +175,8 @@ def runtime_exp_meta(config) -> dict:
     meta["lap"] = lap
     meta["sale_version"] = SALE_VERSION
     meta["lap_version"] = LAP_VERSION
+    meta["replay_sampling_version"] = REPLAY_SAMPLING_VERSION
+    meta["replay_sampling_mode"] = config.replay_sampling_mode
     meta["critic_loss_mode"] = config.critic_loss_mode
     meta["action_scale"] = float(config.action_scale)
     meta["reward_global_alpha"] = float(reward_config.global_alpha)
@@ -206,11 +210,13 @@ def runtime_exp_meta(config) -> dict:
     meta["exploration_schedule_version"] = EXPLORATION_SCHEDULE_VERSION
     replay_mode = "lap" if lap else "uniform"
     meta["replay"] = (
-        f"snapshot_{replay_mode}_{int(config.replay_capacity_env_steps)}"
+        f"{config.replay_sampling_mode}_{replay_mode}_"
+        f"{int(config.replay_capacity_env_steps)}"
     )
     meta["description"] = (
         f"{EXP_META['description']} Directional contextual TD7 with "
         f"SALE={'on' if sale else 'off'}, LAP={'on' if lap else 'off'}, "
+        f"replay_sampling={config.replay_sampling_mode}, "
         f"action_mode={action_mode}, critic_loss={config.critic_loss_mode}, "
         "independently initialized Q1/Q2 heads, "
         f"reward E ({REWARD_VERSION}, global/local="

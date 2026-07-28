@@ -30,6 +30,13 @@ class ContextualReplayError(RuntimeError):
 
 
 REPLAY_VERSION = "contextual_step_snapshot_uniform_v1"
+REPLAY_SAMPLING_VERSION = "contextual_replay_rail_or_full_snapshot_v1"
+REPLAY_SAMPLING_RAIL = "rail"
+REPLAY_SAMPLING_SNAPSHOT = "snapshot"
+REPLAY_SAMPLING_MODES = (
+    REPLAY_SAMPLING_RAIL,
+    REPLAY_SAMPLING_SNAPSHOT,
+)
 LAP_VERSION = "contextual_snapshot_lap_hierarchical_v1"
 LAP_PERFORMANCE_VERSION = "contextual_lap_cached_vectorized_v2"
 
@@ -109,9 +116,18 @@ class ContextualStepReplayBuffer:
         lap_alpha: float = 0.4,
         lap_min_priority: float = 1.0,
         action_version: str = ACTION_VERSION,
+        sampling_mode: str = REPLAY_SAMPLING_RAIL,
     ):
         if int(capacity_env_steps) <= 0:
             raise ValueError("capacity_env_steps must be positive")
+        if sampling_mode not in REPLAY_SAMPLING_MODES:
+            raise ValueError(
+                f"sampling_mode must be one of {REPLAY_SAMPLING_MODES}"
+            )
+        if sampling_mode == REPLAY_SAMPLING_SNAPSHOT and lap_enabled:
+            raise ValueError(
+                "snapshot replay sampling currently requires LAP disabled"
+            )
         self.topology = topology
         self.observation_builder = observation_builder
         self.capacity = int(capacity_env_steps)
@@ -125,6 +141,7 @@ class ContextualStepReplayBuffer:
         self.lap_alpha = float(lap_alpha)
         self.lap_min_priority = float(lap_min_priority)
         self.action_version = str(action_version)
+        self.sampling_mode = str(sampling_mode)
         self._priority = (
             np.zeros((self.capacity, self.controlled_count), np.float32)
             if self.lap_enabled else None
@@ -456,9 +473,33 @@ class ContextualStepReplayBuffer:
         if valid_slots.size == 0:
             raise ContextualReplayError("cannot sample an empty replay")
         started = time.perf_counter()
-        # With replacement is explicit: any positive batch is allowed once one
-        # environment snapshot exists.
-        if self.lap_enabled:
+        if self.sampling_mode == REPLAY_SAMPLING_SNAPSHOT:
+            if int(batch_size) > valid_slots.size:
+                raise ContextualReplayError(
+                    "snapshot batch size exceeds the number of valid "
+                    f"environment steps: batch={int(batch_size)}, "
+                    f"valid={int(valid_slots.size)}"
+                )
+            # A snapshot batch means distinct environment steps, with every
+            # controlled rail from each selected step included exactly once.
+            snapshot_slots = self.rng.choice(
+                valid_slots, size=int(batch_size), replace=False
+            )
+            transition_slots = np.repeat(
+                snapshot_slots, self.controlled_count
+            )
+            controlled_rows = np.tile(
+                np.arange(self.controlled_count, dtype=np.int64),
+                int(batch_size),
+            )
+            sample_probabilities = np.full(
+                transition_slots.size,
+                1.0 / len(valid_slots),
+                np.float64,
+            )
+        # Rail sampling is the original behavior. With replacement is
+        # explicit: any positive batch is allowed once one snapshot exists.
+        elif self.lap_enabled:
             step_sums = self._priority_sum[valid_slots]
             total_priority = float(step_sums.sum())
             if not np.isfinite(total_priority) or total_priority <= 0:

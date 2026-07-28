@@ -643,3 +643,17 @@ architectural stabilization change is selected.
   with the first post-burn-in observation and action.
 - Reward E, topology, actor/critic architecture, TD7 targets, optimizers,
   replay sampling, and action curriculum equations are unchanged.
+
+# 2026-07-28 - Selectable rail/full-snapshot replay sampling
+
+- Replay sampling version:
+  `contextual_replay_rail_or_full_snapshot_v1`.
+- The default `--replay-buffer-rail` mode preserves the existing behavior:
+  `batch_size` independent `(environment step, controlled rail)` samples.
+- The new `--replay-buffer-snapshot --no-lap` mode interprets `batch_size` as
+  the number of distinct environment steps and includes every controlled rail
+  from each selected snapshot exactly once. The resulting rail rows are
+  flattened and passed to the unchanged learner.
+- Reward E, replay storage, observation structure, network architecture, and
+  learner update equations are unchanged. `EXP_META.note=replaymode`. No
+  simulator or W&B run was launched for this implementation change.

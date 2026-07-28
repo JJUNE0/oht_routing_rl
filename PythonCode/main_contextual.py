@@ -19,7 +19,11 @@ from ClientAlgorithm_contextual import (
     ContextualRuntimeConfig,
     ContextualTrainingFailure,
 )
-from cocel_rl.algorithms.contextual_td7 import read_contextual_runtime_config
+from cocel_rl.algorithms.contextual_td7 import (
+    REPLAY_SAMPLING_RAIL,
+    REPLAY_SAMPLING_SNAPSHOT,
+    read_contextual_runtime_config,
+)
 from contextual_action import ACTION_MODES, REGION_B_RL
 
 
@@ -144,6 +148,28 @@ def parse_args():
     parser.add_argument("--device", default=None)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--replay-capacity-env-steps", type=int, default=10_000)
+    replay_sampling = parser.add_mutually_exclusive_group()
+    replay_sampling.add_argument(
+        "--replay-buffer-rail",
+        dest="replay_sampling_mode",
+        action="store_const",
+        const=REPLAY_SAMPLING_RAIL,
+        help=(
+            "Sample batch-size independent (environment step, controlled "
+            "rail) transitions. This is the default and original behavior."
+        ),
+    )
+    replay_sampling.add_argument(
+        "--replay-buffer-snapshot",
+        dest="replay_sampling_mode",
+        action="store_const",
+        const=REPLAY_SAMPLING_SNAPSHOT,
+        help=(
+            "Sample batch-size distinct environment steps and include every "
+            "controlled rail from each selected snapshot. Requires --no-lap."
+        ),
+    )
+    parser.set_defaults(replay_sampling_mode=REPLAY_SAMPLING_RAIL)
     parser.add_argument("--batch-size", type=int, default=1_024)
     parser.add_argument("--minimum-replay-env-steps", type=int, default=100)
     parser.add_argument(
@@ -396,6 +422,7 @@ def main():
         ),
         "exploration_noise_clip": args.exploration_noise_clip,
         "replay_capacity_env_steps": args.replay_capacity_env_steps,
+        "replay_sampling_mode": args.replay_sampling_mode,
         "batch_size": args.batch_size,
         "minimum_replay_env_steps": args.minimum_replay_env_steps,
         "minimum_action_enabled_env_steps": (
@@ -441,6 +468,8 @@ def main():
         f"action_scale={client._action_scale()}, "
         f"warmup_steps={client.config.warmup_steps}, "
         f"episode_burnin_steps={client.config.episode_burnin_steps}, "
+        f"replay_sampling={client.config.replay_sampling_mode}, "
+        f"batch_size={client.config.batch_size}, "
         f"exploration_noise={client.config.exploration_noise_std}->"
         f"{min(client.config.exploration_noise_std, client.config.exploration_noise_final_std)}"
         f"@global[{client.config.warmup_steps},"
