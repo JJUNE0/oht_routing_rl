@@ -139,7 +139,7 @@ def parse_args():
     )
     parser.add_argument("--exploration-noise-clip", type=float, default=0.20)
     parser.add_argument("--warmup-steps", type=int, default=10_000)
-    parser.add_argument("--episode-burnin-steps", type=int, default=2_000)
+    parser.add_argument("--episode-burnin-steps", type=int, default=0)
     parser.add_argument("--normalizer-freeze-steps", type=int, default=10_000)
     parser.add_argument("--device", default=None)
     parser.add_argument("--seed", type=int, default=0)

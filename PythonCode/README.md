@@ -149,3 +149,32 @@ python -m unittest discover -s .\PythonCode\tests -p "test_contextual*.py"
 ```
 
 현재 contextual 회귀 테스트: **157개**.
+
+
+## Ablation study
+
+```powershell
+
+#1 
+python .\PythonCode\main_contextual.py `
+  --mode training `
+  --action-enabled `
+  --no-lap `
+  --wandb
+
+#2 
+python .\PythonCode\main_contextual.py `
+  --mode training `
+  --action-enabled `
+  --no-sale `
+  --wandb
+
+#3 
+python .\PythonCode\main_contextual.py `
+  --mode training `
+  --action-enabled `
+  --no-sale `
+  --no-lap `
+  --wandb
+
+```
