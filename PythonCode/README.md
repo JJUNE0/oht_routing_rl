@@ -160,6 +160,8 @@ python .\PythonCode\main_contextual.py `
   --mode training `
   --action-enabled `
   --no-lap `
+  --replay-buffer-rail `
+  --batch-size 1024 `
   --wandb
 
 #2 
@@ -167,6 +169,8 @@ python .\PythonCode\main_contextual.py `
   --mode training `
   --action-enabled `
   --no-sale `
+  --replay-buffer-rail `
+  --batch-size 1024 `
   --wandb
 
 #3 
@@ -175,6 +179,17 @@ python .\PythonCode\main_contextual.py `
   --action-enabled `
   --no-sale `
   --no-lap `
+  --replay-buffer-rail `
+  --batch-size 1024 `
+  --wandb
+
+#4
+python main_contextual.py \
+  --mode training \
+  --action-enabled \
+  --replay-buffer-snapshot  \
+  --batch-size 4 \
+  --no-lap \
   --wandb
 
 ```
