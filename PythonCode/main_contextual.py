@@ -20,6 +20,7 @@ from ClientAlgorithm_contextual import (
     ContextualTrainingFailure,
 )
 from cocel_rl.algorithms.contextual_td7 import (
+    REPLAY_SAMPLING_RANDOM_RAIL,
     REPLAY_SAMPLING_RAIL,
     REPLAY_SAMPLING_SNAPSHOT,
     read_contextual_runtime_config,
@@ -167,6 +168,18 @@ def parse_args():
         help=(
             "Sample batch-size distinct environment steps and include every "
             "controlled rail from each selected snapshot. Requires --no-lap."
+        ),
+    )
+    replay_sampling.add_argument(
+        "--replay-buffer-random-rail",
+        "--random-rail-mode",
+        dest="replay_sampling_mode",
+        action="store_const",
+        const=REPLAY_SAMPLING_RANDOM_RAIL,
+        help=(
+            "Uniformly sample batch-size unique centered-rail transitions "
+            "directly from the complete (environment step, controlled rail) "
+            "replay pool. Requires --no-lap."
         ),
     )
     parser.set_defaults(replay_sampling_mode=REPLAY_SAMPLING_RAIL)

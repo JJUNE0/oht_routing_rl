@@ -657,3 +657,17 @@ architectural stabilization change is selected.
 - Reward E, replay storage, observation structure, network architecture, and
   learner update equations are unchanged. `EXP_META.note=replaymode`. No
   simulator or W&B run was launched for this implementation change.
+
+# 2026-07-28 - Flat random-rail replay sampling
+
+- Replay sampling version: `contextual_replay_sampling_modes_v2`.
+- Added `--replay-buffer-random-rail` (`--random-rail-mode`) for uniform,
+  without-replacement sampling directly from the full logical
+  `(environment step, controlled rail)` pool.
+- Raw physical/global states remain shared by step, so the new sampler does
+  not duplicate observation storage. Each sampled logical transition is
+  materialized into the unchanged centered-rail learner batch contract.
+- Random-rail mode requires `--no-lap`. Reward E, observation contents,
+  networks, and learner equations are unchanged.
+  `EXP_META.note=randomrail`. No simulator or W&B run was launched for this
+  implementation change.

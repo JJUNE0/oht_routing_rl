@@ -42,11 +42,11 @@ EXP_META = {
     "diagnostic_schema_version": "contextual_rail_tat_diag_v6",
     "centering": False,
     "replay_sampling_version": REPLAY_SAMPLING_VERSION,
-    "note": "replaymode",
+    "note": "randomrail",
     "description": (
-        "Adds an explicit choice between the original per-rail replay "
-        "sampler and uniform full-snapshot sampling without changing learner "
-        "update equations."
+        "Adds uniform without-replacement sampling from the full logical "
+        "environment-step by controlled-rail replay pool while preserving "
+        "the existing learner update equations."
     ),
 }
 

@@ -23,6 +23,7 @@ from cocel_rl.algorithms.contextual_td7 import (
     ContextualTD7Learner,
     DirectionalContextEncoder,
     REPLAY_SAMPLING_MODES,
+    REPLAY_SAMPLING_RANDOM_RAIL,
     REPLAY_SAMPLING_RAIL,
     REPLAY_SAMPLING_SNAPSHOT,
     REPLAY_SAMPLING_VERSION,
@@ -112,11 +113,13 @@ class ContextualRuntimeConfig:
                 f"replay_sampling_mode must be one of {REPLAY_SAMPLING_MODES}"
             )
         if (
-            self.replay_sampling_mode == REPLAY_SAMPLING_SNAPSHOT
+            self.replay_sampling_mode
+            in {REPLAY_SAMPLING_SNAPSHOT, REPLAY_SAMPLING_RANDOM_RAIL}
             and self.lap_enabled
         ):
             raise ValueError(
-                "snapshot replay sampling currently requires lap_enabled=False"
+                f"{self.replay_sampling_mode} replay sampling requires "
+                "lap_enabled=False"
             )
         if (
             not np.isfinite(self.action_scale)
@@ -273,7 +276,10 @@ class ClientAlgorithm:
         )
         if self.config.replay_sampling_mode == REPLAY_SAMPLING_RAIL:
             return base
-        return f"{base}_{REPLAY_SAMPLING_VERSION}"
+        return (
+            f"{base}_{REPLAY_SAMPLING_VERSION}_"
+            f"{self.config.replay_sampling_mode}"
+        )
 
     def _synchronize(self):
         if self.device.type == "cuda":

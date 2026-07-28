@@ -30,12 +30,14 @@ class ContextualReplayError(RuntimeError):
 
 
 REPLAY_VERSION = "contextual_step_snapshot_uniform_v1"
-REPLAY_SAMPLING_VERSION = "contextual_replay_rail_or_full_snapshot_v1"
+REPLAY_SAMPLING_VERSION = "contextual_replay_sampling_modes_v2"
 REPLAY_SAMPLING_RAIL = "rail"
 REPLAY_SAMPLING_SNAPSHOT = "snapshot"
+REPLAY_SAMPLING_RANDOM_RAIL = "random_rail"
 REPLAY_SAMPLING_MODES = (
     REPLAY_SAMPLING_RAIL,
     REPLAY_SAMPLING_SNAPSHOT,
+    REPLAY_SAMPLING_RANDOM_RAIL,
 )
 LAP_VERSION = "contextual_snapshot_lap_hierarchical_v1"
 LAP_PERFORMANCE_VERSION = "contextual_lap_cached_vectorized_v2"
@@ -124,9 +126,13 @@ class ContextualStepReplayBuffer:
             raise ValueError(
                 f"sampling_mode must be one of {REPLAY_SAMPLING_MODES}"
             )
-        if sampling_mode == REPLAY_SAMPLING_SNAPSHOT and lap_enabled:
+        if (
+            sampling_mode
+            in {REPLAY_SAMPLING_SNAPSHOT, REPLAY_SAMPLING_RANDOM_RAIL}
+            and lap_enabled
+        ):
             raise ValueError(
-                "snapshot replay sampling currently requires LAP disabled"
+                f"{sampling_mode} replay sampling requires LAP disabled"
             )
         self.topology = topology
         self.observation_builder = observation_builder
@@ -473,7 +479,37 @@ class ContextualStepReplayBuffer:
         if valid_slots.size == 0:
             raise ContextualReplayError("cannot sample an empty replay")
         started = time.perf_counter()
-        if self.sampling_mode == REPLAY_SAMPLING_SNAPSHOT:
+        if self.sampling_mode == REPLAY_SAMPLING_RANDOM_RAIL:
+            logical_count = int(valid_slots.size * self.controlled_count)
+            if int(batch_size) > logical_count:
+                raise ContextualReplayError(
+                    "random-rail batch size exceeds the number of valid "
+                    f"logical transitions: batch={int(batch_size)}, "
+                    f"valid={logical_count}"
+                )
+            # Treat the complete (valid step, controlled rail) Cartesian
+            # product as one flat replay pool. Sampling without replacement
+            # guarantees that a logical rail transition appears at most once
+            # in an optimizer batch, while allowing any number of different
+            # rails to come from the same environment step.
+            logical_indices = self.rng.choice(
+                logical_count,
+                size=int(batch_size),
+                replace=False,
+                shuffle=False,
+            )
+            transition_slots = valid_slots[
+                logical_indices // self.controlled_count
+            ]
+            controlled_rows = (
+                logical_indices % self.controlled_count
+            ).astype(np.int64, copy=False)
+            sample_probabilities = np.full(
+                int(batch_size),
+                1.0 / logical_count,
+                np.float64,
+            )
+        elif self.sampling_mode == REPLAY_SAMPLING_SNAPSHOT:
             if int(batch_size) > valid_slots.size:
                 raise ContextualReplayError(
                     "snapshot batch size exceeds the number of valid "
