@@ -671,3 +671,18 @@ architectural stabilization change is selected.
   networks, and learner equations are unchanged.
   `EXP_META.note=randomrail`. No simulator or W&B run was launched for this
   implementation change.
+## 2026-07-29 — Contextual reward F: TAT confidence ramp and full trace
+
+- `EXP_META.note=tat_ramp`, reward contract
+  `contextual_controlled_reward_v8_tat_confidence_diagnostics`.
+- Global TAT raw reward is multiplied by episode completion confidence
+  `n / (n + 50)` by default; OP and backlog terms are unchanged.
+- Added raw subterm, normalize-before-update, clipping, signed contribution,
+  and absolute-scale/share W&B diagnostics.
+- Reward F refuses resume from earlier reward checkpoints because their reward
+  normalizer statistics are not compatible. Use a fresh run.
+- Standalone reward-normalizer NPZ files now persist `reward_version`; legacy,
+  missing-version, and mismatched-version NPZ files are rejected before state
+  mutation.
+- SALE, LAP, action curriculum, replay sampling, and learner updates are
+  unchanged.

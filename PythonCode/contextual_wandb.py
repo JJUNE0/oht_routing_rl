@@ -25,7 +25,7 @@ EXP_META = {
     "action_range": "b_rl_0.0-1.0",
     "topology": "directed_10in_10out_controlled_centers_v2",
     "observation": "contextual_obs_controlled_v1",
-    "reward_version": "E",
+    "reward_version": "F",
     "reward_contract_version": REWARD_VERSION,
     "reward_global_alpha": 0.5,
     "reward_local_alpha": 0.5,
@@ -39,14 +39,13 @@ EXP_META = {
     "episode_burnin_version": "deterministic_policy_burnin_v1",
     "send_cost_logging_version": "post_send_v2",
     "protocol_version": "single_end_time_v2",
-    "diagnostic_schema_version": "contextual_rail_tat_diag_v6",
+    "diagnostic_schema_version": "contextual_reward_trace_v7",
     "centering": False,
     "replay_sampling_version": REPLAY_SAMPLING_VERSION,
-    "note": "randomrail",
+    "note": "tat_ramp",
     "description": (
-        "Adds uniform without-replacement sampling from the full logical "
-        "environment-step by controlled-rail replay pool while preserving "
-        "the existing learner update equations."
+        "Applies an episode-completion confidence ramp to the global TAT raw "
+        "term and logs raw, normalization, contribution, and scale diagnostics."
     ),
 }
 
@@ -155,10 +154,59 @@ WANDB_METRIC_KEYS = (
     "runtime/total_algorithm_ms", "runtime/total_ms",
 )
 
+WANDB_METRIC_KEYS += (
+    "reward/global/tat_error", "reward/global/tat_weight",
+    "reward/global/tat_raw_unramped", "reward/global/tat_confidence",
+    "reward/global/tat_confidence_n0", "reward/global/tat_raw_ramped",
+    "reward/global/completed_episode", "reward/global/completed_delta",
+    "reward/global/op_delta", "reward/global/op_weight",
+    "reward/global/op_raw", "reward/global/backlog",
+    "reward/global/backlog_weight", "reward/global/backlog_raw",
+    "reward/global/raw_sum", "reward/global/raw_decomposition_error",
+    "normalizer/global_reward/mean_before",
+    "normalizer/global_reward/std_before",
+    "normalizer/global_reward/count_before",
+    "normalizer/global_reward/frozen",
+    "reward/global/z_unclipped", "reward/global/normalized",
+    "reward/global/clip_delta", "reward/global/clip_applied",
+    "normalizer/local_reward/mean_before",
+    "normalizer/local_reward/std_before",
+    "normalizer/local_reward/count_before",
+    "normalizer/local_reward/frozen",
+    "reward/local/z_unclipped_mean", "reward/local/z_unclipped_std",
+    "reward/local/z_unclipped_min", "reward/local/z_unclipped_max",
+    "reward/local/normalized_mean", "reward/local/normalized_std",
+    "reward/local/normalized_min", "reward/local/normalized_max",
+    "reward/local/clip_fraction",
+    "reward/local/raw_decomposition_error_max",
+    "reward/contribution/global_mean", "reward/contribution/local_mean",
+    "reward/contribution/rail_tat_mean",
+    "reward/contribution/smooth_mean",
+    "reward/contribution/total_mean", "reward/contribution/sum_error",
+    "reward/scale/global_abs_mean", "reward/scale/local_abs_mean",
+    "reward/scale/rail_tat_abs_mean", "reward/scale/smooth_abs_mean",
+    "reward/scale/total_abs_mean", "reward/scale/global_abs_share",
+    "reward/scale/local_abs_share", "reward/scale/rail_tat_abs_share",
+    "reward/scale/smooth_abs_share", "reward/scale/abs_share_sum_error",
+    "reward/config/global_alpha", "reward/config/local_alpha",
+    "reward/config/rail_tat_weight",
+    "reward/config/smooth_weight_effective",
+) + tuple(
+    f"reward/local/{term}_raw_{stat}"
+    for term in ("oht", "predicted", "stop", "idle", "capacity")
+    for stat in ("mean", "std", "abs_mean")
+)
+
 
 def runtime_exp_meta(config) -> dict:
     meta = dict(EXP_META)
-    reward_config = ContextualRewardConfig()
+    reward_config = ContextualRewardConfig(
+        action_mode=config.action_mode,
+        smooth_b_rl_weight=config.smooth_b_rl_weight,
+        smooth_exp_residual_weight=config.smooth_exp_residual_weight,
+        tat_confidence_n0=config.tat_confidence_n0,
+        tat_confidence_ramp=config.tat_confidence_ramp,
+    )
     sale = bool(config.sale_enabled)
     lap = bool(config.lap_enabled)
     action_mode = str(config.action_mode)
@@ -181,6 +229,8 @@ def runtime_exp_meta(config) -> dict:
     meta["action_scale"] = float(config.action_scale)
     meta["reward_global_alpha"] = float(reward_config.global_alpha)
     meta["reward_local_alpha"] = float(reward_config.local_alpha)
+    meta["tat_confidence_n0"] = float(reward_config.tat_confidence_n0)
+    meta["tat_confidence_ramp"] = bool(reward_config.tat_confidence_ramp)
     meta["curriculum_end_step"] = int(config.curriculum_end_step)
     meta["replay_capacity_env_steps"] = int(
         config.replay_capacity_env_steps
@@ -219,7 +269,7 @@ def runtime_exp_meta(config) -> dict:
         f"replay_sampling={config.replay_sampling_mode}, "
         f"action_mode={action_mode}, critic_loss={config.critic_loss_mode}, "
         "independently initialized Q1/Q2 heads, "
-        f"reward E ({REWARD_VERSION}, global/local="
+        f"reward F ({REWARD_VERSION}, global/local="
         f"{reward_config.global_alpha:g}/{reward_config.local_alpha:g}), "
         f"replay_capacity={int(config.replay_capacity_env_steps)}, "
         f"curriculum_end_step={int(config.curriculum_end_step)}, "

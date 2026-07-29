@@ -146,6 +146,12 @@ def parse_args():
     parser.add_argument("--warmup-steps", type=int, default=10_000)
     parser.add_argument("--episode-burnin-steps", type=int, default=0)
     parser.add_argument("--normalizer-freeze-steps", type=int, default=10_000)
+    parser.add_argument("--tat-confidence-n0", type=float, default=500.0)
+    parser.add_argument(
+        "--tat-confidence-ramp",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--device", default=None)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--replay-capacity-env-steps", type=int, default=10_000)
@@ -427,6 +433,8 @@ def main():
         "warmup_steps": args.warmup_steps,
         "episode_burnin_steps": args.episode_burnin_steps,
         "normalizer_freeze_steps": args.normalizer_freeze_steps,
+        "tat_confidence_n0": args.tat_confidence_n0,
+        "tat_confidence_ramp": args.tat_confidence_ramp,
         "seed": args.seed,
         "exploration_noise_std": args.exploration_noise_std,
         "exploration_noise_final_std": args.exploration_noise_final_std,

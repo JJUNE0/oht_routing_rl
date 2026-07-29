@@ -68,6 +68,8 @@ class ContextualRuntimeConfig:
     warmup_steps: int = 10_000
     episode_burnin_steps: int = 2_000
     normalizer_freeze_steps: int = 10_000
+    tat_confidence_n0: float = 50.0
+    tat_confidence_ramp: bool = True
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     seed: int = 0
     topology_cache_path: str | None = None
@@ -182,6 +184,11 @@ class ContextualRuntimeConfig:
             raise ValueError(
                 "rail_tat_diagnostic_max_step must be non-negative"
             )
+        if (
+            not np.isfinite(self.tat_confidence_n0)
+            or self.tat_confidence_n0 <= 0
+        ):
+            raise ValueError("tat_confidence_n0 must be finite and positive")
 
 
 class ClientAlgorithm:
@@ -297,6 +304,8 @@ class ClientAlgorithm:
                         smooth_exp_residual_weight=(
                             self.config.smooth_exp_residual_weight
                         ),
+                        tat_confidence_n0=self.config.tat_confidence_n0,
+                        tat_confidence_ramp=self.config.tat_confidence_ramp,
                     ),
                     completion_diagnostic_path=self.rail_tat_diagnostic_path,
                     global_step_provider=lambda: self.total_steps,
@@ -332,6 +341,8 @@ class ClientAlgorithm:
                 smooth_exp_residual_weight=(
                     self.config.smooth_exp_residual_weight
                 ),
+                tat_confidence_n0=self.config.tat_confidence_n0,
+                tat_confidence_ramp=self.config.tat_confidence_ramp,
             ),
             completion_diagnostic_path=self.rail_tat_diagnostic_path,
             global_step_provider=lambda: self.total_steps,

@@ -25,9 +25,6 @@ LEGACY_CHECKPOINT_VERSIONS = {
 }
 COMPATIBLE_REWARD_VERSIONS = {
     REWARD_VERSION,
-    "contextual_controlled_reward_v4_balanced_global_local",
-    "contextual_controlled_reward_v5_completion_dedup",
-    "contextual_controlled_reward_v6_oht_state_cycle",
 }
 CRITIC_INITIALIZATION = "independent"
 
@@ -298,7 +295,8 @@ def load_contextual_checkpoint(
         raise ContextualCheckpointError(
             "checkpoint reward_version mismatch: "
             f"saved={payload.get('reward_version')!r}, "
-            f"runtime={REWARD_VERSION!r}"
+            f"runtime={REWARD_VERSION!r}. A fresh run is required because "
+            "reward normalizer statistics are incompatible."
         )
     for state_key in ("online_critic", "target_critic"):
         if _twin_state_max_abs_diff(payload[state_key]) <= 0.0:
