@@ -39,6 +39,12 @@ from contextual_action import (
     action_version,
     apply_controlled_action,
 )
+from contextual_dispatch import (
+    DISPATCH_COST,
+    DISPATCH_FIRST_MATCH,
+    DISPATCH_MODES,
+    DISPATCH_SELECTION_VERSION,
+)
 from contextual_observation import (
     ContextualObservationBuilder,
     ObservationNormalizerConfig,
@@ -100,6 +106,7 @@ class ContextualRuntimeConfig:
     early_stop_tat_threshold: float = 500.0
     early_stop_min_episode_steps: int = 100
     max_stale_sim_time_ticks: int = 5
+    dispatch_mode: str = DISPATCH_FIRST_MATCH
 
     def __post_init__(self):
         if self.mode not in {"baseline_only", "actor_inference", "training"}:
@@ -113,6 +120,10 @@ class ContextualRuntimeConfig:
         if self.replay_sampling_mode not in REPLAY_SAMPLING_MODES:
             raise ValueError(
                 f"replay_sampling_mode must be one of {REPLAY_SAMPLING_MODES}"
+            )
+        if self.dispatch_mode not in DISPATCH_MODES:
+            raise ValueError(
+                f"dispatch_mode must be one of {DISPATCH_MODES}"
             )
         if (
             self.replay_sampling_mode
@@ -253,6 +264,10 @@ class ClientAlgorithm:
         self._stale_sim_time_ticks = 0
         self._burnin_last_applied_action = None
         self._burnin_previous_applied_action = None
+        self.latest_dispatch_live_cost_by_rail: dict[int, float] = {}
+        self.latest_dispatch_cost_tick: int | None = None
+        self.dispatch_cost_ready = False
+        self._reset_dispatch_diagnostics()
         root = Path(__file__).resolve().parent.parent
         self.checkpoint_root = Path(
             self.config.checkpoint_root
@@ -502,6 +517,8 @@ class ClientAlgorithm:
             "critic_loss_mode": self.config.critic_loss_mode,
             "action_mode": self.config.action_mode,
             "action_version": self.action_version,
+            "dispatch_mode": self.config.dispatch_mode,
+            "dispatch_selection_version": DISPATCH_SELECTION_VERSION,
             "action_scale": self.config.action_scale,
             "curriculum_end_step": self.config.curriculum_end_step,
             "curriculum_scale_start": self.config.curriculum_scale_start,
@@ -689,6 +706,7 @@ class ClientAlgorithm:
             pclient.RAILLINECOST_DIC[rail_id].FRailLineCost = float(
                 baseline[physical_row]
             )
+        self._capture_dispatch_cost_snapshot(baseline)
         return apply_controlled_action(
             baseline,
             np.zeros(controlled_count, dtype=np.float32),
@@ -712,6 +730,10 @@ class ClientAlgorithm:
         self._stale_sim_time_ticks = 0
         self._burnin_last_applied_action = None
         self._burnin_previous_applied_action = None
+        self.latest_dispatch_live_cost_by_rail = {}
+        self.latest_dispatch_cost_tick = None
+        self.dispatch_cost_ready = False
+        self._reset_dispatch_diagnostics()
         if self.transition_aligner is not None:
             self.transition_aligner.reset(self.episode_id)
         if self.reward_builder is not None:
@@ -872,6 +894,72 @@ class ClientAlgorithm:
 
     def _baseline_cost(self, pclient) -> np.ndarray:
         return self._cost_components(pclient)[2]
+
+    def _capture_dispatch_cost_snapshot(self, final_cost):
+        """Freeze the exact command-0 rail costs for later command-6 use."""
+        if self.config.dispatch_mode != DISPATCH_COST:
+            return
+        costs = np.asarray(final_cost, dtype=np.float64)
+        rail_ids = np.asarray(self.topology.all_rail_ids)
+        if costs.shape != rail_ids.shape:
+            raise RuntimeError(
+                "dispatch cost snapshot shape does not match topology"
+            )
+        self.latest_dispatch_live_cost_by_rail = {
+            int(rail_id): float(costs[row])
+            for row, rail_id in enumerate(rail_ids)
+        }
+        self.latest_dispatch_cost_tick = int(self.total_steps)
+        self.dispatch_cost_ready = True
+
+    def _reset_dispatch_diagnostics(self):
+        self._dispatch_job_count = 0
+        self._dispatch_candidate_total = 0
+        self._dispatch_selected_count = 0
+        self._dispatch_selected_hops_total = 0
+        self._dispatch_path_cost_count = 0
+        self._dispatch_path_cost_total = 0.0
+        self._dispatch_changed_count = 0
+        self._dispatch_margin_count = 0
+        self._dispatch_margin_total = 0.0
+        self._dispatch_cost_snapshot_fallback_count = 0
+        self._dispatch_invalid_cost_count = 0
+
+    def _dispatch_diagnostics(self):
+        job_count = max(1, self._dispatch_job_count)
+        selected_count = max(1, self._dispatch_selected_count)
+        path_cost_count = max(1, self._dispatch_path_cost_count)
+        margin_count = max(1, self._dispatch_margin_count)
+        return {
+            "dispatch/mode_first_match": float(
+                self.config.dispatch_mode == DISPATCH_FIRST_MATCH
+            ),
+            "dispatch/mode_neutral_path_cost": 0.0,
+            "dispatch/mode_live_td7_path_cost": float(
+                self.config.dispatch_mode == DISPATCH_COST
+            ),
+            "dispatch/candidate_count_mean": (
+                float(self._dispatch_candidate_total) / job_count
+            ),
+            "dispatch/selected_pickup_hops_mean": (
+                float(self._dispatch_selected_hops_total) / selected_count
+            ),
+            "dispatch/selected_path_cost_mean": (
+                self._dispatch_path_cost_total / path_cost_count
+            ),
+            "dispatch/selection_changed_from_first_match_ratio": (
+                float(self._dispatch_changed_count) / path_cost_count
+            ),
+            "dispatch/best_second_margin_mean": (
+                self._dispatch_margin_total / margin_count
+            ),
+            "dispatch/cost_snapshot_fallback_count": float(
+                self._dispatch_cost_snapshot_fallback_count
+            ),
+            "dispatch/invalid_cost_count": float(
+                self._dispatch_invalid_cost_count
+            ),
+        }
 
     @staticmethod
     def _cpu_tensors(observation):
@@ -1123,6 +1211,7 @@ class ClientAlgorithm:
             pclient.RAILLINECOST_DIC[rail_id].FRailLineCost = float(
                 action_result.final_cost[physical_row]
             )
+        self._capture_dispatch_cost_snapshot(action_result.final_cost)
         cost_apply_ms = (time.perf_counter() - t0) * 1000.0
 
         replay_sample_ms = 0.0
@@ -1266,6 +1355,7 @@ class ClientAlgorithm:
             "learner/updates": float(
                 getattr(self.learner, "learner_update_count", 0)
             ),
+            **self._dispatch_diagnostics(),
         }
         if completed is not None:
             reward_diagnostics = self.reward_builder.diagnostics(
@@ -1449,7 +1539,10 @@ class ClientAlgorithm:
         assigned = defaultdict(int)
         used = set()
         for job in job_list:
-            for oht_id, oht in pclient.OHT_DIC.items():
+            candidates = []
+            for iteration_index, (oht_id, oht) in enumerate(
+                pclient.OHT_DIC.items()
+            ):
                 carrier_ok = any(
                     value in job.CarrierTypes for value in oht.CarrierTypes
                 )
@@ -1460,8 +1553,70 @@ class ClientAlgorithm:
                 )
                 if oht.State == 3 or not carrier_ok or not area_ok or oht_id in used:
                     continue
-                if job.FromNode in list(oht.RouteList)[:16]:
-                    assigned[job.ID] = oht_id
-                    used.add(oht_id)
-                    break
+                route_window = list(oht.RouteList)[:16]
+                if job.FromNode not in route_window:
+                    continue
+                pickup_index = route_window.index(job.FromNode)
+                candidates.append({
+                    "oht_id": oht_id,
+                    "pickup_path": tuple(route_window[: pickup_index + 1]),
+                    "pickup_hops": pickup_index + 1,
+                    "iteration_index": iteration_index,
+                })
+
+            self._dispatch_job_count += 1
+            self._dispatch_candidate_total += len(candidates)
+            if not candidates:
+                continue
+
+            selected = candidates[0]
+            if self.config.dispatch_mode == DISPATCH_COST:
+                if not self.dispatch_cost_ready:
+                    self._dispatch_cost_snapshot_fallback_count += 1
+                else:
+                    scored = []
+                    for candidate in candidates:
+                        score = 0.0
+                        for rail_id in candidate["pickup_path"]:
+                            cost = self.latest_dispatch_live_cost_by_rail.get(
+                                int(rail_id)
+                            )
+                            if (
+                                cost is None
+                                or not np.isfinite(cost)
+                                or cost < 0.0
+                            ):
+                                self._dispatch_invalid_cost_count += 1
+                                raise ValueError(
+                                    "invalid dispatch rail cost: "
+                                    f"mode={self.config.dispatch_mode}, "
+                                    f"rail_id={rail_id}, cost={cost}"
+                                )
+                            score += cost
+                        scored.append((score, candidate))
+                    scored.sort(
+                        key=lambda item: (
+                            item[0],
+                            item[1]["pickup_hops"],
+                            int(item[1]["oht_id"]),
+                        )
+                    )
+                    selected_score, selected = scored[0]
+                    self._dispatch_path_cost_count += 1
+                    self._dispatch_path_cost_total += selected_score
+                    self._dispatch_changed_count += int(
+                        selected["oht_id"] != candidates[0]["oht_id"]
+                    )
+                    if len(scored) > 1:
+                        self._dispatch_margin_count += 1
+                        self._dispatch_margin_total += (
+                            scored[1][0] - scored[0][0]
+                        )
+
+            assigned[job.ID] = selected["oht_id"]
+            used.add(selected["oht_id"])
+            self._dispatch_selected_count += 1
+            self._dispatch_selected_hops_total += selected["pickup_hops"]
+
+        self.last_diagnostics.update(self._dispatch_diagnostics())
         return assigned
