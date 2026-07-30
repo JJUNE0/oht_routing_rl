@@ -19,6 +19,10 @@ from ClientAlgorithm_contextual import (
     ContextualRuntimeConfig,
     ContextualTrainingFailure,
 )
+from contextual_dispatch import (
+    DISPATCH_FIRST_MATCH,
+    DISPATCH_MODES,
+)
 from cocel_rl.algorithms.contextual_td7 import (
     REPLAY_SAMPLING_RANDOM_RAIL,
     REPLAY_SAMPLING_RAIL,
@@ -44,6 +48,7 @@ RESUME_LAUNCH_CONTROL_FIELDS = {
     "rail_tat_diagnostic_path",
     "rail_tat_diagnostic_max_step",
     "wandb_enabled",
+    "dispatch_mode",
 }
 
 
@@ -105,6 +110,15 @@ def parse_args():
     parser.add_argument("--action-enabled", action="store_true")
     parser.add_argument(
         "--action-mode", choices=ACTION_MODES, default=REGION_B_RL
+    )
+    parser.add_argument(
+        "--dispatch-mode",
+        choices=DISPATCH_MODES,
+        default=DISPATCH_FIRST_MATCH,
+        help=(
+            "OHT selection for command 6: preserve iteration-order "
+            "first-match, or minimize cumulative live command-0 rail cost."
+        ),
     )
     parser.add_argument(
         "--action-scale",
@@ -423,6 +437,7 @@ def main():
         "mode": args.mode,
         "action_enabled": args.action_enabled,
         "action_mode": args.action_mode,
+        "dispatch_mode": args.dispatch_mode,
         "action_scale": args.action_scale,
         "curriculum_end_step": args.curriculum_end_step,
         "curriculum_scale_start": args.curriculum_scale_start,
@@ -486,6 +501,7 @@ def main():
         "[main-contextual] "
         f"mode={args.mode}, action_enabled={args.action_enabled}, "
         f"action_mode={args.action_mode}, "
+        f"dispatch_mode={client.config.dispatch_mode}, "
         f"action_scale={client._action_scale()}, "
         f"warmup_steps={client.config.warmup_steps}, "
         f"episode_burnin_steps={client.config.episode_burnin_steps}, "
