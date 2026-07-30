@@ -686,3 +686,19 @@ architectural stabilization change is selected.
   mutation.
 - SALE, LAP, action curriculum, replay sampling, and learner updates are
   unchanged.
+
+## 2026-07-30 — Command 6 selectable live-cost dispatch
+
+- Dispatch selection version: `command6_live_path_cost_v1`.
+- Added `--dispatch-mode {first-match,cost}` to `main_contextual.py`;
+  `first-match` remains the default and preserves the existing eligibility,
+  Job order, OHT iteration order, and `RouteList[:16]` behavior.
+- `cost` selects the eligible OHT with the smallest cumulative command-0
+  final rail cost over the current-to-pickup route prefix. Ties use pickup
+  hops and then numeric OHT ID.
+- The final cost snapshot is captured only after command 0 applies its action,
+  is cleared on episode reset, and falls back to first-match before the first
+  valid snapshot.
+- Added aggregate dispatch diagnostics to W&B/export metadata. Reward F,
+  learner, replay, observation, action mapping, and curriculum are unchanged.
+- No simulator or W&B run was launched for this implementation change.

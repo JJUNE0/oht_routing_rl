@@ -86,6 +86,24 @@ python .\PythonCode\main_contextual.py `
 
 실행 후 simulator GUI에서 Python 연동을 활성화하고 Run을 시작합니다.
 
+## Command 6 dispatch mode
+
+기본 배차는 기존과 동일한 first-match입니다.
+
+```powershell
+python .\PythonCode\main_contextual.py --dispatch-mode first-match
+```
+
+command 0에서 실제 적용한 rail cost의 pickup 경로 누적합이 가장 작은
+후보 OHT를 선택하려면:
+
+```powershell
+python .\PythonCode\main_contextual.py --dispatch-mode cost
+```
+
+두 모드 모두 기존 eligibility 조건과 `RouteList[:16]` 후보 범위를
+그대로 사용합니다.
+
 ## Checkpoint와 재개
 
 기본 저장 위치:
@@ -191,5 +209,15 @@ python main_contextual.py \
   --batch-size 4 \
   --no-lap \
   --wandb
+
+python .\PythonCode\main_contextual.py `
+  --mode training `
+  --action-enabled `
+  --no-lap `
+  --replay-buffer-rail `
+  --batch-size 1024 `
+  --dispatch-mode cost `
+  --wandb
+
 
 ```

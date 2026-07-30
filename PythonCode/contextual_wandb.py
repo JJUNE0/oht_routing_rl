@@ -18,6 +18,7 @@ from contextual_action import (
     REGION_B_RL,
     action_version,
 )
+from contextual_dispatch import DISPATCH_SELECTION_VERSION
 from contextual_reward import ContextualRewardConfig, REWARD_VERSION
 
 EXP_META = {
@@ -104,6 +105,15 @@ WANDB_METRIC_KEYS = (
     "global/queued_jobs", "global/waiting", "global/transfer",
     "global/completed",
     "job/mean_wait_priority", "job/mean_reassign", "job/queued",
+    "dispatch/mode_first_match", "dispatch/mode_neutral_path_cost",
+    "dispatch/mode_live_td7_path_cost",
+    "dispatch/candidate_count_mean",
+    "dispatch/selected_pickup_hops_mean",
+    "dispatch/selected_path_cost_mean",
+    "dispatch/selection_changed_from_first_match_ratio",
+    "dispatch/best_second_margin_mean",
+    "dispatch/cost_snapshot_fallback_count",
+    "dispatch/invalid_cost_count",
     "oht/idle_count", "oht/move_to_load", "oht/move_to_unload",
     "oht/loading", "oht/unloading",
     "replay/size", "replay/size_env_steps", "replay/size_logical_transitions",
@@ -219,6 +229,11 @@ def runtime_exp_meta(config) -> dict:
     meta["checkpoint_version"] = CHECKPOINT_VERSION
     meta["action_mode"] = action_mode
     meta["action_version"] = mode_version
+    meta["dispatch_mode"] = str(config.dispatch_mode)
+    meta["dispatch_selection_version"] = DISPATCH_SELECTION_VERSION
+    meta["note"] = (
+        f"{meta['note']}_dispatch_{str(config.dispatch_mode).replace('-', '_')}"
+    )
     meta["sale"] = sale
     meta["lap"] = lap
     meta["sale_version"] = SALE_VERSION
@@ -267,7 +282,8 @@ def runtime_exp_meta(config) -> dict:
         f"{EXP_META['description']} Directional contextual TD7 with "
         f"SALE={'on' if sale else 'off'}, LAP={'on' if lap else 'off'}, "
         f"replay_sampling={config.replay_sampling_mode}, "
-        f"action_mode={action_mode}, critic_loss={config.critic_loss_mode}, "
+        f"action_mode={action_mode}, dispatch_mode={config.dispatch_mode}, "
+        f"critic_loss={config.critic_loss_mode}, "
         "independently initialized Q1/Q2 heads, "
         f"reward F ({REWARD_VERSION}, global/local="
         f"{reward_config.global_alpha:g}/{reward_config.local_alpha:g}), "
