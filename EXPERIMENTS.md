@@ -767,15 +767,32 @@ architectural stabilization change is selected.
 
 ## 2026-08-03 - Optional TAT confidence ramp CLI
 
-- Added `args.use_tat_cofidence` with `--use-tat-confidence` and
-  `--no-use-tat-confidence` as the canonical CLI switches. The requested
-  `cofidence` spelling and the legacy `tat-confidence-ramp` spelling remain
-  accepted as aliases.
+- Added opt-in `args.use_tat_cofidence`. Omitting the option passes
+  `tat_confidence_ramp=False`; only `--use-tat-confidence` (or the requested
+  `--use-tat-cofidence` alias) enables it.
 - The CLI choice is a launch control and is therefore preserved when loading
   a checkpoint instead of being overwritten by the checkpoint's saved value.
 - Enabled preserves the existing
   `completed / (completed + tat_confidence_n0)` TAT reward ramp. Disabled
   applies the unramped TAT term with confidence `1.0` whenever the TAT signal
   is available.
-- `EXP_META.note=tatflag`. Reward version F and diagnostic schema v9 are
+- `EXP_META.note=tatoptin`. Reward version F and diagnostic schema v9 are
   unchanged because the existing reward branches and metrics are unchanged.
+
+## 2026-08-03 - Reward G global level terms
+
+- Reward version: `G`; contract version:
+  `contextual_controlled_reward_v9_global_tat_op_backlog_levels`.
+- Global raw reward is now
+  `9.2 * (174.4236 - marginal_tat_ema) / 174.4236`
+  `+ 5.0 * (0.80 - current_operation_rate)`
+  `- 0.002 * (waiting + queued)`.
+- Replaced the OP-rate delta reward with a current-level term. The previous
+  `op_delta` remains diagnostic-only; added `op_rate`, `op_reference`, and
+  `op_error` diagnostics.
+- TAT confidence defaults to disabled and remains opt-in through
+  `--use-tat-confidence`. TAT still uses the existing marginal-TAT EMA.
+- Local reward, rail-TAT penalty, smooth penalty, global/local alpha, replay,
+  action mapping, learner, and dispatch contracts are unchanged.
+- Diagnostic schema version: `contextual_global_reward_v10`; synchronized
+  `contextual_wandb.py` and `export_wandb_run.py`.
