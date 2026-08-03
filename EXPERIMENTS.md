@@ -644,6 +644,15 @@ architectural stabilization change is selected.
 - Reward E, topology, actor/critic architecture, TD7 targets, optimizers,
   replay sampling, and action curriculum equations are unchanged.
 
+# 2026-07-31 - Short checkpoint directory slug
+
+- Storage-path version: `contextual_checkpoint_dir_slug_v1`. Default
+  checkpoint directories now use a compact SALE/LAP/action/sampling slug plus
+  a ten-character hash of the full runtime variant. Full algorithm and replay
+  version strings remain unchanged in checkpoint and W&B metadata.
+- This is a Windows path-length fix only. Model, reward, replay sampling,
+  learner updates, and checkpoint payload contents are unchanged.
+
 # 2026-07-28 - Selectable rail/full-snapshot replay sampling
 
 - Replay sampling version:
@@ -702,3 +711,71 @@ architectural stabilization change is selected.
 - Added aggregate dispatch diagnostics to W&B/export metadata. Reward F,
   learner, replay, observation, action mapping, and curriculum are unchanged.
 - No simulator or W&B run was launched for this implementation change.
+
+## 2026-07-30 — Command 6 indexed dispatch candidates
+
+- Dispatch selection version:
+  `command6_live_path_cost_v2_indexed_candidates`.
+- Replaced the per-Job full scan over every OHT with a per-command-6
+  `pickup rail -> OHT candidates` index built from `RouteList[:16]`.
+- Job order, OHT insertion order, first pickup occurrence, eligibility,
+  one-OHT-per-batch usage, first-match selection, and cost-mode tie-breaking
+  are unchanged.
+- A 510-Job/1004-OHT synthetic workload with approximately three candidates
+  per Job produced identical assignments and reduced dispatch selection time
+  from about 599 ms to 67 ms. Reward, observation, action, and learner
+  contracts are unchanged.
+
+## 2026-07-30 - Command 6 reassignment-churn safety fix
+
+- Dispatch selection version:
+  `command6_live_path_cost_v4_safe_assignment_payload`.
+- Python dispatch now proposes only `QUEUED` Jobs with no existing OHT and
+  only unbound `IDLE` OHTs. `RESERVATED`/`WAITING` Jobs and OHTs referenced
+  by `JobID`, `DispatchedCommand`, or another command's `OHTId` are preserved.
+- The selected OHT-to-pickup prefix is sent as the assignment route instead
+  of the stale Job snapshot route.
+- Continuation assignment buffers are zero-initialized after every send, and
+  three Job snapshot running-area copy/paste errors were corrected.
+- `EXP_META.note=dispatchsafe`. Reward F, observation, learner, replay, and
+  rail-cost action contracts are unchanged.
+
+## 2026-07-30 - First-match counterfactual dispatch diagnostics
+
+- Diagnostic schema version: `contextual_reward_trace_v8`.
+- Added cost-mode comparisons against the first-match candidate from the
+  exact same candidate set: absolute/relative saving, strict-improvement
+  ratio, candidate-cost spread, multi-candidate ratio, and first-match cost.
+- Added cost-snapshot readiness, fallback, age, and eligible/zero-candidate
+  coverage diagnostics. Existing dispatch metric names remain as aliases.
+- Updated `export_wandb_run.py` with the same dispatch schema.
+- `EXP_META.note=dispatchdiag`. Dispatch selection, reward F, observation,
+  action, learner, and replay contracts are unchanged.
+
+## 2026-08-03 - Same-snapshot action variance decomposition
+
+- Diagnostic schema version: `contextual_action_decomposition_v9`.
+- Added per-environment-step cross-rail deterministic-policy, raw exploration,
+  post-clip action, and effective-noise variance diagnostics.
+- Added policy-to-noise variance ratio, action-clip direction/frequency,
+  saturation, range, and noise-suppression diagnostics. These are computed in
+  normalized actor action space before `action_scale`; existing
+  `action/applied_controlled_*` metrics remain the critic/applied-action view.
+- Updated `export_wandb_run.py` with the same action decomposition schema.
+- `EXP_META.note=actiondecomp`. Reward F, observation, action mapping,
+  dispatch selection, learner, and replay contracts are unchanged.
+
+## 2026-08-03 - Optional TAT confidence ramp CLI
+
+- Added `args.use_tat_cofidence` with `--use-tat-confidence` and
+  `--no-use-tat-confidence` as the canonical CLI switches. The requested
+  `cofidence` spelling and the legacy `tat-confidence-ramp` spelling remain
+  accepted as aliases.
+- The CLI choice is a launch control and is therefore preserved when loading
+  a checkpoint instead of being overwritten by the checkpoint's saved value.
+- Enabled preserves the existing
+  `completed / (completed + tat_confidence_n0)` TAT reward ramp. Disabled
+  applies the unramped TAT term with confidence `1.0` whenever the TAT signal
+  is available.
+- `EXP_META.note=tatflag`. Reward version F and diagnostic schema v9 are
+  unchanged because the existing reward branches and metrics are unchanged.
