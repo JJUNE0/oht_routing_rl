@@ -167,7 +167,7 @@ class PClient:
                file.write("\n")
        def RecieveSimulationSnapshotData(self):
           self.RecieveRailLineData();
-          # self.RecieveJobData();  # 새 시뮬은 스냅샷에 Job 데이터 안 보냄 (PythonCode_origin 참조)
+          self.RecieveJobData();
           self.RecieveOHTData();
 
        def SendIsEnd(self, isEnd):
@@ -748,6 +748,7 @@ class PClient:
            commandIndex += 3
 
            commandCount = self.CompletedCommandCount + self.TransferCommandCount + self.WaitingCommandCount + self.QueuedCommandCount
+           # print(f"[JobData] total={commandCount} completed={self.CompletedCommandCount} transfer={self.TransferCommandCount} waiting={self.WaitingCommandCount} queued={self.QueuedCommandCount}", flush=True)
 
            completedCommandCount = self.CompletedCommandCount  ;
            waitingTranferCommandCount = completedCommandCount + self.TransferCommandCount + self.WaitingCommandCount;
@@ -810,7 +811,7 @@ class PClient:
                  for i in range(running_area_type_cnt):
                      running_area_type = recieveMessage[commandIndex]
                      commandIndex += 1
-                     self.JOB_DIC[id].RunningAreaTyes.append(carrier_type)
+                     self.JOB_DIC[id].RunningAreaTyes.append(running_area_type)
 
                  self.JOB_DIC[id].ToNode = toNode
                  self.JOB_DIC[id].FromNode = fromNode
@@ -893,7 +894,7 @@ class PClient:
                  for i in range(running_area_type_cnt):
                      running_area_type = recieveMessage[commandIndex]
                      commandIndex += 1
-                     self.JOB_DIC[id].RunningAreaTyes.append(carrier_type)
+                     self.JOB_DIC[id].RunningAreaTyes.append(running_area_type)
                  cC += 1
 
                else:
@@ -954,7 +955,7 @@ class PClient:
                  for i in range(running_area_type_cnt):
                      running_area_type = recieveMessage[commandIndex]
                      commandIndex += 1
-                     self.JOB_DIC[id].RunningAreaTyes.append(carrier_type)
+                     self.JOB_DIC[id].RunningAreaTyes.append(running_area_type)
                  cC += 1
 
                else:
@@ -1198,13 +1199,17 @@ class PClient:
            count = 0
 
            while count < command_cnt:
-               if idx + 14 < self.BUFFER_SIZE :
-                   command_id = self.GetBase10Value_3(recieveMessage, idx)
-                   idx += 3
-                   if command_id == 0:
-                       recieveMessage = self.RecieveMessage(self.BUFFER_SIZE)
-                       idx = 0
-                       continue;
+               if idx + 14 >= len(recieveMessage):
+                   recieveMessage = self.RecieveMessage(self.BUFFER_SIZE)
+                   idx = 0
+                   continue
+
+               command_id = self.GetBase10Value_3(recieveMessage, idx)
+               idx += 3
+               if command_id == 0:
+                   recieveMessage = self.RecieveMessage(self.BUFFER_SIZE)
+                   idx = 0
+                   continue;
              
                from_node = self.GetBase10Value_2(recieveMessage, idx)
                idx += 2
@@ -1251,24 +1256,33 @@ class PClient:
                count += 1
            return job_list
 
-       def SendAssignOht(self, oht_dic):
+       def SendAssignOht(self, assignments):
            buffer = bytearray(self.BUFFER_SIZE)
            idx = 0
-           self.SetByteHexa_2Legnth(len(oht_dic.keys()),buffer, idx)
+           self.SetByteHexa_2Legnth(len(assignments),buffer, idx)
            idx += 2
 
-           for job_id, oht_id in oht_dic.items():
-               if idx + 5  + len(self.JOB_DIC[job_id].RouteList) * 2 + 2 >= self.BUFFER_SIZE:
+           for job_id, assignment in assignments.items():
+               if isinstance(assignment, dict):
+                   oht_id = assignment["oht_id"]
+                   route = list(assignment["pickup_path"])
+               else:
+                   # Legacy main.py still returns {job_id: oht_id}.
+                   oht_id = assignment
+                   route = list(self.JOB_DIC[job_id].RouteList)
+
+               if idx + 5 + len(route) * 2 + 2 >= self.BUFFER_SIZE:
                    self.SendMessage(buffer)
+                   buffer = bytearray(self.BUFFER_SIZE)
                    idx = 0
 
                self.SetByteHexa_3Legnth(job_id, buffer, idx)
                idx += 3
                self.SetByteHexa_2Legnth(oht_id, buffer, idx)
                idx += 2
-               self.SetByteHexa_2Legnth(len(self.JOB_DIC[job_id].RouteList), buffer, idx)
+               self.SetByteHexa_2Legnth(len(route), buffer, idx)
                idx += 2
-               for line_id in self.JOB_DIC[job_id].RouteList:
+               for line_id in route:
                    self.SetByteHexa_2Legnth(line_id, buffer, idx)
                    idx += 2
 

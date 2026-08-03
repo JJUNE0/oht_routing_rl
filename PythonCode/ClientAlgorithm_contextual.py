@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import heapq
+import hashlib
 import os
 import time
 import traceback
@@ -55,8 +56,15 @@ from contextual_transition import ContextualTransitionAligner
 from contextual_wandb import ContextualWandbLogger
 
 
+QUEUED_JOB_STATE = 1
+IDLE_OHT_STATE = 0
+
+
 class ContextualTrainingFailure(RuntimeError):
     """Fatal training failure requiring an explicit process restart."""
+
+
+CHECKPOINT_DIRECTORY_VERSION = "contextual_checkpoint_dir_slug_v1"
 
 
 @dataclass(frozen=True)
@@ -271,7 +279,7 @@ class ClientAlgorithm:
         root = Path(__file__).resolve().parent.parent
         self.checkpoint_root = Path(
             self.config.checkpoint_root
-            or root / "checkpoints" / self.runtime_variant
+            or root / "checkpoints" / self.checkpoint_variant
         )
         self.rail_tat_diagnostic_path = Path(
             self.config.rail_tat_diagnostic_path
@@ -301,6 +309,19 @@ class ClientAlgorithm:
         return (
             f"{base}_{REPLAY_SAMPLING_VERSION}_"
             f"{self.config.replay_sampling_mode}"
+        )
+
+    @property
+    def checkpoint_variant(self):
+        """Short, collision-resistant directory name for Windows paths."""
+        digest = hashlib.sha256(
+            self.runtime_variant.encode("utf-8")
+        ).hexdigest()[:10]
+        return (
+            f"ctx_td7_s{int(self.config.sale_enabled)}_"
+            f"l{int(self.config.lap_enabled)}_"
+            f"{self.config.action_mode}_"
+            f"{self.config.replay_sampling_mode}_{digest}"
         )
 
     def _synchronize(self):
@@ -511,6 +532,8 @@ class ClientAlgorithm:
     def _runtime_checkpoint_metadata(self, checkpoint_kind="latest"):
         return {
             "algorithm_version": self.runtime_variant,
+            "checkpoint_directory_version": CHECKPOINT_DIRECTORY_VERSION,
+            "checkpoint_variant": self.checkpoint_variant,
             "uniform_replay": not self.config.lap_enabled,
             "sale": self.config.sale_enabled,
             "lap": self.config.lap_enabled,
@@ -910,26 +933,64 @@ class ClientAlgorithm:
             for row, rail_id in enumerate(rail_ids)
         }
         self.latest_dispatch_cost_tick = int(self.total_steps)
+        self._dispatch_cost_snapshot_step = int(self.total_steps)
         self.dispatch_cost_ready = True
 
     def _reset_dispatch_diagnostics(self):
         self._dispatch_job_count = 0
+        self._dispatch_eligible_job_count = 0
+        self._dispatch_zero_candidate_count = 0
         self._dispatch_candidate_total = 0
         self._dispatch_selected_count = 0
         self._dispatch_selected_hops_total = 0
+        self._dispatch_cost_attempt_count = 0
         self._dispatch_path_cost_count = 0
         self._dispatch_path_cost_total = 0.0
+        self._dispatch_first_match_path_cost_total = 0.0
+        self._dispatch_first_match_hops_total = 0
+        self._dispatch_cost_saving_total = 0.0
+        self._dispatch_relative_cost_saving_total = 0.0
+        self._dispatch_candidate_cost_spread_total = 0.0
+        self._dispatch_multi_candidate_count = 0
         self._dispatch_changed_count = 0
+        self._dispatch_strict_cost_improvement_count = 0
         self._dispatch_margin_count = 0
         self._dispatch_margin_total = 0.0
         self._dispatch_cost_snapshot_fallback_count = 0
         self._dispatch_invalid_cost_count = 0
+        self._dispatch_cost_snapshot_step = None
+
+    @staticmethod
+    def _safe_ratio(numerator, denominator):
+        return (
+            float(numerator) / float(denominator)
+            if denominator > 0
+            else 0.0
+        )
 
     def _dispatch_diagnostics(self):
-        job_count = max(1, self._dispatch_job_count)
-        selected_count = max(1, self._dispatch_selected_count)
-        path_cost_count = max(1, self._dispatch_path_cost_count)
-        margin_count = max(1, self._dispatch_margin_count)
+        eligible = self._dispatch_eligible_job_count
+        selected = self._dispatch_selected_count
+        attempts = self._dispatch_cost_attempt_count
+        decisions = self._dispatch_path_cost_count
+        snapshot_age = (
+            -1.0
+            if self._dispatch_cost_snapshot_step is None
+            else float(
+                max(
+                    0,
+                    self.total_steps - self._dispatch_cost_snapshot_step,
+                )
+            )
+        )
+        changed_ratio = self._safe_ratio(
+            self._dispatch_changed_count,
+            decisions,
+        )
+        selection_margin = self._safe_ratio(
+            self._dispatch_margin_total,
+            self._dispatch_margin_count,
+        )
         return {
             "dispatch/mode_first_match": float(
                 self.config.dispatch_mode == DISPATCH_FIRST_MATCH
@@ -938,21 +999,98 @@ class ClientAlgorithm:
             "dispatch/mode_live_td7_path_cost": float(
                 self.config.dispatch_mode == DISPATCH_COST
             ),
+            "dispatch/cost_mode_active": float(
+                self.config.dispatch_mode == DISPATCH_COST
+            ),
+            "dispatch/cost_snapshot_ready": float(
+                self.dispatch_cost_ready
+            ),
+            "dispatch/cost_snapshot_ready_ratio": self._safe_ratio(
+                decisions,
+                attempts,
+            ),
+            "dispatch/cost_snapshot_age_steps": snapshot_age,
+            "dispatch/eligible_job_count_total": float(eligible),
             "dispatch/candidate_count_mean": (
-                float(self._dispatch_candidate_total) / job_count
+                self._safe_ratio(
+                    self._dispatch_candidate_total,
+                    self._dispatch_job_count,
+                )
+            ),
+            "dispatch/candidate_count_mean_per_eligible_job": (
+                self._safe_ratio(
+                    self._dispatch_candidate_total,
+                    eligible,
+                )
+            ),
+            "dispatch/zero_candidate_ratio_per_eligible_job": (
+                self._safe_ratio(
+                    self._dispatch_zero_candidate_count,
+                    eligible,
+                )
+            ),
+            "dispatch/selected_ratio_per_eligible_job": (
+                self._safe_ratio(selected, eligible)
             ),
             "dispatch/selected_pickup_hops_mean": (
-                float(self._dispatch_selected_hops_total) / selected_count
+                self._safe_ratio(
+                    self._dispatch_selected_hops_total,
+                    selected,
+                )
+            ),
+            "dispatch/first_match_pickup_hops_mean": (
+                self._safe_ratio(
+                    self._dispatch_first_match_hops_total,
+                    decisions,
+                )
+            ),
+            "dispatch/first_match_path_cost_mean": (
+                self._safe_ratio(
+                    self._dispatch_first_match_path_cost_total,
+                    decisions,
+                )
             ),
             "dispatch/selected_path_cost_mean": (
-                self._dispatch_path_cost_total / path_cost_count
+                self._safe_ratio(
+                    self._dispatch_path_cost_total,
+                    decisions,
+                )
             ),
-            "dispatch/selection_changed_from_first_match_ratio": (
-                float(self._dispatch_changed_count) / path_cost_count
+            "dispatch/cost_saving_vs_first_mean": (
+                self._safe_ratio(
+                    self._dispatch_cost_saving_total,
+                    decisions,
+                )
             ),
-            "dispatch/best_second_margin_mean": (
-                self._dispatch_margin_total / margin_count
+            "dispatch/cost_saving_vs_first_ratio_mean": (
+                self._safe_ratio(
+                    self._dispatch_relative_cost_saving_total,
+                    decisions,
+                )
             ),
+            "dispatch/candidate_cost_spread_mean": (
+                self._safe_ratio(
+                    self._dispatch_candidate_cost_spread_total,
+                    decisions,
+                )
+            ),
+            "dispatch/multi_candidate_ratio": self._safe_ratio(
+                self._dispatch_multi_candidate_count,
+                decisions,
+            ),
+            "dispatch/changed_from_first_ratio": changed_ratio,
+            "dispatch/strict_cost_improvement_ratio": self._safe_ratio(
+                self._dispatch_strict_cost_improvement_count,
+                decisions,
+            ),
+            "dispatch/cost_snapshot_fallback_ratio": self._safe_ratio(
+                self._dispatch_cost_snapshot_fallback_count,
+                attempts,
+            ),
+            "dispatch/selection_margin_mean": selection_margin,
+            # Compatibility aliases for existing dashboards.
+            "dispatch/selection_changed_from_first_match_ratio": changed_ratio,
+            "dispatch/best_second_margin_mean": selection_margin,
             "dispatch/cost_snapshot_fallback_count": float(
                 self._dispatch_cost_snapshot_fallback_count
             ),
@@ -1146,6 +1284,8 @@ class ClientAlgorithm:
             )
             timing.update(inference_timing)
         controlled_action = deterministic_policy.copy()
+        raw_exploration_noise = np.zeros_like(deterministic_policy)
+        preclip_action = deterministic_policy.copy()
         exploration_noise_std = (
             0.0 if burnin_active else self._exploration_noise_std()
         )
@@ -1166,19 +1306,29 @@ class ClientAlgorithm:
             and should_apply
             and not burnin_active
         ):
-            noise = self.exploration_rng.normal(
+            raw_exploration_noise = self.exploration_rng.normal(
                 0.0,
                 exploration_noise_std,
                 size=controlled_action.shape,
             )
-            noise = np.clip(
-                noise,
+            raw_exploration_noise = np.clip(
+                raw_exploration_noise,
                 -self.config.exploration_noise_clip,
                 self.config.exploration_noise_clip,
-            )
-            controlled_action = np.clip(
-                controlled_action + noise, -1.0, 1.0
             ).astype(np.float32)
+            preclip_action = (
+                deterministic_policy + raw_exploration_noise
+            )
+            controlled_action = np.clip(preclip_action, -1.0, 1.0).astype(
+                np.float32
+            )
+
+        effective_noise = controlled_action - deterministic_policy
+        policy_variance = float(np.var(deterministic_policy))
+        noise_variance = float(np.var(raw_exploration_noise))
+        positive_clip_mask = preclip_action > 1.0
+        negative_clip_mask = preclip_action < -1.0
+        clipped_mask = positive_clip_mask | negative_clip_mask
 
         policy_delta_mean, policy_delta_std = self._temporal_delta(
             deterministic_policy, self.last_policy_action
@@ -1308,6 +1458,49 @@ class ClientAlgorithm:
             "action/policy_max": float(deterministic_policy.max()),
             "action/policy_saturation_ratio": float(
                 (np.abs(deterministic_policy) >= 0.999).mean()
+            ),
+            "action/cross_rail_policy_std": float(
+                deterministic_policy.std()
+            ),
+            "action/cross_rail_applied_std": float(
+                controlled_action.std()
+            ),
+            "action/cross_rail_noise_std": float(
+                raw_exploration_noise.std()
+            ),
+            "action/cross_rail_noise_residual_std": float(
+                effective_noise.std()
+            ),
+            "action/cross_rail_policy_range": float(
+                np.ptp(deterministic_policy)
+            ),
+            "action/policy_to_noise_variance_ratio": float(
+                policy_variance / (noise_variance + 1e-12)
+            ),
+            "action/noise_abs_mean": float(
+                np.abs(raw_exploration_noise).mean()
+            ),
+            "action/noise_residual_abs_mean": float(
+                np.abs(effective_noise).mean()
+            ),
+            "action/clipped_fraction": float(clipped_mask.mean()),
+            "action/positive_clip_ratio": float(
+                positive_clip_mask.mean()
+            ),
+            "action/negative_clip_ratio": float(
+                negative_clip_mask.mean()
+            ),
+            "action/noise_suppressed_by_clip_mean": float(
+                (
+                    np.abs(raw_exploration_noise)
+                    - np.abs(effective_noise)
+                ).mean()
+            ),
+            "action/policy_positive_saturation_ratio": float(
+                (deterministic_policy > 0.95).mean()
+            ),
+            "action/policy_negative_saturation_ratio": float(
+                (deterministic_policy < -0.95).mean()
             ),
             "action/policy_temporal_delta_mean": policy_delta_mean,
             "action/policy_temporal_delta_std": policy_delta_std,
@@ -1536,13 +1729,55 @@ class ClientAlgorithm:
         }
 
     def Assign(self, pclient, job_list):
-        assigned = defaultdict(int)
+        assigned = {}
         used = set()
-        for job in job_list:
-            candidates = []
-            for iteration_index, (oht_id, oht) in enumerate(
-                pclient.OHT_DIC.items()
+        jobs = list(job_list)
+        owned_oht_ids = {
+            int(job.OHTId)
+            for job in jobs
+            if int(job.OHTId) != 0
+        }
+        pickup_candidates = defaultdict(list)
+        for iteration_index, (oht_id, oht) in enumerate(
+            pclient.OHT_DIC.items()
+        ):
+            if (
+                oht.State != IDLE_OHT_STATE
+                or oht.JobID != 0
+                or oht.DispatchedCommand != 0
+                or int(oht_id) in owned_oht_ids
             ):
+                continue
+            route_window = tuple(list(oht.RouteList)[:16])
+            seen_rails = set()
+            for pickup_index, rail_id in enumerate(route_window):
+                if rail_id in seen_rails:
+                    continue
+                seen_rails.add(rail_id)
+                pickup_candidates[rail_id].append(
+                    (
+                        iteration_index,
+                        oht_id,
+                        oht,
+                        route_window[: pickup_index + 1],
+                        pickup_index + 1,
+                    )
+                )
+
+        for job in jobs:
+            self._dispatch_job_count += 1
+            if job.State != QUEUED_JOB_STATE or job.OHTId != 0:
+                continue
+            self._dispatch_eligible_job_count += 1
+
+            candidates = []
+            for (
+                iteration_index,
+                oht_id,
+                oht,
+                pickup_path,
+                pickup_hops,
+            ) in pickup_candidates.get(job.FromNode, ()):
                 carrier_ok = any(
                     value in job.CarrierTypes for value in oht.CarrierTypes
                 )
@@ -1551,26 +1786,23 @@ class ClientAlgorithm:
                     or oht.RunningAreaType == 0
                     or job.RunningAreaTyes[0] == 0
                 )
-                if oht.State == 3 or not carrier_ok or not area_ok or oht_id in used:
+                if not carrier_ok or not area_ok or oht_id in used:
                     continue
-                route_window = list(oht.RouteList)[:16]
-                if job.FromNode not in route_window:
-                    continue
-                pickup_index = route_window.index(job.FromNode)
                 candidates.append({
                     "oht_id": oht_id,
-                    "pickup_path": tuple(route_window[: pickup_index + 1]),
-                    "pickup_hops": pickup_index + 1,
+                    "pickup_path": pickup_path,
+                    "pickup_hops": pickup_hops,
                     "iteration_index": iteration_index,
                 })
 
-            self._dispatch_job_count += 1
             self._dispatch_candidate_total += len(candidates)
             if not candidates:
+                self._dispatch_zero_candidate_count += 1
                 continue
 
             selected = candidates[0]
             if self.config.dispatch_mode == DISPATCH_COST:
+                self._dispatch_cost_attempt_count += 1
                 if not self.dispatch_cost_ready:
                     self._dispatch_cost_snapshot_fallback_count += 1
                 else:
@@ -1594,6 +1826,12 @@ class ClientAlgorithm:
                                 )
                             score += cost
                         scored.append((score, candidate))
+                    first_match_score = scored[0][0]
+                    first_match_hops = candidates[0]["pickup_hops"]
+                    candidate_scores = [item[0] for item in scored]
+                    candidate_cost_spread = (
+                        max(candidate_scores) - min(candidate_scores)
+                    )
                     scored.sort(
                         key=lambda item: (
                             item[0],
@@ -1602,18 +1840,47 @@ class ClientAlgorithm:
                         )
                     )
                     selected_score, selected = scored[0]
-                    self._dispatch_path_cost_count += 1
-                    self._dispatch_path_cost_total += selected_score
-                    self._dispatch_changed_count += int(
+                    cost_saving = max(
+                        0.0,
+                        first_match_score - selected_score,
+                    )
+                    relative_saving = (
+                        cost_saving / first_match_score
+                        if first_match_score > 1e-12
+                        else 0.0
+                    )
+                    changed = (
                         selected["oht_id"] != candidates[0]["oht_id"]
                     )
+                    strict_improvement = cost_saving > 1e-9
+                    self._dispatch_path_cost_count += 1
+                    self._dispatch_path_cost_total += selected_score
+                    self._dispatch_first_match_path_cost_total += (
+                        first_match_score
+                    )
+                    self._dispatch_first_match_hops_total += first_match_hops
+                    self._dispatch_cost_saving_total += cost_saving
+                    self._dispatch_relative_cost_saving_total += (
+                        relative_saving
+                    )
+                    self._dispatch_candidate_cost_spread_total += (
+                        candidate_cost_spread
+                    )
+                    self._dispatch_changed_count += int(changed)
+                    self._dispatch_strict_cost_improvement_count += int(
+                        strict_improvement
+                    )
                     if len(scored) > 1:
+                        self._dispatch_multi_candidate_count += 1
                         self._dispatch_margin_count += 1
                         self._dispatch_margin_total += (
                             scored[1][0] - scored[0][0]
                         )
 
-            assigned[job.ID] = selected["oht_id"]
+            assigned[job.ID] = {
+                "oht_id": selected["oht_id"],
+                "pickup_path": list(selected["pickup_path"]),
+            }
             used.add(selected["oht_id"])
             self._dispatch_selected_count += 1
             self._dispatch_selected_hops_total += selected["pickup_hops"]
