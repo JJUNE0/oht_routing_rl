@@ -83,7 +83,7 @@ class ContextualRuntimeConfig:
     episode_burnin_steps: int = 2_000
     normalizer_freeze_steps: int = 10_000
     tat_confidence_n0: float = 50.0
-    tat_confidence_ramp: bool = True
+    tat_confidence_ramp: bool = False
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     seed: int = 0
     topology_cache_path: str | None = None

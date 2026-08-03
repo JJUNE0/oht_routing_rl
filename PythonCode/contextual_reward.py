@@ -15,7 +15,7 @@ from contextual_observation import RunningFeatureNormalizer
 from contextual_topology import ContextualTopology
 
 REWARD_VERSION = (
-    "contextual_controlled_reward_v8_tat_confidence_diagnostics"
+    "contextual_controlled_reward_v9_global_tat_op_backlog_levels"
 )
 
 ACTIVE_OHT_CYCLE_STATES = frozenset({
@@ -40,14 +40,15 @@ class ContextualRewardConfig:
     smooth_exp_residual_weight: float = 0.5
     tat_weight: float = 9.2
     op_weight: float = 5.0
-    backlog_weight: float = 0.01
+    backlog_weight: float = 0.002
     use_tat: bool = True
-    use_op: bool = False
+    use_op: bool = True
     use_backlog: bool = True
     tat_reference: float = 2.90706 * 60.0
+    op_reference: float = 0.80
     tat_ema_beta: float = 0.05
     tat_confidence_n0: float = 50.0
-    tat_confidence_ramp: bool = True
+    tat_confidence_ramp: bool = False
     freeze_after_env_steps: int = 30_000
     normalizer_epsilon: float = 1e-6
     global_clip: float | None = 5.0
@@ -58,13 +59,16 @@ class ContextualRewardConfig:
             self.global_alpha, self.local_alpha, self.rail_tat_weight,
             self.smooth_b_rl_weight, self.smooth_exp_residual_weight,
             self.tat_weight, self.op_weight,
-            self.backlog_weight, self.tat_reference, self.tat_ema_beta,
+            self.backlog_weight, self.tat_reference, self.op_reference,
+            self.tat_ema_beta,
             self.tat_confidence_n0, self.normalizer_epsilon,
         )
         if not np.isfinite(numeric).all():
             raise ValueError("reward config contains NaN or Inf")
         if self.tat_reference <= 0 or self.normalizer_epsilon <= 0:
             raise ValueError("tat_reference and normalizer_epsilon must be positive")
+        if not 0.0 <= self.op_reference <= 1.0:
+            raise ValueError("op_reference must be in [0, 1]")
         if self.tat_confidence_n0 <= 0:
             raise ValueError("tat_confidence_n0 must be finite and positive")
         if self.freeze_after_env_steps < 0:
@@ -100,6 +104,9 @@ class ControlledRewardBatch:
     tat_raw_ramped: float
     completed_episode: float
     completed_delta: float
+    op_rate: float
+    op_reference: float
+    op_error: float
     op_delta: float
     op_raw: float
     backlog: float
@@ -325,7 +332,8 @@ class ContextualRewardBuilder:
             float(self._prev_op_rate) - cur_op
             if self._prev_op_rate is not None else 0.0
         )
-        op_raw = cfg.op_weight * op_delta if cfg.use_op else 0.0
+        op_error = cfg.op_reference - cur_op
+        op_raw = cfg.op_weight * op_error if cfg.use_op else 0.0
         backlog = waiting + queued
         backlog_raw = -cfg.backlog_weight * backlog if cfg.use_backlog else 0.0
         raw = tat_raw_ramped + op_raw + backlog_raw
@@ -336,6 +344,9 @@ class ContextualRewardBuilder:
             "tat_raw_ramped": tat_raw_ramped,
             "completed_episode": completed,
             "completed_delta": delta_completed,
+            "op_rate": cur_op,
+            "op_reference": cfg.op_reference,
+            "op_error": op_error,
             "op_delta": op_delta,
             "op_raw": op_raw,
             "backlog": backlog,
@@ -1486,6 +1497,9 @@ class ContextualRewardBuilder:
                 self._last_global_terms["completed_episode"]
             ),
             completed_delta=float(self._last_global_terms["completed_delta"]),
+            op_rate=float(self._last_global_terms["op_rate"]),
+            op_reference=float(self._last_global_terms["op_reference"]),
+            op_error=float(self._last_global_terms["op_error"]),
             op_delta=float(self._last_global_terms["op_delta"]),
             op_raw=float(self._last_global_terms["op_raw"]),
             backlog=float(self._last_global_terms["backlog"]),
@@ -1538,6 +1552,9 @@ class ContextualRewardBuilder:
             "reward/global/tat_raw_ramped": batch.tat_raw_ramped,
             "reward/global/completed_episode": batch.completed_episode,
             "reward/global/completed_delta": batch.completed_delta,
+            "reward/global/op_rate": batch.op_rate,
+            "reward/global/op_reference": batch.op_reference,
+            "reward/global/op_error": batch.op_error,
             "reward/global/op_delta": batch.op_delta,
             "reward/global/op_weight": self.config.op_weight,
             "reward/global/op_raw": batch.op_raw,

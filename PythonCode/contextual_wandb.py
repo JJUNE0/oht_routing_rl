@@ -26,10 +26,16 @@ EXP_META = {
     "action_range": "b_rl_0.0-1.0",
     "topology": "directed_10in_10out_controlled_centers_v2",
     "observation": "contextual_obs_controlled_v1",
-    "reward_version": "F",
+    "reward_version": "G",
     "reward_contract_version": REWARD_VERSION,
     "reward_global_alpha": 0.5,
     "reward_local_alpha": 0.5,
+    "tat_reference": 174.4236,
+    "tat_weight": 9.2,
+    "op_reference": 0.80,
+    "op_weight": 5.0,
+    "backlog_weight": 0.002,
+    "tat_confidence_ramp": False,
     "action_scale": 0.05,
     "exploration_noise_std": 0.10,
     "exploration_noise_final_std": 0.02,
@@ -41,14 +47,14 @@ EXP_META = {
     "episode_burnin_version": "deterministic_policy_burnin_v1",
     "send_cost_logging_version": "post_send_v2",
     "protocol_version": "single_end_time_v2",
-    "diagnostic_schema_version": "contextual_action_decomposition_v9",
+    "diagnostic_schema_version": "contextual_global_reward_v10",
     "centering": False,
     "replay_sampling_version": REPLAY_SAMPLING_VERSION,
-    "note": "tatoptin",
+    "note": "globalg",
     "description": (
-        "Makes TAT confidence an explicit opt-in CLI feature: omitted means "
-        "unramped TAT reward and --use-tat-confidence enables the existing "
-        "completed-job confidence ramp."
+        "Reward G keeps the marginal-TAT EMA level term, replaces OP delta "
+        "with current OP level relative to 0.80, reduces backlog weight to "
+        "0.002, and disables TAT confidence by default."
     ),
 }
 
@@ -200,7 +206,9 @@ WANDB_METRIC_KEYS += (
     "reward/global/tat_raw_unramped", "reward/global/tat_confidence",
     "reward/global/tat_confidence_n0", "reward/global/tat_raw_ramped",
     "reward/global/completed_episode", "reward/global/completed_delta",
-    "reward/global/op_delta", "reward/global/op_weight",
+    "reward/global/op_rate", "reward/global/op_reference",
+    "reward/global/op_error", "reward/global/op_delta",
+    "reward/global/op_weight",
     "reward/global/op_raw", "reward/global/backlog",
     "reward/global/backlog_weight", "reward/global/backlog_raw",
     "reward/global/raw_sum", "reward/global/raw_decomposition_error",
@@ -277,6 +285,11 @@ def runtime_exp_meta(config) -> dict:
     meta["reward_local_alpha"] = float(reward_config.local_alpha)
     meta["tat_confidence_n0"] = float(reward_config.tat_confidence_n0)
     meta["tat_confidence_ramp"] = bool(reward_config.tat_confidence_ramp)
+    meta["tat_reference"] = float(reward_config.tat_reference)
+    meta["tat_weight"] = float(reward_config.tat_weight)
+    meta["op_reference"] = float(reward_config.op_reference)
+    meta["op_weight"] = float(reward_config.op_weight)
+    meta["backlog_weight"] = float(reward_config.backlog_weight)
     meta["curriculum_end_step"] = int(config.curriculum_end_step)
     meta["replay_capacity_env_steps"] = int(
         config.replay_capacity_env_steps
@@ -316,7 +329,7 @@ def runtime_exp_meta(config) -> dict:
         f"action_mode={action_mode}, dispatch_mode={config.dispatch_mode}, "
         f"critic_loss={config.critic_loss_mode}, "
         "independently initialized Q1/Q2 heads, "
-        f"reward F ({REWARD_VERSION}, global/local="
+        f"reward G ({REWARD_VERSION}, global/local="
         f"{reward_config.global_alpha:g}/{reward_config.local_alpha:g}), "
         f"replay_capacity={int(config.replay_capacity_env_steps)}, "
         f"curriculum_end_step={int(config.curriculum_end_step)}, "
