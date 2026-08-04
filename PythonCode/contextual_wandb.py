@@ -26,7 +26,7 @@ EXP_META = {
     "action_range": "b_rl_0.0-1.0",
     "topology": "directed_10in_10out_controlled_centers_v2",
     "observation": "contextual_obs_controlled_v1",
-    "reward_version": "G",
+    "reward_version": "H",
     "reward_contract_version": REWARD_VERSION,
     "reward_global_alpha": 0.5,
     "reward_local_alpha": 0.5,
@@ -47,14 +47,15 @@ EXP_META = {
     "episode_burnin_version": "deterministic_policy_burnin_v1",
     "send_cost_logging_version": "post_send_v2",
     "protocol_version": "single_end_time_v2",
-    "diagnostic_schema_version": "contextual_global_reward_v10",
+    "diagnostic_schema_version": "contextual_global_reward_v11",
     "centering": False,
     "replay_sampling_version": REPLAY_SAMPLING_VERSION,
-    "note": "globalg",
+    "note": "tatlevel",
     "description": (
-        "Reward G keeps the marginal-TAT EMA level term, replaces OP delta "
-        "with current OP level relative to 0.80, reduces backlog weight to "
-        "0.002, and disables TAT confidence by default."
+        "Reward H removes quantization-amplified marginal-TAT reconstruction "
+        "and uses the simulator TotalTat level directly. OP level, backlog, "
+        "local, rail-TAT, and smooth-control terms are unchanged; use a fresh "
+        "critic, replay buffer, and reward normalizer."
     ),
 }
 
@@ -107,8 +108,7 @@ WANDB_METRIC_KEYS = (
     "reward/global_component", "reward/local_raw_mean",
     "reward/local_raw_std", "reward/local_normalized_mean",
     "reward/local_normalized_std", "reward/local_component_mean",
-    "reward/local_component_std", "reward/marginal_tat_ema",
-    "reward/tat_signal_available",
+    "reward/local_component_std", "reward/total_tat_level",
     "reward/rail_tat_penalty_mean", "reward/smooth_penalty_mean",
     "reward/total_mean", "reward/total_std", "reward/finite_ratio",
     "reward/smooth_control_delta_mean", "reward/smooth_control_delta_max",
@@ -117,7 +117,7 @@ WANDB_METRIC_KEYS = (
     "reward/rail_tat_sum", "reward/rail_tat_mean",
     "reward/rail_tat_vector_mean", "reward/rail_tat_event_mean",
     "reward/rail_tat_max",
-    "reward/alpha", "reward/marg_tat", "reward/backlog",
+    "reward/alpha", "reward/backlog",
     "reward/smooth_mean",
     "curriculum/action_scale",
     "global/tat", "global/op_rate", "global/queued",
@@ -202,7 +202,9 @@ WANDB_METRIC_KEYS = (
 )
 
 WANDB_METRIC_KEYS += (
+    "reward/global/total_tat", "reward/global/tat_reference",
     "reward/global/tat_error", "reward/global/tat_weight",
+    "reward/global/tat_signal_available",
     "reward/global/tat_raw_unramped", "reward/global/tat_confidence",
     "reward/global/tat_confidence_n0", "reward/global/tat_raw_ramped",
     "reward/global/completed_episode", "reward/global/completed_delta",
@@ -329,7 +331,7 @@ def runtime_exp_meta(config) -> dict:
         f"action_mode={action_mode}, dispatch_mode={config.dispatch_mode}, "
         f"critic_loss={config.critic_loss_mode}, "
         "independently initialized Q1/Q2 heads, "
-        f"reward G ({REWARD_VERSION}, global/local="
+        f"reward H ({REWARD_VERSION}, global/local="
         f"{reward_config.global_alpha:g}/{reward_config.local_alpha:g}), "
         f"replay_capacity={int(config.replay_capacity_env_steps)}, "
         f"curriculum_end_step={int(config.curriculum_end_step)}, "

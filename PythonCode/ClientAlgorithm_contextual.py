@@ -1588,9 +1588,6 @@ class ClientAlgorithm:
                 "reward/alpha": float(
                     self.reward_builder.config.global_alpha
                 ),
-                "reward/marg_tat": reward_diagnostics[
-                    "reward/marginal_tat_ema"
-                ],
                 "reward/backlog": float(
                     (getattr(pclient, "WaitingCommandCount", 0) or 0)
                     + (getattr(pclient, "QueuedCommandCount", 0) or 0)

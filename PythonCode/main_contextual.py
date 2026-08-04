@@ -175,7 +175,7 @@ def parse_args():
     )
     parser.add_argument("--device", default=None)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--replay-capacity-env-steps", type=int, default=10_000)
+    parser.add_argument("--replay-capacity-env-steps", type=int, default=50_000)
     replay_sampling = parser.add_mutually_exclusive_group()
     replay_sampling.add_argument(
         "--replay-buffer-rail",

@@ -796,3 +796,23 @@ architectural stabilization change is selected.
   action mapping, learner, and dispatch contracts are unchanged.
 - Diagnostic schema version: `contextual_global_reward_v10`; synchronized
   `contextual_wandb.py` and `export_wandb_run.py`.
+
+## 2026-08-04 - Reward H direct TotalTat level
+
+- Reward version: `H`; contract version:
+  `contextual_controlled_reward_v10_total_tat_level`.
+- Removed marginal-TAT reconstruction from quantized cumulative `TotalTat` and
+  completion counts, including `_prev_tat_sum`, `_prev_completed`, and the
+  marginal EMA state. Global TAT reward now directly uses
+  `9.2 * (174.4236 - TotalTat) / 174.4236` whenever `TotalTat > 0`.
+- Completion counts remain diagnostic and are used only by the explicitly
+  enabled confidence ramp. OP level, backlog, local, rail-TAT, smooth-control,
+  action, replay sampling, learner, and dispatch formulas are unchanged.
+- Canonical diagnostics are `reward/total_tat_level` and
+  `reward/global/total_tat`; obsolete marginal-TAT metric names were removed.
+  Diagnostic schema version is now `contextual_global_reward_v11`.
+- `EXP_META.note=tatlevel`. Start a fresh run: do not reuse an old replay
+  buffer or reward normalizer, and do not reuse an old critic/target critic.
+  If reusing an actor, initialize critic, target critic, replay, and reward
+  normalizer from scratch. Reward-version checks reject incompatible
+  checkpoints, replay snapshots, and standalone normalizer statistics.

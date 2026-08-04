@@ -15,7 +15,7 @@ from contextual_observation import RunningFeatureNormalizer
 from contextual_topology import ContextualTopology
 
 REWARD_VERSION = (
-    "contextual_controlled_reward_v9_global_tat_op_backlog_levels"
+    "contextual_controlled_reward_v10_total_tat_level"
 )
 
 ACTIVE_OHT_CYCLE_STATES = frozenset({
@@ -46,7 +46,6 @@ class ContextualRewardConfig:
     use_backlog: bool = True
     tat_reference: float = 2.90706 * 60.0
     op_reference: float = 0.80
-    tat_ema_beta: float = 0.05
     tat_confidence_n0: float = 50.0
     tat_confidence_ramp: bool = False
     freeze_after_env_steps: int = 30_000
@@ -60,7 +59,6 @@ class ContextualRewardConfig:
             self.smooth_b_rl_weight, self.smooth_exp_residual_weight,
             self.tat_weight, self.op_weight,
             self.backlog_weight, self.tat_reference, self.op_reference,
-            self.tat_ema_beta,
             self.tat_confidence_n0, self.normalizer_epsilon,
         )
         if not np.isfinite(numeric).all():
@@ -96,7 +94,7 @@ class ControlledRewardBatch:
     smooth_control_delta: np.ndarray
     smooth_penalty: np.ndarray
     controlled_rail_ids: np.ndarray
-    marginal_tat_ema: float
+    total_tat_level: float
     tat_signal_available: float
     tat_error: float
     tat_raw_unramped: float
@@ -267,10 +265,7 @@ class ContextualRewardBuilder:
 
     def _reset_temporal(self) -> None:
         self._total_completed_jobs = 0.0
-        self._prev_completed: float | None = None
-        self._prev_tat_sum = 0.0
         self._prev_op_rate: float | None = None
-        self._tat_ema = 0.0
         self._last_global_terms: dict[str, float] = {}
         self._last_local_terms: dict[str, np.ndarray] = {}
         self._last_rail_tat_event_count = 0
@@ -298,25 +293,14 @@ class ContextualRewardBuilder:
             raise ContextualRewardError("global reward input contains NaN or Inf")
         self._total_completed_jobs += completed_delta
         completed = self._total_completed_jobs
-        cur_tat_sum = cur_tat * completed
         waiting, queued = self._job_backlog(pclient)
 
-        previous_completed = (
-            0.0 if self._prev_completed is None else self._prev_completed
-        )
-        delta_completed = completed - previous_completed
-        if delta_completed > 0:
-            marginal_tat = (
-                cur_tat_sum - self._prev_tat_sum
-            ) / delta_completed
-            beta = cfg.tat_ema_beta
-            self._tat_ema = (
-                marginal_tat if self._tat_ema <= 0
-                else (1 - beta) * self._tat_ema + beta * marginal_tat
-            )
-        tat_signal_available = self._tat_ema > 0
+        # TotalTat is already the simulator's cumulative mean TAT level.
+        # Never difference it to recover a marginal value: its 0.1-second
+        # transport quantization is amplified by the cumulative job count.
+        tat_signal_available = cur_tat > 0.0
         tat_error = (
-            (cfg.tat_reference - self._tat_ema) / cfg.tat_reference
+            (cfg.tat_reference - cur_tat) / cfg.tat_reference
             if tat_signal_available else 0.0
         )
         tat_raw_unramped = (
@@ -342,8 +326,9 @@ class ContextualRewardBuilder:
             "tat_raw_unramped": tat_raw_unramped,
             "tat_confidence": tat_confidence,
             "tat_raw_ramped": tat_raw_ramped,
+            "total_tat": cur_tat,
             "completed_episode": completed,
-            "completed_delta": delta_completed,
+            "completed_delta": completed_delta,
             "op_rate": cur_op,
             "op_reference": cfg.op_reference,
             "op_error": op_error,
@@ -352,8 +337,6 @@ class ContextualRewardBuilder:
             "backlog": backlog,
             "backlog_raw": backlog_raw,
         }
-        self._prev_completed = completed
-        self._prev_tat_sum = cur_tat_sum
         self._prev_op_rate = cur_op
         return float(raw)
 
@@ -1485,8 +1468,10 @@ class ContextualRewardBuilder:
             global_raw=float(global_raw),
             global_normalized=float(global_norm),
             global_component=float(global_component),
-            marginal_tat_ema=float(self._tat_ema),
-            tat_signal_available=float(self._tat_ema > 0),
+            total_tat_level=float(self._last_global_terms["total_tat"]),
+            tat_signal_available=float(
+                self._last_global_terms["total_tat"] > 0.0
+            ),
             tat_error=float(self._last_global_terms["tat_error"]),
             tat_raw_unramped=float(
                 self._last_global_terms["tat_raw_unramped"]
@@ -1544,8 +1529,13 @@ class ContextualRewardBuilder:
         abs_shares = abs_means / abs_denominator
         result = {
             "reward/global_raw": batch.global_raw,
+            "reward/global/total_tat": batch.total_tat_level,
+            "reward/global/tat_reference": self.config.tat_reference,
             "reward/global/tat_error": batch.tat_error,
             "reward/global/tat_weight": self.config.tat_weight,
+            "reward/global/tat_signal_available": (
+                batch.tat_signal_available
+            ),
             "reward/global/tat_raw_unramped": batch.tat_raw_unramped,
             "reward/global/tat_confidence": batch.tat_confidence,
             "reward/global/tat_confidence_n0": self.config.tat_confidence_n0,
@@ -1568,8 +1558,7 @@ class ContextualRewardBuilder:
             ),
             "reward/global_normalized": batch.global_normalized,
             "reward/global_component": batch.global_component,
-            "reward/marginal_tat_ema": batch.marginal_tat_ema,
-            "reward/tat_signal_available": batch.tat_signal_available,
+            "reward/total_tat_level": batch.total_tat_level,
             "reward/local_raw_mean": float(batch.local_raw.mean()),
             "reward/local_raw_std": float(batch.local_raw.std()),
             "reward/local_normalized_mean": float(batch.local_normalized.mean()),
