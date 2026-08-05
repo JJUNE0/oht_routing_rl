@@ -47,6 +47,8 @@ RESUME_LAUNCH_CONTROL_FIELDS = {
     "resume_checkpoint_path",
     "rail_tat_diagnostic_path",
     "rail_tat_diagnostic_max_step",
+    "reward_diagnostic_dir",
+    "reward_diagnostic_windows",
     "wandb_enabled",
     "dispatch_mode",
     "tat_confidence_ramp",
@@ -135,7 +137,7 @@ def parse_args():
         choices=("geometric", "linear"),
         default="geometric",
     )
-    parser.add_argument("--smooth-b-rl-weight", type=float, default=0.05)
+    parser.add_argument("--smooth-b-rl-weight", type=float, default=0.25)
     parser.add_argument(
         "--smooth-exp-residual-weight", type=float, default=0.5
     )
@@ -161,6 +163,16 @@ def parse_args():
     parser.add_argument("--warmup-steps", type=int, default=10_000)
     parser.add_argument("--episode-burnin-steps", type=int, default=0)
     parser.add_argument("--normalizer-freeze-steps", type=int, default=10_000)
+    parser.add_argument(
+        "--reward-diagnostic-dir",
+        default=None,
+        help="Opt-in directory for Reward I step/cycle JSONL diagnostics.",
+    )
+    parser.add_argument(
+        "--reward-diagnostic-windows",
+        default="0:1000,10000:11000,20000:21000",
+        help="Start-inclusive:end-exclusive global-step windows.",
+    )
     parser.add_argument("--tat-confidence-n0", type=float, default=500.0)
     parser.add_argument(
         "--use-tat-confidence",
@@ -239,9 +251,7 @@ def parse_args():
         "--rail-tat-diagnostic",
         default=None,
         help=(
-            "Append rail-TAT completion diagnostics as JSON Lines. "
-            "Defaults to CHECKPOINT_ROOT/diagnostics/"
-            "rail_tat_completion.jsonl."
+            "Opt in to the legacy rail-TAT completion JSONL at this path."
         ),
     )
     parser.add_argument(
@@ -465,6 +475,8 @@ def main():
         "warmup_steps": args.warmup_steps,
         "episode_burnin_steps": args.episode_burnin_steps,
         "normalizer_freeze_steps": args.normalizer_freeze_steps,
+        "reward_diagnostic_dir": args.reward_diagnostic_dir,
+        "reward_diagnostic_windows": args.reward_diagnostic_windows,
         "tat_confidence_n0": args.tat_confidence_n0,
         "tat_confidence_ramp": args.use_tat_cofidence,
         "seed": args.seed,
@@ -522,6 +534,7 @@ def main():
         f"action_scale={client._action_scale()}, "
         f"warmup_steps={client.config.warmup_steps}, "
         f"episode_burnin_steps={client.config.episode_burnin_steps}, "
+        f"reward_diagnostic_dir={client.config.reward_diagnostic_dir}, "
         f"use_tat_confidence={client.config.tat_confidence_ramp}, "
         f"replay_sampling={client.config.replay_sampling_mode}, "
         f"batch_size={client.config.batch_size}, "

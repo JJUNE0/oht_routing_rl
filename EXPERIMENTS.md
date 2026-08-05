@@ -816,3 +816,27 @@ architectural stabilization change is selected.
   If reusing an actor, initialize critic, target critic, replay, and reward
   normalizer from scratch. Reward-version checks reject incompatible
   checkpoints, replay snapshots, and standalone normalizer statistics.
+
+## 2026-08-05 - Reward I fixed scale with rail-TAT diagnostics
+
+- Reward version: `I`; contract version:
+  `contextual_controlled_reward_v11_fixed_scale_rail100`.
+- Running global/local reward normalization is inactive and is never read,
+  updated, or frozen by Reward I. Deprecated persistence remains only for
+  compatibility/version rejection. Observation/state normalization is unchanged.
+- The default contextual reward is `0.5 * global_raw +
+  0.5 * (local_raw / 3) - clip(100 * rail_tat_raw, -0.5, 0.5) -
+  0.25 * abs(delta_b_rl)`.
+- The weighted global TAT term is clipped to `[-1, 1]`; local idle-OHT reward
+  is zero while the idle count remains diagnostic-only. Rail-TAT retains the
+  existing OHTTat/fixed-reference/elapsed-time attribution contract, with its
+  weight applied exactly once before per-rail clipping.
+- Opt-in append-only step/cycle JSONL diagnostics use global-step windows
+  `0:1000`, `10000:11000`, and `20000:21000`. Occurrence-aware
+  DistancePerVelocity free-flow values are diagnostic-only and never affect
+  reward. Diagnostic schema version: `contextual_reward_diagnostic_v12`.
+- `EXP_META.note=fixedscale_localdiv3_idleoff_rail100clip05_smooth025`;
+  W&B and export schemas contain fixed-scale and bounded cycle summaries, with
+  obsolete normalizer metrics removed. Start a fresh Reward I run; older
+  checkpoints, replay snapshots, and reward-normalizer statistics are rejected
+  by reward-version guards.

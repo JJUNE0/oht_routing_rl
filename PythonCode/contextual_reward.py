@@ -12,10 +12,11 @@ import numpy as np
 from Oht import OHTState
 from contextual_action import ACTION_MODES, EXP_RESIDUAL, REGION_B_RL
 from contextual_observation import RunningFeatureNormalizer
+from contextual_reward_diagnostic import RewardDiagnosticWriter
 from contextual_topology import ContextualTopology
 
 REWARD_VERSION = (
-    "contextual_controlled_reward_v10_total_tat_level"
+    "contextual_controlled_reward_v11_fixed_scale_rail100"
 )
 
 ACTIVE_OHT_CYCLE_STATES = frozenset({
@@ -34,9 +35,9 @@ class ContextualRewardError(RuntimeError):
 class ContextualRewardConfig:
     global_alpha: float = 0.5
     local_alpha: float = 0.5
-    rail_tat_weight: float = 1.0
+    rail_tat_weight: float = 100.0
     action_mode: str = REGION_B_RL
-    smooth_b_rl_weight: float = 0.5
+    smooth_b_rl_weight: float = 0.25
     smooth_exp_residual_weight: float = 0.5
     tat_weight: float = 9.2
     op_weight: float = 5.0
@@ -49,6 +50,9 @@ class ContextualRewardConfig:
     tat_confidence_n0: float = 50.0
     tat_confidence_ramp: bool = False
     freeze_after_env_steps: int = 30_000
+    local_reward_scale: float = 3.0
+    tat_raw_clip: float | None = 1.0
+    rail_tat_clip: float | None = 0.5
     normalizer_epsilon: float = 1e-6
     global_clip: float | None = 5.0
     local_clip: float | None = None
@@ -60,11 +64,24 @@ class ContextualRewardConfig:
             self.tat_weight, self.op_weight,
             self.backlog_weight, self.tat_reference, self.op_reference,
             self.tat_confidence_n0, self.normalizer_epsilon,
+            self.local_reward_scale,
         )
         if not np.isfinite(numeric).all():
             raise ValueError("reward config contains NaN or Inf")
         if self.tat_reference <= 0 or self.normalizer_epsilon <= 0:
             raise ValueError("tat_reference and normalizer_epsilon must be positive")
+        if self.local_reward_scale <= 0:
+            raise ValueError("local_reward_scale must be positive")
+        if self.rail_tat_weight < 0:
+            raise ValueError("rail_tat_weight must be non-negative")
+        if self.tat_raw_clip is not None and (
+            not np.isfinite(self.tat_raw_clip) or self.tat_raw_clip <= 0
+        ):
+            raise ValueError("tat_raw_clip must be positive or None")
+        if self.rail_tat_clip is not None and (
+            not np.isfinite(self.rail_tat_clip) or self.rail_tat_clip <= 0
+        ):
+            raise ValueError("rail_tat_clip must be positive or None")
         if not 0.0 <= self.op_reference <= 1.0:
             raise ValueError("op_reference must be in [0, 1]")
         if self.tat_confidence_n0 <= 0:
@@ -84,11 +101,12 @@ class ContextualRewardConfig:
 class ControlledRewardBatch:
     total: np.ndarray
     global_raw: float
-    global_normalized: float
     global_component: float
     local_raw: np.ndarray
-    local_normalized: np.ndarray
+    local_scaled: np.ndarray
     local_component: np.ndarray
+    rail_tat_raw: np.ndarray
+    rail_tat_weighted_preclip: np.ndarray
     rail_tat_penalty: np.ndarray
     rail_tat_event_count: int
     smooth_control_delta: np.ndarray
@@ -97,7 +115,8 @@ class ControlledRewardBatch:
     total_tat_level: float
     tat_signal_available: float
     tat_error: float
-    tat_raw_unramped: float
+    tat_raw_preclip: float
+    tat_raw_postclip: float
     tat_confidence: float
     tat_raw_ramped: float
     completed_episode: float
@@ -114,19 +133,27 @@ class ControlledRewardBatch:
     local_stop_raw: np.ndarray
     local_idle_raw: np.ndarray
     local_capacity_raw: np.ndarray
-    global_mean_before: float
-    global_std_before: float
-    global_count_before: int
-    global_frozen_before: bool
-    global_z_unclipped: float
-    local_mean_before: float
-    local_std_before: float
-    local_count_before: int
-    local_frozen_before: bool
-    local_z_unclipped: np.ndarray
+    waiting: float
+    queued: float
+    idle_oht_observation: np.ndarray
     smooth_weight_effective: float
     env_step: int
     episode_id: int
+
+    @property
+    def global_normalized(self):
+        """Deprecated compatibility alias; Reward I is never normalized."""
+        return self.global_raw
+
+    @property
+    def local_normalized(self):
+        """Deprecated compatibility alias for the fixed local scale."""
+        return self.local_scaled
+
+    @property
+    def tat_raw_unramped(self):
+        """Deprecated compatibility alias for the post-clip TAT term."""
+        return self.tat_raw_postclip
 
 
 @dataclass
@@ -156,6 +183,11 @@ class OHTCycleTracker:
     boundary_time_subtracted: float = 0.0
     ambiguous_pass_count: int = 0
     invalid_pass_delta_count: int = 0
+    rail_occurrences: list = field(default_factory=list)
+    route_free_flow_time: float = 0.0
+    completed_rail_occurrence_count: int = 0
+    free_flow_missing_count: int = 0
+    free_flow_invalid_count: int = 0
 
     def clear_cycle(self) -> None:
         self.cycle_active = False
@@ -178,6 +210,11 @@ class OHTCycleTracker:
         self.boundary_time_subtracted = 0.0
         self.ambiguous_pass_count = 0
         self.invalid_pass_delta_count = 0
+        self.rail_occurrences.clear()
+        self.route_free_flow_time = 0.0
+        self.completed_rail_occurrence_count = 0
+        self.free_flow_missing_count = 0
+        self.free_flow_invalid_count = 0
 
     @property
     def last_valid_oht_tat(self) -> float | None:
@@ -190,6 +227,16 @@ class OHTCycleTracker:
         return self.current_segment_last_state5_oht_tat
 
 
+@dataclass(frozen=True)
+class RailOccurrenceDiagnostic:
+    occurrence_index: int
+    rail_id: int
+    state: int
+    actual_elapsed: float
+    distance_per_velocity: float | None
+    controlled: bool
+
+
 @dataclass
 class RailPassTemporalTracker:
     """Packet-to-packet state for one OHT's current rail occurrence."""
@@ -197,11 +244,13 @@ class RailPassTemporalTracker:
     inflight_rail_id: int | None = None
     inflight_state: int | None = None
     inflight_elapsed: float | None = None
+    inflight_attributed_elapsed: float = 0.0
 
     def clear(self) -> None:
         self.inflight_rail_id = None
         self.inflight_state = None
         self.inflight_elapsed = None
+        self.inflight_attributed_elapsed = 0.0
 
 
 @dataclass(frozen=True)
@@ -231,6 +280,7 @@ class ContextualRewardBuilder:
         completion_diagnostic_path: str | Path | None = None,
         global_step_provider: Callable[[], int] | None = None,
         completion_diagnostic_max_global_step: int | None = None,
+        reward_diagnostic_writer: RewardDiagnosticWriter | None = None,
     ):
         self.topology = topology
         self.config = config or ContextualRewardConfig()
@@ -240,6 +290,7 @@ class ContextualRewardBuilder:
             else None
         )
         self._global_step_provider = global_step_provider
+        self.reward_diagnostic_writer = reward_diagnostic_writer
         self.completion_diagnostic_max_global_step = (
             int(completion_diagnostic_max_global_step)
             if completion_diagnostic_max_global_step is not None
@@ -269,12 +320,29 @@ class ContextualRewardBuilder:
         self._last_global_terms: dict[str, float] = {}
         self._last_local_terms: dict[str, np.ndarray] = {}
         self._last_rail_tat_event_count = 0
+        self._last_rail_tat_cycle_count = 0
+        self._last_rail_tat_controlled_assignment_count = 0
+        self._last_rail_tat_uncontrolled_assignment_count = 0
         self._oht_cycle_trackers.clear()
         self._rail_pass_trackers.clear()
 
     def reset_episode(self) -> None:
         """Clear only episode-temporal state; training statistics persist."""
         self._reset_temporal()
+
+    def _current_global_step(self) -> int:
+        return (
+            int(self._global_step_provider())
+            if self._global_step_provider is not None else self.reward_steps
+        )
+
+    def _cycle_diagnostic_active(self) -> bool:
+        return bool(
+            self.reward_diagnostic_writer is not None
+            and self.reward_diagnostic_writer.window_name(
+                self._current_global_step()
+            ) is not None
+        )
 
     @staticmethod
     def _job_backlog(pclient) -> tuple[float, float]:
@@ -303,15 +371,19 @@ class ContextualRewardBuilder:
             (cfg.tat_reference - cur_tat) / cfg.tat_reference
             if tat_signal_available else 0.0
         )
-        tat_raw_unramped = (
+        tat_raw_preclip = (
             cfg.tat_weight * tat_error if cfg.use_tat else 0.0
         )
-        tat_confidence = (
-            completed / (completed + cfg.tat_confidence_n0)
-            if tat_signal_available and cfg.tat_confidence_ramp
-            else float(tat_signal_available)
+        tat_raw_postclip = (
+            float(np.clip(
+                tat_raw_preclip, -cfg.tat_raw_clip, cfg.tat_raw_clip
+            ))
+            if cfg.tat_raw_clip is not None else float(tat_raw_preclip)
         )
-        tat_raw_ramped = tat_confidence * tat_raw_unramped
+        # Reward I never gates TAT by completed-command count. Keep the
+        # compatibility diagnostic fields, but they are identity-valued.
+        tat_confidence = float(tat_signal_available)
+        tat_raw_ramped = tat_raw_postclip
         op_delta = (
             float(self._prev_op_rate) - cur_op
             if self._prev_op_rate is not None else 0.0
@@ -323,7 +395,8 @@ class ContextualRewardBuilder:
         raw = tat_raw_ramped + op_raw + backlog_raw
         self._last_global_terms = {
             "tat_error": tat_error,
-            "tat_raw_unramped": tat_raw_unramped,
+            "tat_raw_preclip": tat_raw_preclip,
+            "tat_raw_postclip": tat_raw_postclip,
             "tat_confidence": tat_confidence,
             "tat_raw_ramped": tat_raw_ramped,
             "total_tat": cur_tat,
@@ -336,6 +409,8 @@ class ContextualRewardBuilder:
             "op_raw": op_raw,
             "backlog": backlog,
             "backlog_raw": backlog_raw,
+            "waiting": waiting,
+            "queued": queued,
         }
         self._prev_op_rate = cur_op
         return float(raw)
@@ -346,6 +421,9 @@ class ContextualRewardBuilder:
             name: np.empty(len(self.topology.controlled_rail_ids), dtype=np.float64)
             for name in ("oht", "predicted", "stop", "idle", "capacity")
         }
+        idle_observation = np.empty(
+            len(self.topology.controlled_rail_ids), dtype=np.float64
+        )
         rails = getattr(pclient, "RAILLINE_DIC", {})
         ohts = getattr(pclient, "OHT_DIC", {})
         for row, rail_id_value in enumerate(self.topology.controlled_rail_ids):
@@ -369,17 +447,17 @@ class ContextualRewardBuilder:
                 -0.2 * float(getattr(rail, "PredictedOHTCount"))
             )
             local_values["stop"][row] = -0.3 * avg_stop
-            local_values["idle"][row] = (
-                -0.1 * float(getattr(rail, "IdleOHTCount"))
-            )
+            idle_observation[row] = float(getattr(rail, "IdleOHTCount"))
+            local_values["idle"][row] = 0.0
             local_values["capacity"][row] = -0.1 * capacity
             result[row] = sum(values[row] for values in local_values.values())
         if not np.isfinite(result).all():
             raise ContextualRewardError("local reward input contains NaN or Inf")
         self._last_local_terms = local_values
+        self._last_idle_oht_observation = idle_observation
         return result
 
-    def _rail_tat(
+    def _rail_tat_raw(
         self,
         pclient,
         *,
@@ -387,7 +465,16 @@ class ContextualRewardBuilder:
         episode_id: int = 0,
     ) -> np.ndarray:
         credit: dict[int, float] = {}
-        event_count = 0
+        cycle_count = 0
+        controlled_assignment_count = 0
+        uncontrolled_assignment_count = 0
+        diagnostic_active = self._cycle_diagnostic_active()
+        self._diagnostic_rails = (
+            getattr(pclient, "RAILLINE_DIC", {}) if diagnostic_active else None
+        )
+        self._diagnostic_sim_time = (
+            float(getattr(pclient, "SimTime", 0.0)) if diagnostic_active else None
+        )
         for oht_id, oht in getattr(pclient, "OHT_DIC", {}).items():
             oht_id = int(oht_id)
             current_state = int(getattr(oht, "State", OHTState.NULL))
@@ -515,8 +602,10 @@ class ContextualRewardBuilder:
                     episode_id=episode_id,
                 )
                 outcome = self._finalize_oht_cycle(tracker, credit)
+                cycle_count += 1
                 if outcome.reward_applied:
-                    event_count += outcome.controlled_reward_count
+                    controlled_assignment_count += outcome.controlled_reward_count
+                    uncontrolled_assignment_count += outcome.uncontrolled_reward_count
                 event = (
                     "oht_cycle_restarted"
                     if restarting else "oht_cycle_completed"
@@ -853,8 +942,38 @@ class ContextualRewardBuilder:
              for rail_id in self.topology.controlled_rail_ids],
             dtype=np.float64,
         )
-        self._last_rail_tat_event_count = int(event_count)
-        return result * self.config.rail_tat_weight
+        self._last_rail_tat_cycle_count = int(cycle_count)
+        self._last_rail_tat_controlled_assignment_count = int(
+            controlled_assignment_count
+        )
+        self._last_rail_tat_uncontrolled_assignment_count = int(
+            uncontrolled_assignment_count
+        )
+        # Compatibility alias: historically this counted controlled rail
+        # assignments, not completed OHT cycles.
+        self._last_rail_tat_event_count = int(controlled_assignment_count)
+        self._diagnostic_rails = None
+        self._diagnostic_sim_time = None
+        return result
+
+    def _rail_tat(self, pclient, *, env_step: int, episode_id: int = 0):
+        """Deprecated compatibility alias returning unweighted raw penalty."""
+        return self._rail_tat_raw(
+            pclient, env_step=env_step, episode_id=episode_id
+        )
+
+    def _scale_rail_tat(self, rail_tat_raw):
+        raw = np.asarray(rail_tat_raw, dtype=np.float64)
+        weighted_preclip = self.config.rail_tat_weight * raw
+        postclip = (
+            np.clip(
+                weighted_preclip,
+                -self.config.rail_tat_clip,
+                self.config.rail_tat_clip,
+            )
+            if self.config.rail_tat_clip is not None else weighted_preclip
+        )
+        return weighted_preclip, postclip
 
     @staticmethod
     def _oht_tat_entries(oht) -> dict[int, object]:
@@ -1003,6 +1122,7 @@ class ContextualRewardBuilder:
         )
         previous_id = temporal.inflight_rail_id
         previous_elapsed = temporal.inflight_elapsed
+        previous_attributed = temporal.inflight_attributed_elapsed
         previous_consumed = False
 
         def invalid_delta(item, reason):
@@ -1042,6 +1162,38 @@ class ContextualRewardBuilder:
             ledger.route_time += float(delta)
             ledger.pass_delta_count += 1
 
+        def record_completed_occurrence(item, actual_elapsed):
+            if ledger is None or self._diagnostic_rails is None:
+                return
+            rail_id = int(getattr(item, "ID"))
+            rail = self._diagnostic_rails.get(rail_id)
+            free_flow = (
+                getattr(rail, "DistancePerVelocity", None)
+                if rail is not None else None
+            )
+            if free_flow is None:
+                ledger.free_flow_missing_count += 1
+                free_flow_value = None
+            else:
+                free_flow_value = float(free_flow)
+                if not np.isfinite(free_flow_value) or free_flow_value <= 0:
+                    ledger.free_flow_invalid_count += 1
+                    free_flow_value = None
+                else:
+                    ledger.route_free_flow_time += free_flow_value
+            controlled = rail_id in set(
+                int(value) for value in self.topology.controlled_rail_ids
+            )
+            ledger.rail_occurrences.append(RailOccurrenceDiagnostic(
+                occurrence_index=len(ledger.rail_occurrences),
+                rail_id=rail_id,
+                state=int(getattr(item, "State")),
+                actual_elapsed=float(actual_elapsed),
+                distance_per_velocity=free_flow_value,
+                controlled=controlled,
+            ))
+            ledger.completed_rail_occurrence_count += 1
+
         for index, item in enumerate(completed):
             rail_id = int(getattr(item, "ID"))
             total = float(getattr(item, "PassTime"))
@@ -1078,6 +1230,16 @@ class ContextualRewardBuilder:
             else:
                 delta = total
             add_delta(item, delta)
+            occurrence_elapsed = (
+                previous_attributed + delta
+                if index == 0 and previous_consumed else delta
+            )
+            if (
+                np.isfinite(delta)
+                and delta >= 0
+                and int(getattr(item, "State")) in ACTIVE_OHT_CYCLE_STATES
+            ):
+                record_completed_occurrence(item, occurrence_elapsed)
 
         inflight_items = list(current_inflight or [])
         if len(inflight_items) > 1:
@@ -1154,6 +1316,9 @@ class ContextualRewardBuilder:
         temporal.inflight_rail_id = rail_id
         temporal.inflight_state = int(getattr(item, "State"))
         temporal.inflight_elapsed = elapsed
+        temporal.inflight_attributed_elapsed = (
+            previous_attributed + delta if same_occurrence else delta
+        )
 
     @staticmethod
     def _update_cycle_tat(
@@ -1259,6 +1424,20 @@ class ContextualRewardBuilder:
         skip_reason,
         outcome=None,
     ) -> None:
+        outcome = outcome or CycleRewardOutcome(
+            bool(reward_applied), skip_reason
+        )
+        if event in {"oht_cycle_completed", "oht_cycle_restarted"}:
+            self._write_reward_i_cycle_diagnostic(
+                env_step=env_step,
+                episode_id=episode_id,
+                tracker=tracker,
+                previous_state=previous_state,
+                current_state=current_state,
+                previous_job_id=previous_job_id,
+                current_job_id=current_job_id,
+                outcome=outcome,
+            )
         if self.completion_diagnostic_path is None:
             return
         global_step = (
@@ -1272,9 +1451,6 @@ class ContextualRewardBuilder:
             and global_step >= self.completion_diagnostic_max_global_step
         ):
             return
-        outcome = outcome or CycleRewardOutcome(
-            bool(reward_applied), skip_reason
-        )
         effective_oht_tat = outcome.effective_oht_tat
         cycle_elapsed = (
             int(env_step) - int(tracker.cycle_start_step)
@@ -1354,9 +1530,228 @@ class ContextualRewardBuilder:
                 stream,
                 ensure_ascii=False,
                 separators=(",", ":"),
+                allow_nan=False,
             )
             stream.write("\n")
             stream.flush()
+
+    def _write_reward_i_cycle_diagnostic(
+        self,
+        *,
+        env_step,
+        episode_id,
+        tracker,
+        previous_state,
+        current_state,
+        previous_job_id,
+        current_job_id,
+        outcome,
+    ) -> None:
+        writer = self.reward_diagnostic_writer
+        if writer is None:
+            return
+        global_step = self._current_global_step()
+        if writer.window_name(global_step) is None:
+            return
+        controlled = set(
+            int(value) for value in self.topology.controlled_rail_ids
+        )
+        signed_excess = outcome.signed_excess
+        attributions = []
+        if (
+            signed_excess is not None
+            and np.isfinite(tracker.route_time)
+            and tracker.route_time > 0
+        ):
+            for rail_id, elapsed in tracker.rail_time_by_id.items():
+                raw = float(signed_excess * elapsed / tracker.route_time)
+                weighted = float(self.config.rail_tat_weight * raw)
+                postclip = (
+                    float(np.clip(
+                        weighted,
+                        -self.config.rail_tat_clip,
+                        self.config.rail_tat_clip,
+                    ))
+                    if self.config.rail_tat_clip is not None else weighted
+                )
+                attributions.append({
+                    "rail_id": int(rail_id),
+                    "actual_elapsed": float(elapsed),
+                    "elapsed_share": float(elapsed / tracker.route_time),
+                    "raw_penalty": raw,
+                    "weighted_preclip": weighted,
+                    "postclip": postclip,
+                    "clip_applied": not np.isclose(weighted, postclip),
+                    "controlled": int(rail_id) in controlled,
+                })
+        elapsed_share_sum = sum(item["elapsed_share"] for item in attributions)
+        all_raw = sum(item["raw_penalty"] for item in attributions)
+        controlled_raw = sum(
+            item["raw_penalty"] for item in attributions if item["controlled"]
+        )
+        uncontrolled_raw = all_raw - controlled_raw
+        preclip_abs_sum = sum(
+            abs(item["weighted_preclip"]) for item in attributions
+        )
+        postclip_abs_sum = sum(abs(item["postclip"]) for item in attributions)
+        clip_removed_abs_sum = preclip_abs_sum - postclip_abs_sum
+        clipped_count = sum(item["clip_applied"] for item in attributions)
+        effective = outcome.effective_oht_tat
+        free_flow_available = bool(
+            tracker.completed_rail_occurrence_count > 0
+            and tracker.free_flow_missing_count == 0
+            and tracker.free_flow_invalid_count == 0
+            and tracker.route_free_flow_time > 0
+        )
+        route_free_flow = (
+            float(tracker.route_free_flow_time)
+            if free_flow_available else None
+        )
+        occurrence_ids = [item.rail_id for item in tracker.rail_occurrences]
+        record = {
+            "reward_version": REWARD_VERSION,
+            "global_step": global_step,
+            "episode_id": int(episode_id),
+            "episode_step": int(env_step),
+            "sim_time": self._diagnostic_sim_time,
+            "oht_id": int(tracker.oht_id),
+            "previous_job_id": int(previous_job_id),
+            "current_job_id": int(current_job_id),
+            "previous_job_ids": sorted(int(v) for v in tracker.previous_job_ids),
+            "cycle_start_step": tracker.cycle_start_step,
+            "cycle_end_step": int(env_step),
+            "cycle_elapsed_steps": (
+                int(env_step) - int(tracker.cycle_start_step)
+                if tracker.cycle_start_step is not None else None
+            ),
+            "previous_state": int(previous_state),
+            "current_state": int(current_state),
+            "bootstrapped": bool(tracker.bootstrapped),
+            "reward_applied": bool(outcome.reward_applied),
+            "skip_reason": outcome.skip_reason,
+            "tat_segment_count": int(tracker.tat_segment_count),
+            "effective_oht_tat": effective,
+            "closed_segment_oht_tat_sum": float(
+                tracker.closed_segment_oht_tat_sum
+            ),
+            "final_segment_state5_oht_tat": (
+                tracker.current_segment_last_state5_oht_tat
+            ),
+            "last_valid_cmd_tat": tracker.last_valid_cmd_tat,
+            "tat_reference": float(self.config.tat_reference),
+            "signed_excess": signed_excess,
+            "cycle_raw_penalty": signed_excess,
+            "cycle_raw_reward": (
+                -float(signed_excess) if signed_excess is not None else None
+            ),
+            "cycle_is_reward": bool(
+                signed_excess is not None and signed_excess < 0
+            ),
+            "cycle_is_penalty": bool(
+                signed_excess is not None and signed_excess > 0
+            ),
+            "route_time": float(tracker.route_time),
+            "route_count": int(tracker.route_count),
+            "pass_delta_count": int(tracker.pass_delta_count),
+            "rail_unique_count": len(tracker.rail_time_by_id),
+            "boundary_carry_count": int(tracker.boundary_carry_count),
+            "boundary_carry_time": float(tracker.boundary_carry_time),
+            "boundary_time_subtracted": float(
+                tracker.boundary_time_subtracted
+            ),
+            "ambiguous_pass_count": int(tracker.ambiguous_pass_count),
+            "invalid_pass_delta_count": int(tracker.invalid_pass_delta_count),
+            "route_free_flow_available": free_flow_available,
+            "route_free_flow_time": route_free_flow,
+            "completed_rail_occurrence_count": int(
+                tracker.completed_rail_occurrence_count
+            ),
+            "free_flow_missing_count": int(tracker.free_flow_missing_count),
+            "free_flow_invalid_count": int(tracker.free_flow_invalid_count),
+            "route_delay_time": (
+                float(tracker.route_time - route_free_flow)
+                if route_free_flow is not None else None
+            ),
+            "route_delay_ratio": (
+                float(tracker.route_time / route_free_flow - 1.0)
+                if route_free_flow is not None else None
+            ),
+            "effective_to_freeflow_ratio": (
+                float(effective / route_free_flow)
+                if effective is not None and route_free_flow is not None else None
+            ),
+            "service_residual_time": (
+                float(effective - tracker.route_time)
+                if effective is not None else None
+            ),
+            "same_rail_revisit_count": (
+                len(occurrence_ids) - len(set(occurrence_ids))
+            ),
+            "rail_occurrences": [
+                {
+                    "occurrence_index": item.occurrence_index,
+                    "rail_id": item.rail_id,
+                    "state": item.state,
+                    "actual_elapsed": item.actual_elapsed,
+                    "distance_per_velocity": item.distance_per_velocity,
+                    "controlled": item.controlled,
+                }
+                for item in tracker.rail_occurrences
+            ],
+            "rail_attributions": attributions,
+            "elapsed_share_sum": elapsed_share_sum if attributions else None,
+            "elapsed_share_sum_error": (
+                abs(1.0 - elapsed_share_sum) if attributions else None
+            ),
+            "all_rail_raw_attribution_sum": all_raw if attributions else None,
+            "controlled_raw_attribution_sum": (
+                controlled_raw if attributions else None
+            ),
+            "uncontrolled_raw_attribution_sum": (
+                uncontrolled_raw if attributions else None
+            ),
+            "raw_attribution_sum_error": (
+                abs(all_raw - signed_excess)
+                if attributions and signed_excess is not None else None
+            ),
+            "controlled_elapsed_ratio": (
+                sum(item["elapsed_share"] for item in attributions
+                    if item["controlled"])
+                if attributions else None
+            ),
+            "weighted_scaling_error_max": (
+                max(abs(
+                    item["weighted_preclip"]
+                    - self.config.rail_tat_weight * item["raw_penalty"]
+                ) for item in attributions) if attributions else None
+            ),
+            "clip_contract_error_max": (
+                max(abs(
+                    item["postclip"]
+                    - (
+                        np.clip(
+                            item["weighted_preclip"],
+                            -self.config.rail_tat_clip,
+                            self.config.rail_tat_clip,
+                        ) if self.config.rail_tat_clip is not None
+                        else item["weighted_preclip"]
+                    )
+                ) for item in attributions) if attributions else None
+            ),
+            "preclip_abs_sum": preclip_abs_sum,
+            "postclip_abs_sum": postclip_abs_sum,
+            "clip_removed_abs_sum": clip_removed_abs_sum,
+            "clip_removed_ratio": (
+                clip_removed_abs_sum / preclip_abs_sum
+                if preclip_abs_sum > 0 else 0.0
+            ),
+            "clipped_assignment_count": int(clipped_count),
+            "assignment_count": len(attributions),
+            "clip_assignment_ratio": (
+                clipped_count / len(attributions) if attributions else 0.0
+            ),
+        }
+        writer.append_cycle(global_step, record)
 
     def build(
         self,
@@ -1382,55 +1777,20 @@ class ContextualRewardBuilder:
 
         global_raw = self._global_raw(pclient)
         local_raw = self._local_raw(pclient)
-        global_count_before = int(self.global_normalizer.count)
-        global_mean_before = float(self.global_normalizer.mean[0])
-        global_std_before = (
-            float(np.sqrt(max(
-                self.global_normalizer.m2[0] / global_count_before,
-                self.config.normalizer_epsilon,
-            )))
-            if global_count_before > 0 else 1.0
-        )
-        global_frozen_before = bool(self.global_normalizer.frozen)
-        global_z_unclipped = (
-            (global_raw - global_mean_before) / global_std_before
-            if global_count_before > 0 else global_raw
-        )
-        local_count_before = int(self.local_normalizer.count)
-        local_mean_before = float(self.local_normalizer.mean[0])
-        local_std_before = (
-            float(np.sqrt(max(
-                self.local_normalizer.m2[0] / local_count_before,
-                self.config.normalizer_epsilon,
-            )))
-            if local_count_before > 0 else 1.0
-        )
-        local_frozen_before = bool(self.local_normalizer.frozen)
-        local_z_unclipped = (
-            (local_raw - local_mean_before) / local_std_before
-            if local_count_before > 0 else local_raw.copy()
-        )
-        global_norm = float(
-            self.global_normalizer.normalize([[global_raw]], name="global_reward")[0, 0]
-        )
-        local_norm = self.local_normalizer.normalize(
-            local_raw[:, None], name="local_reward"
-        )[:, 0]
-        # Contractual normalize-before-update; exactly one batch update each.
-        self.global_normalizer.update([[global_raw]], name="global_reward")
-        self.local_normalizer.update(local_raw[:, None], name="local_reward")
         self.reward_steps += 1
-        if self.reward_steps >= self.config.freeze_after_env_steps:
-            self.global_normalizer.freeze()
-            self.local_normalizer.freeze()
 
-        global_component = self.config.global_alpha * global_norm
-        local_component = self.config.local_alpha * local_norm
-        rail_tat = self._rail_tat(
+        global_component = self.config.global_alpha * global_raw
+        local_scaled = local_raw / self.config.local_reward_scale
+        local_component = self.config.local_alpha * local_scaled
+        rail_tat_raw = self._rail_tat_raw(
             pclient,
             env_step=env_step,
             episode_id=episode_id,
         )
+        (
+            rail_tat_weighted_preclip,
+            rail_tat_penalty,
+        ) = self._scale_rail_tat(rail_tat_raw)
         if self.config.action_mode == REGION_B_RL:
             control_delta = np.abs(
                 (0.5 + 0.5 * action) - (0.5 + 0.5 * previous)
@@ -1440,11 +1800,15 @@ class ContextualRewardBuilder:
             control_delta = np.abs(action - previous)
             smooth_weight = self.config.smooth_exp_residual_weight
         smooth = smooth_weight * control_delta
-        total = global_component + local_component - rail_tat - smooth
+        total = (
+            global_component + local_component - rail_tat_penalty - smooth
+        )
         arrays = {
             "total": total, "local_raw": local_raw,
-            "local_normalized": local_norm, "local_component": local_component,
-            "rail_tat_penalty": rail_tat,
+            "local_scaled": local_scaled, "local_component": local_component,
+            "rail_tat_raw": rail_tat_raw,
+            "rail_tat_weighted_preclip": rail_tat_weighted_preclip,
+            "rail_tat_penalty": rail_tat_penalty,
             "smooth_control_delta": control_delta,
             "smooth_penalty": smooth,
             "controlled_rail_ids": self.topology.controlled_rail_ids,
@@ -1453,7 +1817,7 @@ class ContextualRewardBuilder:
             "local_stop_raw": self._last_local_terms["stop"],
             "local_idle_raw": self._last_local_terms["idle"],
             "local_capacity_raw": self._last_local_terms["capacity"],
-            "local_z_unclipped": local_z_unclipped,
+            "idle_oht_observation": self._last_idle_oht_observation,
         }
         frozen_arrays = {}
         for name, value in arrays.items():
@@ -1466,16 +1830,14 @@ class ContextualRewardBuilder:
             **frozen_arrays,
             rail_tat_event_count=int(self._last_rail_tat_event_count),
             global_raw=float(global_raw),
-            global_normalized=float(global_norm),
             global_component=float(global_component),
             total_tat_level=float(self._last_global_terms["total_tat"]),
             tat_signal_available=float(
                 self._last_global_terms["total_tat"] > 0.0
             ),
             tat_error=float(self._last_global_terms["tat_error"]),
-            tat_raw_unramped=float(
-                self._last_global_terms["tat_raw_unramped"]
-            ),
+            tat_raw_preclip=float(self._last_global_terms["tat_raw_preclip"]),
+            tat_raw_postclip=float(self._last_global_terms["tat_raw_postclip"]),
             tat_confidence=float(self._last_global_terms["tat_confidence"]),
             tat_raw_ramped=float(self._last_global_terms["tat_raw_ramped"]),
             completed_episode=float(
@@ -1489,15 +1851,8 @@ class ContextualRewardBuilder:
             op_raw=float(self._last_global_terms["op_raw"]),
             backlog=float(self._last_global_terms["backlog"]),
             backlog_raw=float(self._last_global_terms["backlog_raw"]),
-            global_mean_before=global_mean_before,
-            global_std_before=global_std_before,
-            global_count_before=global_count_before,
-            global_frozen_before=global_frozen_before,
-            global_z_unclipped=float(global_z_unclipped),
-            local_mean_before=local_mean_before,
-            local_std_before=local_std_before,
-            local_count_before=local_count_before,
-            local_frozen_before=local_frozen_before,
+            waiting=float(self._last_global_terms["waiting"]),
+            queued=float(self._last_global_terms["queued"]),
             smooth_weight_effective=float(smooth_weight),
             env_step=int(env_step),
             episode_id=int(episode_id),
@@ -1536,7 +1891,8 @@ class ContextualRewardBuilder:
             "reward/global/tat_signal_available": (
                 batch.tat_signal_available
             ),
-            "reward/global/tat_raw_unramped": batch.tat_raw_unramped,
+            "reward/global/tat_raw_preclip": batch.tat_raw_preclip,
+            "reward/global/tat_raw_postclip": batch.tat_raw_postclip,
             "reward/global/tat_confidence": batch.tat_confidence,
             "reward/global/tat_confidence_n0": self.config.tat_confidence_n0,
             "reward/global/tat_raw_ramped": batch.tat_raw_ramped,
@@ -1556,15 +1912,18 @@ class ContextualRewardBuilder:
                 batch.global_raw
                 - batch.tat_raw_ramped - batch.op_raw - batch.backlog_raw
             ),
-            "reward/global_normalized": batch.global_normalized,
             "reward/global_component": batch.global_component,
             "reward/total_tat_level": batch.total_tat_level,
             "reward/local_raw_mean": float(batch.local_raw.mean()),
             "reward/local_raw_std": float(batch.local_raw.std()),
-            "reward/local_normalized_mean": float(batch.local_normalized.mean()),
-            "reward/local_normalized_std": float(batch.local_normalized.std()),
+            "reward/local_scaled_mean": float(batch.local_scaled.mean()),
+            "reward/local_scaled_std": float(batch.local_scaled.std()),
             "reward/local_component_mean": float(batch.local_component.mean()),
             "reward/local_component_std": float(batch.local_component.std()),
+            "reward/rail_tat_raw_mean": float(batch.rail_tat_raw.mean()),
+            "reward/rail_tat_weighted_preclip_mean": float(
+                batch.rail_tat_weighted_preclip.mean()
+            ),
             "reward/rail_tat_penalty_mean": rail_tat_vector_mean,
             "reward/rail_tat_penalty_max": float(batch.rail_tat_penalty.max()),
             "reward/rail_tat_event_count": float(
@@ -1573,6 +1932,15 @@ class ContextualRewardBuilder:
             "reward/rail_tat_sum": rail_tat_sum,
             "reward/rail_tat_vector_mean": rail_tat_vector_mean,
             "reward/rail_tat_event_mean": float(rail_tat_event_mean),
+            "reward/rail_tat_cycle_count": float(
+                self._last_rail_tat_cycle_count
+            ),
+            "reward/rail_tat_controlled_assignment_count": float(
+                self._last_rail_tat_controlled_assignment_count
+            ),
+            "reward/rail_tat_uncontrolled_assignment_count": float(
+                self._last_rail_tat_uncontrolled_assignment_count
+            ),
             "reward/smooth_penalty_mean": float(batch.smooth_penalty.mean()),
             "reward/smooth_penalty_max": float(batch.smooth_penalty.max()),
             "reward/smooth_control_delta_mean": float(
@@ -1586,69 +1954,6 @@ class ContextualRewardBuilder:
             "reward/total_min": float(batch.total.min()),
             "reward/total_max": float(batch.total.max()),
             "reward/finite_ratio": float(np.isfinite(batch.total).mean()),
-            "normalizer/local_reward_update_calls": float(
-                self.local_normalizer.update_calls
-            ),
-            "normalizer/local_reward_sample_count": float(
-                self.local_normalizer.count
-            ),
-            "normalizer/global_reward_update_calls": float(
-                self.global_normalizer.update_calls
-            ),
-            "normalizer/global_reward_sample_count": float(
-                self.global_normalizer.count
-            ),
-            "normalizer/global_reward/mean_before": batch.global_mean_before,
-            "normalizer/global_reward/std_before": batch.global_std_before,
-            "normalizer/global_reward/count_before": float(
-                batch.global_count_before
-            ),
-            "normalizer/global_reward/frozen": float(
-                batch.global_frozen_before
-            ),
-            "reward/global/z_unclipped": batch.global_z_unclipped,
-            "reward/global/normalized": batch.global_normalized,
-            "reward/global/clip_delta": (
-                batch.global_normalized - batch.global_z_unclipped
-            ),
-            "reward/global/clip_applied": float(
-                not np.isclose(
-                    batch.global_normalized, batch.global_z_unclipped
-                )
-            ),
-            "normalizer/local_reward/mean_before": batch.local_mean_before,
-            "normalizer/local_reward/std_before": batch.local_std_before,
-            "normalizer/local_reward/count_before": float(
-                batch.local_count_before
-            ),
-            "normalizer/local_reward/frozen": float(batch.local_frozen_before),
-            "reward/local/z_unclipped_mean": float(
-                batch.local_z_unclipped.mean()
-            ),
-            "reward/local/z_unclipped_std": float(
-                batch.local_z_unclipped.std()
-            ),
-            "reward/local/z_unclipped_min": float(
-                batch.local_z_unclipped.min()
-            ),
-            "reward/local/z_unclipped_max": float(
-                batch.local_z_unclipped.max()
-            ),
-            "reward/local/normalized_mean": float(
-                batch.local_normalized.mean()
-            ),
-            "reward/local/normalized_std": float(
-                batch.local_normalized.std()
-            ),
-            "reward/local/normalized_min": float(
-                batch.local_normalized.min()
-            ),
-            "reward/local/normalized_max": float(
-                batch.local_normalized.max()
-            ),
-            "reward/local/clip_fraction": float(np.mean(
-                ~np.isclose(batch.local_normalized, batch.local_z_unclipped)
-            )),
             "reward/local/raw_decomposition_error_max": float(np.max(np.abs(
                 batch.local_raw
                 - batch.local_oht_raw
@@ -1690,7 +1995,16 @@ class ContextualRewardBuilder:
             ),
             "reward/config/global_alpha": self.config.global_alpha,
             "reward/config/local_alpha": self.config.local_alpha,
+            "reward/config/local_reward_scale": self.config.local_reward_scale,
             "reward/config/rail_tat_weight": self.config.rail_tat_weight,
+            "reward/config/rail_tat_clip": float(
+                self.config.rail_tat_clip
+                if self.config.rail_tat_clip is not None else 0.0
+            ),
+            "reward/config/tat_raw_clip": float(
+                self.config.tat_raw_clip
+                if self.config.tat_raw_clip is not None else 0.0
+            ),
             "reward/config/smooth_weight_effective": (
                 batch.smooth_weight_effective
             ),

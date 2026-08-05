@@ -67,11 +67,12 @@ python .\PythonCode\main_contextual.py `
   --exploration-noise-clip 0.20 `
   --warmup-steps 10000 `
   --normalizer-freeze-steps 10000 `
+  --reward-diagnostic-dir .\diagnostics\reward_i `
   --curriculum-end-step 20000 `
   --curriculum-scale-start 0.05 `
   --curriculum-scale-end 1.0 `
   --curriculum-shape geometric `
-  --smooth-b-rl-weight 0.05 `
+  --smooth-b-rl-weight 0.25 `
   --minimum-replay-env-steps 100 `
   --minimum-action-enabled-env-steps 100 `
   --replay-capacity-env-steps 10000 `
@@ -83,6 +84,17 @@ python .\PythonCode\main_contextual.py `
   --smoke-report .\contextual_training_noiseanneal_seed0.json `
   --checkpoint-root .\checkpoints\contextual_noiseanneal_seed0
 ```
+
+Reward I uses the fixed-scale contextual reward directly; reward normalizers
+are inactive and there is no reward-normalizer CLI switch. Observation/state
+normalization is unchanged. `--reward-diagnostic-dir` is optional; when it is
+omitted, no Reward I JSONL records or free-flow occurrence diagnostics are
+created. The default diagnostic windows are
+`0:1000,10000:11000,20000:21000` and can be overridden with
+`--reward-diagnostic-windows`.
+
+The fixed reward for controlled rail `i` is
+`0.5 * global_raw + 0.5 * (local_raw / 3) - clip(100 * rail_tat_raw, -0.5, 0.5) - 0.25 * abs(delta_b_rl)`.
 
 실행 후 simulator GUI에서 Python 연동을 활성화하고 Run을 시작합니다.
 
