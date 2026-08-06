@@ -7,7 +7,8 @@ from datetime import datetime
 
 import numpy as np
 import torch
-from cocel_rl.algorithms import TD3, TD7
+from cocel_rl.algorithms import SAC, TD3, TD7
+from cocel_rl.algorithms.sac import ALGORITHM_VERSION as SAC_ALGORITHM_VERSION
 from cocel_rl.buffers.off_policy_buffer import OffPolicyBuffer
 from cocel_rl.core.learner import Learner
 from cocel_rl.core.logger import OffPolicyLogger
@@ -15,6 +16,28 @@ from eval import evaluate
 from torch.nn.modules.module import T
 
 import wandb
+
+
+EXP_META = {
+    "cost_structure": "b_rl",
+    "action_range": "b_rl_0.0-1.0",
+    "reward_version": "J",
+    "centering": False,
+    "note": "0704_sac",
+    "description": (
+        "Keeps the 0704 18-dimensional observation, action mapping, and reward "
+        "formula unchanged while adding CO-GYM-style SAC with automatic entropy tuning."
+    ),
+}
+
+
+def _make_run_name(exp_meta):
+    stamp = datetime.now().strftime("%m%d_%H%M")
+    return (
+        f"run_{stamp}_{exp_meta['cost_structure']}_"
+        f"{exp_meta['action_range']}_{exp_meta['reward_version']}_"
+        f"{exp_meta['note']}"
+    )
 
 
 def train_config():
@@ -101,6 +124,11 @@ def train_config():
             "target_update_rate": 250,  # 하드 타깃/인코더 스냅샷 주기
             "lap_alpha": 0.4,  # LAP 우선순위 지수
             "min_priority": 1.0,  # LAP Huber 경계
+            # --- SAC 전용 (CO-GYM 기본값) ---
+            "log_std_bound": [-20.0, 2.0],
+            "temperature_lr": 3e-4,
+            "initial_alpha": 0.2,
+            "target_entropy": None,
         },
     }
     return config
@@ -146,7 +174,7 @@ class StateNormalizer:
 
 
 class RunningRewardNormalizer:
-    def __init__(self):
+    def __init__(self, algorithm_name=None):
         self.mean = 0.0
         self.var = 1.0
         self.count = 0
@@ -175,10 +203,18 @@ class ClientAlgorithm:
 
         env = DummyEnv(self.obs_dim, self.act_dim, self.action_bound)
         self.config = train_config()
+        if algorithm_name is not None:
+            self.config["algorithm"]["name"] = str(algorithm_name).upper()
         algo_name = str(self.config["algorithm"]["name"]).upper()
-        algo_cls = {"TD3": TD3, "TD7": TD7}.get(algo_name)
+        algo_cls = {"TD3": TD3, "TD7": TD7, "SAC": SAC}.get(algo_name)
         if algo_cls is None:
-            raise ValueError(f"지원하지 않는 algorithm: {algo_name} (TD3/TD7)")
+            raise ValueError(f"지원하지 않는 algorithm: {algo_name} (TD3/TD7/SAC)")
+        self.exp_meta = dict(EXP_META)
+        self.exp_meta["note"] = f"0704_{algo_name.lower()}"
+        self.exp_meta["algorithm"] = algo_name
+        if algo_name == "SAC":
+            self.exp_meta["algorithm_version"] = SAC_ALGORITHM_VERSION
+        self.config["EXP_META"] = dict(self.exp_meta)
         print(f"[Algo] {algo_name} 사용")
         self.algo = algo_cls(env, self.config)
         self.learner = Learner(self.algo, self.config)
@@ -241,7 +277,8 @@ class ClientAlgorithm:
             wandb.init(
                 project="oht-routing-rl",
                 config=self.config,
-                name=f"run_{datetime.now().strftime('%m%d_%H%M')}",
+                name=_make_run_name(self.exp_meta),
+                notes=self.exp_meta["description"],
                 resume="allow",
                 mode=os.environ.get("WANDB_MODE", "online"),
             )
@@ -313,6 +350,24 @@ class ClientAlgorithm:
             self.learner.critic_optimizer.load_state_dict(
                 ckpt["critic_optimizer_state_dict"]
             )
+            self.learner.target_actor.load_state_dict(
+                self.learner.actor.state_dict()
+            )
+            self.learner.target_critic.load_state_dict(
+                self.learner.critic.state_dict()
+            )
+
+            if self.algo.name == "SAC":
+                saved_alpha = ckpt.get("log_alpha")
+                saved_alpha_optimizer = ckpt.get("alpha_optimizer_state_dict")
+                if saved_alpha is None or saved_alpha_optimizer is None:
+                    raise ValueError("SAC checkpoint is missing entropy state")
+                self.learner.algorithm.log_alpha.data.fill_(
+                    float(saved_alpha)
+                )
+                self.learner.algorithm.alpha_optimizer.load_state_dict(
+                    saved_alpha_optimizer
+                )
 
             if "buffer" in ckpt and ckpt["buffer"] is not None:
                 self.learner.buffer = ckpt["buffer"]
@@ -916,6 +971,10 @@ class ClientAlgorithm:
             )
 
             if self.total_steps > self.config["update_after"]:
+                if self.algo.name == "SAC":
+                    self.learner.algorithm.applied_action_scale = float(
+                        self._action_scale()
+                    )
                 self.learner.learn()
                 if self.total_steps % 2 == 0:
                     print(
@@ -1038,6 +1097,10 @@ class ClientAlgorithm:
                             "loss/critic": self.learner.total_losses.get("critic", 0),
                             "loss/actor": self.learner.total_losses.get("actor", 0),
                             "loss/encoder": self.learner.total_losses.get("encoder", 0),
+                            "sac/alpha": self.learner.total_losses.get("alpha", 0),
+                            "sac/alpha_loss": self.learner.total_losses.get("alpha_loss", 0),
+                            "sac/entropy": self.learner.total_losses.get("entropy", 0),
+                            "sac/log_prob": self.learner.total_losses.get("log_prob", 0),
                             "buffer/size": self.learner.buffer.size,
                         },
                         step=self.total_steps,

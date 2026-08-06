@@ -15,7 +15,7 @@ import numpy as np
 import torch
 
 from cocel_rl.algorithms.contextual_td7 import (
-    ALGORITHM_VERSION,
+    ALGORITHM_VERSION as TD7_ALGORITHM_VERSION,
     ContextualActor,
     ContextualLearnerConfig,
     ContextualNetworkConfig,
@@ -28,8 +28,16 @@ from cocel_rl.algorithms.contextual_td7 import (
     REPLAY_SAMPLING_SNAPSHOT,
     REPLAY_SAMPLING_VERSION,
     contextual_algorithm_variant,
-    load_contextual_checkpoint,
-    save_contextual_checkpoint,
+    load_contextual_checkpoint as load_contextual_td7_checkpoint,
+    save_contextual_checkpoint as save_contextual_td7_checkpoint,
+)
+from cocel_rl.algorithms.contextual_sac import (
+    ALGORITHM_VERSION as SAC_ALGORITHM_VERSION,
+    ContextualGaussianActor,
+    ContextualSACLearner,
+    ContextualSACLearnerConfig,
+    load_contextual_sac_checkpoint,
+    save_contextual_sac_checkpoint,
 )
 from contextual_action import (
     ACTION_MODES,
@@ -61,6 +69,7 @@ class ContextualTrainingFailure(RuntimeError):
 
 @dataclass(frozen=True)
 class ContextualRuntimeConfig:
+    algorithm: str = "td7"
     mode: str = "baseline_only"
     action_enabled: bool = False
     action_mode: str = REGION_B_RL
@@ -72,7 +81,7 @@ class ContextualRuntimeConfig:
     smooth_b_rl_weight: float = 0.05
     smooth_exp_residual_weight: float = 0.5
     warmup_steps: int = 10_000
-    episode_burnin_steps: int = 2_000
+    episode_burnin_steps: int = 0
     normalizer_freeze_steps: int = 10_000
     tat_confidence_n0: float = 50.0
     tat_confidence_ramp: bool = True
@@ -85,8 +94,11 @@ class ContextualRuntimeConfig:
     exploration_noise_anneal_steps: int = 100_000
     exploration_noise_clip: float = 0.20
     replay_capacity_env_steps: int = 10_000
-    replay_sampling_mode: str = REPLAY_SAMPLING_RAIL
-    batch_size: int = 1_024
+    # One replay sample is one complete factory step by default.  The
+    # snapshot sampler expands it to every controlled rail exactly once when
+    # materializing the learner batch.
+    replay_sampling_mode: str = REPLAY_SAMPLING_SNAPSHOT
+    batch_size: int = 1
     minimum_replay_env_steps: int = 100
     minimum_action_enabled_env_steps: int = 100
     updates_per_env_step: int = 1
@@ -100,8 +112,17 @@ class ContextualRuntimeConfig:
     wandb_enabled: bool = False
     wandb_log_interval: int = 10
     sale_enabled: bool = True
-    lap_enabled: bool = True
+    # Per-rail LAP would reintroduce the line-level sampling bias that full
+    # factory batches are intended to remove.  It remains available together
+    # with the explicit rail replay mode.
+    lap_enabled: bool = False
     critic_loss_mode: str = "auto"
+    sac_temperature_lr: float = 3e-4
+    sac_initial_alpha: float = 0.2
+    sac_target_entropy: float | None = None
+    sac_tau: float = 0.005
+    sac_log_std_min: float = -20.0
+    sac_log_std_max: float = 2.0
     early_stop_queued_threshold: float = 500.0
     early_stop_tat_threshold: float = 500.0
     early_stop_min_episode_steps: int = 100
@@ -109,6 +130,8 @@ class ContextualRuntimeConfig:
     dispatch_mode: str = DISPATCH_FIRST_MATCH
 
     def __post_init__(self):
+        if self.algorithm not in {"td7", "sac"}:
+            raise ValueError("algorithm must be td7 or sac")
         if self.mode not in {"baseline_only", "actor_inference", "training"}:
             raise ValueError(
                 "mode must be baseline_only, actor_inference, or training"
@@ -125,6 +148,21 @@ class ContextualRuntimeConfig:
             raise ValueError(
                 f"dispatch_mode must be one of {DISPATCH_MODES}"
             )
+        if self.algorithm == "sac" and (self.sale_enabled or self.lap_enabled):
+            raise ValueError(
+                "contextual SAC requires --no-sale and --no-lap"
+            )
+        if self.algorithm == "sac" and self.critic_loss_mode not in {
+            "auto", "mse"
+        }:
+            raise ValueError("contextual SAC requires MSE critic loss")
+        if (
+            self.sac_temperature_lr <= 0.0
+            or self.sac_initial_alpha <= 0.0
+            or not 0.0 < self.sac_tau <= 1.0
+            or self.sac_log_std_min >= self.sac_log_std_max
+        ):
+            raise ValueError("invalid contextual SAC hyperparameters")
         if (
             self.replay_sampling_mode
             in {REPLAY_SAMPLING_SNAPSHOT, REPLAY_SAMPLING_RANDOM_RAIL}
@@ -215,7 +253,15 @@ class ClientAlgorithm:
             torch.manual_seed(self.config.seed)
             network_config = ContextualNetworkConfig()
             self.encoder = DirectionalContextEncoder(network_config).to(self.device)
-            self.actor = ContextualActor(network_config).to(self.device)
+            self.actor = (
+                ContextualGaussianActor(
+                    network_config,
+                    log_std_min=self.config.sac_log_std_min,
+                    log_std_max=self.config.sac_log_std_max,
+                )
+                if self.config.algorithm == "sac"
+                else ContextualActor(network_config)
+            ).to(self.device)
         self.encoder.eval()
         self.actor.eval()
 
@@ -282,8 +328,18 @@ class ClientAlgorithm:
 
     @property
     def algorithm_variant(self):
+        if self.config.algorithm == "sac":
+            return "contextual_sac_uniform_v1"
         return contextual_algorithm_variant(
             self.config.sale_enabled, self.config.lap_enabled
+        )
+
+    @property
+    def algorithm_version(self):
+        return (
+            SAC_ALGORITHM_VERSION
+            if self.config.algorithm == "sac"
+            else TD7_ALGORITHM_VERSION
         )
 
     @property
@@ -293,7 +349,7 @@ class ClientAlgorithm:
     @property
     def runtime_variant(self):
         base = (
-            f"{ALGORITHM_VERSION}_{self.algorithm_variant}_"
+            f"{self.algorithm_version}_{self.algorithm_variant}_"
             f"{self.action_version}"
         )
         if self.config.replay_sampling_mode == REPLAY_SAMPLING_RAIL:
@@ -384,20 +440,39 @@ class ClientAlgorithm:
             action_version=self.action_version,
             sampling_mode=self.config.replay_sampling_mode,
         )
-        learner_config = ContextualLearnerConfig(
-            action_mode=self.config.action_mode,
-            action_scale=self.config.action_scale,
-            batch_size=self.config.batch_size,
-            minimum_replay_env_steps=self.config.minimum_replay_env_steps,
-            minimum_action_enabled_env_steps=(
+        common_config = {
+            "action_mode": self.config.action_mode,
+            "action_scale": self.config.action_scale,
+            "batch_size": self.config.batch_size,
+            "minimum_replay_env_steps": self.config.minimum_replay_env_steps,
+            "minimum_action_enabled_env_steps": (
                 self.config.minimum_action_enabled_env_steps
             ),
-            require_normalizer_frozen=True,
-            sale_enabled=self.config.sale_enabled,
-            lap_enabled=self.config.lap_enabled,
-            critic_loss_mode=self.config.critic_loss_mode,
-        )
-        self.learner = ContextualTD7Learner(
+            "require_normalizer_frozen": True,
+        }
+        if self.config.algorithm == "sac":
+            learner_config = ContextualSACLearnerConfig(
+                **common_config,
+                temperature_lr=self.config.sac_temperature_lr,
+                initial_alpha=self.config.sac_initial_alpha,
+                target_entropy=self.config.sac_target_entropy,
+                tau=self.config.sac_tau,
+                log_std_min=self.config.sac_log_std_min,
+                log_std_max=self.config.sac_log_std_max,
+                sale_enabled=False,
+                lap_enabled=False,
+                critic_loss_mode="mse",
+            )
+            learner_class = ContextualSACLearner
+        else:
+            learner_config = ContextualLearnerConfig(
+                **common_config,
+                sale_enabled=self.config.sale_enabled,
+                lap_enabled=self.config.lap_enabled,
+                critic_loss_mode=self.config.critic_loss_mode,
+            )
+            learner_class = ContextualTD7Learner
+        self.learner = learner_class(
             self.replay_buffer,
             network_config=ContextualNetworkConfig(),
             config=learner_config,
@@ -411,7 +486,12 @@ class ClientAlgorithm:
         self.actor.eval()
         self.transition_aligner.callback = self._on_completed_transition
         if self.config.resume_checkpoint_path:
-            runtime_metadata = load_contextual_checkpoint(
+            checkpoint_loader = (
+                load_contextual_sac_checkpoint
+                if self.config.algorithm == "sac"
+                else load_contextual_td7_checkpoint
+            )
+            runtime_metadata = checkpoint_loader(
                 self.config.resume_checkpoint_path,
                 self.learner,
                 observation_builder=self.observation_builder,
@@ -510,6 +590,7 @@ class ClientAlgorithm:
 
     def _runtime_checkpoint_metadata(self, checkpoint_kind="latest"):
         return {
+            "algorithm": self.config.algorithm,
             "algorithm_version": self.runtime_variant,
             "uniform_replay": not self.config.lap_enabled,
             "sale": self.config.sale_enabled,
@@ -567,7 +648,12 @@ class ClientAlgorithm:
             path = self.checkpoint_root / "crash" / "checkpoint.pt"
         else:
             raise ValueError(f"unknown checkpoint kind: {kind}")
-        self.last_checkpoint_path = save_contextual_checkpoint(
+        checkpoint_saver = (
+            save_contextual_sac_checkpoint
+            if self.config.algorithm == "sac"
+            else save_contextual_td7_checkpoint
+        )
+        self.last_checkpoint_path = checkpoint_saver(
             path,
             self.learner,
             observation_builder=self.observation_builder,
@@ -972,7 +1058,13 @@ class ClientAlgorithm:
             torch.from_numpy(observation.global_state),
         )
 
-    def _actor_inference(self, observation, *, attention_diagnostics=False):
+    def _actor_inference(
+        self,
+        observation,
+        *,
+        attention_diagnostics=False,
+        stochastic=False,
+    ):
         t0 = time.perf_counter()
         cpu_tensors = self._cpu_tensors(observation)
         tensor_conversion_ms = (time.perf_counter() - t0) * 1000.0
@@ -1003,11 +1095,18 @@ class ClientAlgorithm:
                 )
                 else None
             )
-            actor_output = (
-                self.actor(encoding.state, sale_state)
-                if sale_state is not None
-                else self.actor(encoding.state)
-            )
+            if stochastic:
+                if self.config.algorithm != "sac":
+                    raise RuntimeError(
+                        "stochastic contextual actor inference is SAC-only"
+                    )
+                actor_output = self.actor.sample(encoding.state)
+            else:
+                actor_output = (
+                    self.actor(encoding.state, sale_state)
+                    if sale_state is not None
+                    else self.actor(encoding.state)
+                )
         self._synchronize()
         encoder_actor_ms = (time.perf_counter() - t0) * 1000.0
 
@@ -1139,6 +1238,11 @@ class ClientAlgorithm:
         if use_actor:
             deterministic_policy, inference_timing = self._actor_inference(
                 observation,
+                stochastic=(
+                    self.config.algorithm == "sac"
+                    and self.config.mode == "training"
+                    and not burnin_active
+                ),
                 attention_diagnostics=(
                     self.config.mode == "training"
                     and self.total_steps % self.config.wandb_log_interval == 0
@@ -1147,7 +1251,9 @@ class ClientAlgorithm:
             timing.update(inference_timing)
         controlled_action = deterministic_policy.copy()
         exploration_noise_std = (
-            0.0 if burnin_active else self._exploration_noise_std()
+            0.0
+            if burnin_active or self.config.algorithm == "sac"
+            else self._exploration_noise_std()
         )
         should_apply = (
             self.config.action_enabled
@@ -1163,6 +1269,7 @@ class ClientAlgorithm:
         )
         if (
             self.config.mode == "training"
+            and self.config.algorithm != "sac"
             and should_apply
             and not burnin_active
         ):

@@ -7,6 +7,7 @@ import torch
 from cocel_rl.algorithms.contextual_td7.replay_buffer import (
     ContextualReplayError,
     ContextualStepReplayBuffer,
+    REPLAY_SAMPLING_SNAPSHOT,
     snapshot_from_transition,
 )
 from cocel_rl.algorithms.contextual_td7.replay_types import ContextualStepSnapshot
@@ -244,6 +245,57 @@ class ContextualReplayTests(unittest.TestCase):
         self.assertEqual(a.reward.dtype, torch.float32)
         self.assertEqual(a.env_step.dtype, torch.int64)
         self.assertEqual(a.reward.device.type, "cpu")
+
+    def test_snapshot_sample_is_complete_factory_steps(self):
+        replay = ContextualStepReplayBuffer(
+            self.topology,
+            self.builder,
+            capacity_env_steps=4,
+            seed=17,
+            sampling_mode=REPLAY_SAMPLING_SNAPSHOT,
+        )
+        for step in range(3):
+            replay.push(make_snapshot(self.topology, step))
+
+        factory_batch_size = 2
+        batch = replay.sample(factory_batch_size)
+        self.assertEqual(
+            tuple(batch.reward.shape),
+            (factory_batch_size * CONTROLLED_COUNT, 1),
+        )
+
+        expected_rows = list(range(CONTROLLED_COUNT))
+        selected_steps = []
+        for factory_index in range(factory_batch_size):
+            start = factory_index * CONTROLLED_COUNT
+            stop = start + CONTROLLED_COUNT
+            keys = batch.sample_keys[start:stop]
+            self.assertEqual(
+                [key.controlled_row for key in keys], expected_rows
+            )
+            self.assertEqual(len({key.step_slot for key in keys}), 1)
+            env_steps = batch.env_step[start:stop]
+            self.assertTrue(torch.all(env_steps == env_steps[0]))
+            selected_steps.append(int(env_steps[0]))
+
+        self.assertEqual(len(set(selected_steps)), factory_batch_size)
+        self.assertEqual(
+            set(int(value) for value in batch.controlled_rail_id[:CONTROLLED_COUNT]),
+            set(int(value) for value in self.topology.controlled_rail_ids),
+        )
+
+    def test_snapshot_batch_size_counts_factory_steps(self):
+        replay = ContextualStepReplayBuffer(
+            self.topology,
+            self.builder,
+            capacity_env_steps=2,
+            sampling_mode=REPLAY_SAMPLING_SNAPSHOT,
+        )
+        replay.push(make_snapshot(self.topology, 0))
+        with self.assertRaisesRegex(
+            ContextualReplayError, "snapshot batch size exceeds"
+        ):
+            replay.sample(2)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA unavailable")
     def test_cuda_device_sample_smoke(self):

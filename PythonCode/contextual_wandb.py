@@ -5,13 +5,17 @@ from __future__ import annotations
 from datetime import datetime
 
 from cocel_rl.algorithms.contextual_td7 import (
-    ALGORITHM_VERSION,
-    CHECKPOINT_VERSION,
+    ALGORITHM_VERSION as TD7_ALGORITHM_VERSION,
+    CHECKPOINT_VERSION as TD7_CHECKPOINT_VERSION,
     CRITIC_INITIALIZATION,
     LAP_VERSION,
     REPLAY_SAMPLING_VERSION,
     SALE_VERSION,
     contextual_algorithm_variant,
+)
+from cocel_rl.algorithms.contextual_sac import (
+    ALGORITHM_VERSION as SAC_ALGORITHM_VERSION,
+    CHECKPOINT_VERSION as SAC_CHECKPOINT_VERSION,
 )
 from contextual_action import (
     EXPLORATION_SCHEDULE_VERSION,
@@ -43,10 +47,12 @@ EXP_META = {
     "diagnostic_schema_version": "contextual_reward_trace_v7",
     "centering": False,
     "replay_sampling_version": REPLAY_SAMPLING_VERSION,
-    "note": "tat_ramp",
+    "note": "tat_ramp_factory_snapshot",
     "description": (
         "Applies an episode-completion confidence ramp to the global TAT raw "
-        "term and logs raw, normalization, contribution, and scale diagnostics."
+        "term and logs raw, normalization, contribution, and scale diagnostics. "
+        "Uses uniform one-step factory snapshots so every controlled rail is "
+        "included exactly once in each default optimizer batch."
     ),
 }
 
@@ -129,6 +135,8 @@ WANDB_METRIC_KEYS = (
     "learner/replay_policy_action_std",
     "learner/replay_applied_action_std",
     "learner/critic_action_matches_applied",
+    "sac/alpha", "sac/alpha_loss", "sac/entropy",
+    "sac/log_prob_mean", "sac/log_std_mean", "sac/target_entropy",
     "critic/q1_mean", "critic/q2_mean", "critic/q_min", "critic/q_max",
     "critic/q_abs_diff_mean", "critic/q_abs_diff_max",
     "critic/parameter_l2_distance", "critic/parameter_max_abs_diff",
@@ -219,20 +227,30 @@ def runtime_exp_meta(config) -> dict:
     )
     sale = bool(config.sale_enabled)
     lap = bool(config.lap_enabled)
+    algorithm = str(getattr(config, "algorithm", "td7")).lower()
     action_mode = str(config.action_mode)
     mode_version = action_version(action_mode)
-    meta["algorithm_version"] = ALGORITHM_VERSION
-    meta["algorithm_variant"] = (
-        f"{contextual_algorithm_variant(sale, lap)}_{mode_version}"
-    )
+    if algorithm == "sac":
+        meta["algorithm_version"] = SAC_ALGORITHM_VERSION
+        meta["algorithm_variant"] = (
+            f"contextual_sac_uniform_v1_{mode_version}"
+        )
+        meta["checkpoint_version"] = SAC_CHECKPOINT_VERSION
+    else:
+        meta["algorithm_version"] = TD7_ALGORITHM_VERSION
+        meta["algorithm_variant"] = (
+            f"{contextual_algorithm_variant(sale, lap)}_{mode_version}"
+        )
+        meta["checkpoint_version"] = TD7_CHECKPOINT_VERSION
+    meta["algorithm"] = algorithm
     meta["critic_initialization"] = CRITIC_INITIALIZATION
-    meta["checkpoint_version"] = CHECKPOINT_VERSION
     meta["action_mode"] = action_mode
     meta["action_version"] = mode_version
     meta["dispatch_mode"] = str(config.dispatch_mode)
     meta["dispatch_selection_version"] = DISPATCH_SELECTION_VERSION
     meta["note"] = (
-        f"{meta['note']}_dispatch_{str(config.dispatch_mode).replace('-', '_')}"
+        f"{meta['note']}_{algorithm}_dispatch_"
+        f"{str(config.dispatch_mode).replace('-', '_')}"
     )
     meta["sale"] = sale
     meta["lap"] = lap
@@ -260,10 +278,19 @@ def runtime_exp_meta(config) -> dict:
     else:
         meta["cost_structure"] = "baseline_exp_residual"
         meta["action_range"] = f"{float(config.action_scale):g}-scaled"
-    meta["exploration_noise_std"] = float(config.exploration_noise_std)
-    meta["exploration_noise_final_std"] = float(
-        min(config.exploration_noise_std, config.exploration_noise_final_std)
+    external_noise_std = (
+        0.0 if algorithm == "sac" else float(config.exploration_noise_std)
     )
+    external_noise_final_std = (
+        0.0
+        if algorithm == "sac"
+        else float(min(
+            config.exploration_noise_std,
+            config.exploration_noise_final_std,
+        ))
+    )
+    meta["exploration_noise_std"] = external_noise_std
+    meta["exploration_noise_final_std"] = external_noise_final_std
     meta["exploration_noise_anneal_steps"] = int(
         config.exploration_noise_anneal_steps
     )
@@ -279,7 +306,7 @@ def runtime_exp_meta(config) -> dict:
         f"{int(config.replay_capacity_env_steps)}"
     )
     meta["description"] = (
-        f"{EXP_META['description']} Directional contextual TD7 with "
+        f"{EXP_META['description']} Directional contextual {algorithm.upper()} with "
         f"SALE={'on' if sale else 'off'}, LAP={'on' if lap else 'off'}, "
         f"replay_sampling={config.replay_sampling_mode}, "
         f"action_mode={action_mode}, dispatch_mode={config.dispatch_mode}, "
@@ -289,7 +316,7 @@ def runtime_exp_meta(config) -> dict:
         f"{reward_config.global_alpha:g}/{reward_config.local_alpha:g}), "
         f"replay_capacity={int(config.replay_capacity_env_steps)}, "
         f"curriculum_end_step={int(config.curriculum_end_step)}, "
-        f"exploration={float(config.exploration_noise_std):g}->"
+        f"external_exploration={external_noise_std:g}->"
         f"{meta['exploration_noise_final_std']:g} over global steps "
         f"{int(config.warmup_steps)}.."
         f"{int(config.warmup_steps + config.exploration_noise_anneal_steps)}, "
@@ -312,19 +339,25 @@ class ContextualWandbLogger:
 
         meta = runtime_exp_meta(config)
         assert meta["action_scale"] == float(config.action_scale)
-        assert meta["exploration_noise_std"] == float(
-            config.exploration_noise_std
-        )
-        assert meta["exploration_noise_final_std"] == float(
-            min(
+        is_sac = getattr(config, "algorithm", "td7") == "sac"
+        expected_noise = 0.0 if is_sac else float(config.exploration_noise_std)
+        expected_final_noise = (
+            0.0
+            if is_sac
+            else float(min(
                 config.exploration_noise_std,
                 config.exploration_noise_final_std,
-            )
+            ))
         )
+        assert meta["exploration_noise_std"] == expected_noise
+        assert meta["exploration_noise_final_std"] == expected_final_noise
         runtime_config = dict(vars(config))
         runtime_config["EXP_META"] = meta
         self.run = wandb.init(
-            project="oht-routing-contextual-td7",
+            project=(
+                f"oht-routing-contextual-"
+                f"{getattr(config, 'algorithm', 'td7')}"
+            ),
             config=runtime_config,
             name=_make_run_name(meta),
             notes=meta["description"],

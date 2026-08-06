@@ -7,9 +7,12 @@ import torch
 from cocel_rl.algorithms.contextual_td7 import (
     ContextualLearnerConfig,
     ContextualTD7Learner,
+    REPLAY_SAMPLING_RAIL,
+    REPLAY_SAMPLING_SNAPSHOT,
     contextual_algorithm_variant,
 )
 from main_contextual import parse_args
+from ClientAlgorithm_contextual import ContextualRuntimeConfig
 from test_contextual_learner import SMALL_NETWORK
 from test_contextual_sale import sale_replay
 
@@ -25,10 +28,12 @@ EXPECTED = {
 class ContextualVariantTests(unittest.TestCase):
     def test_cli_boolean_optional_flags_and_string_false_rejected(self):
         cases = (
-            ([], True, True),
-            (["--no-sale"], False, True),
+            ([], True, False),
+            (["--no-sale"], False, False),
             (["--no-lap"], True, False),
             (["--no-sale", "--no-lap"], False, False),
+            (["--algorithm", "td7", "--replay-buffer-rail"], True, True),
+            (["--replay-buffer-rail", "--no-lap"], True, False),
         )
         for arguments, sale, lap in cases:
             with self.subTest(arguments=arguments), patch.object(
@@ -41,6 +46,30 @@ class ContextualVariantTests(unittest.TestCase):
             sys, "argv", ["main_contextual.py", "--sale", "false"]
         ), self.assertRaises(SystemExit):
             parse_args()
+
+    def test_cli_defaults_to_one_complete_factory_snapshot(self):
+        with patch.object(sys, "argv", ["main_contextual.py"]):
+            parsed = parse_args()
+        self.assertEqual(parsed.replay_sampling_mode, REPLAY_SAMPLING_SNAPSHOT)
+        self.assertEqual(parsed.batch_size, 1)
+        self.assertFalse(parsed.lap)
+
+        with patch.object(
+            sys,
+            "argv",
+            ["main_contextual.py", "--replay-buffer-rail"],
+        ):
+            parsed = parse_args()
+        self.assertEqual(parsed.replay_sampling_mode, REPLAY_SAMPLING_RAIL)
+        self.assertEqual(parsed.batch_size, 1_024)
+
+        runtime_config = ContextualRuntimeConfig()
+        self.assertEqual(
+            runtime_config.replay_sampling_mode,
+            REPLAY_SAMPLING_SNAPSHOT,
+        )
+        self.assertEqual(runtime_config.batch_size, 1)
+        self.assertFalse(runtime_config.lap_enabled)
 
     def test_four_variant_names_loss_modes_and_finite_updates(self):
         for flags, name in EXPECTED.items():

@@ -27,7 +27,11 @@ from cocel_rl.algorithms.contextual_td7 import (
     REPLAY_SAMPLING_RANDOM_RAIL,
     REPLAY_SAMPLING_RAIL,
     REPLAY_SAMPLING_SNAPSHOT,
-    read_contextual_runtime_config,
+    read_contextual_runtime_config as read_contextual_td7_runtime_config,
+)
+from cocel_rl.algorithms.contextual_sac import (
+    CHECKPOINT_VERSION as SAC_CHECKPOINT_VERSION,
+    read_contextual_sac_runtime_config,
 )
 from contextual_action import ACTION_MODES, REGION_B_RL
 
@@ -76,7 +80,13 @@ def seed_everything(seed):
 
 def restore_checkpoint_runtime_config(config_kwargs, checkpoint_path):
     """Apply saved experiment settings while preserving launch controls."""
-    saved, complete = read_contextual_runtime_config(checkpoint_path)
+    checkpoint_header = torch.load(
+        Path(checkpoint_path), map_location="cpu", weights_only=False
+    )
+    if checkpoint_header.get("checkpoint_version") == SAC_CHECKPOINT_VERSION:
+        saved, complete = read_contextual_sac_runtime_config(checkpoint_path)
+    else:
+        saved, complete = read_contextual_td7_runtime_config(checkpoint_path)
     valid_fields = set(ContextualRuntimeConfig.__dataclass_fields__)
     restored = []
     for key, value in saved.items():
@@ -101,6 +111,9 @@ def restore_checkpoint_runtime_config(config_kwargs, checkpoint_path):
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Contextual baseline, inference, and Phase 7 training runtime"
+    )
+    parser.add_argument(
+        "--algorithm", choices=("td7", "sac"), default="sac"
     )
     parser.add_argument(
         "--mode",
@@ -177,7 +190,7 @@ def parse_args():
         const=REPLAY_SAMPLING_RAIL,
         help=(
             "Sample batch-size independent (environment step, controlled "
-            "rail) transitions. This is the default and original behavior."
+            "rail) transitions. This preserves the original behavior."
         ),
     )
     replay_sampling.add_argument(
@@ -186,8 +199,9 @@ def parse_args():
         action="store_const",
         const=REPLAY_SAMPLING_SNAPSHOT,
         help=(
-            "Sample batch-size distinct environment steps and include every "
-            "controlled rail from each selected snapshot. Requires --no-lap."
+            "Sample batch-size complete factory steps and include every "
+            "controlled rail from each selected snapshot exactly once. This "
+            "is the default; batch-size defaults to 1 and LAP defaults off."
         ),
     )
     replay_sampling.add_argument(
@@ -202,24 +216,44 @@ def parse_args():
             "replay pool. Requires --no-lap."
         ),
     )
-    parser.set_defaults(replay_sampling_mode=REPLAY_SAMPLING_RAIL)
-    parser.add_argument("--batch-size", type=int, default=1_024)
+    parser.set_defaults(replay_sampling_mode=REPLAY_SAMPLING_SNAPSHOT)
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help=(
+            "Number of factory snapshots in snapshot mode (default: 1), or "
+            "number of logical rail transitions in rail modes (default: 1024)."
+        ),
+    )
     parser.add_argument("--minimum-replay-env-steps", type=int, default=100)
     parser.add_argument(
         "--minimum-action-enabled-env-steps", type=int, default=100
     )
     parser.add_argument("--updates-per-env-step", type=int, default=1)
     parser.add_argument("--learn-every-env-steps", type=int, default=1)
-    parser.add_argument("--wandb", action="store_true")
+    parser.add_argument("--wandb", action="store_true", default=True)
     parser.add_argument(
         "--sale", action=argparse.BooleanOptionalAction, default=True
     )
     parser.add_argument(
-        "--lap", action=argparse.BooleanOptionalAction, default=True
+        "--lap",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Enable per-rail LAP priority sampling. By default it is enabled "
+            "only for TD7 rail replay and disabled for full-factory replay."
+        ),
     )
     parser.add_argument(
         "--critic-loss-mode", choices=("auto", "huber", "mse"), default="auto"
     )
+    parser.add_argument("--sac-temperature-lr", type=float, default=3e-4)
+    parser.add_argument("--sac-initial-alpha", type=float, default=0.2)
+    parser.add_argument("--sac-target-entropy", type=float, default=None)
+    parser.add_argument("--sac-tau", type=float, default=0.005)
+    parser.add_argument("--sac-log-std-min", type=float, default=-20.0)
+    parser.add_argument("--sac-log-std-max", type=float, default=2.0)
     parser.add_argument("--wandb-log-interval", type=int, default=10)
     parser.add_argument("--console-log-interval", type=int, default=100)
     parser.add_argument("--early-stop-queued-threshold", type=float, default=500.0)
@@ -264,7 +298,19 @@ def parse_args():
         default=100,
         help="Write the smoke summary every N active ticks.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.batch_size is None:
+        args.batch_size = (
+            1
+            if args.replay_sampling_mode == REPLAY_SAMPLING_SNAPSHOT
+            else 1_024
+        )
+    if args.lap is None:
+        args.lap = (
+            args.algorithm == "td7"
+            and args.replay_sampling_mode == REPLAY_SAMPLING_RAIL
+        )
+    return args
 
 
 def read_port(path="wpconfig.json"):
@@ -434,6 +480,7 @@ def main():
     if args.console_log_interval <= 0:
         raise ValueError("--console-log-interval must be positive")
     config_kwargs = {
+        "algorithm": args.algorithm,
         "mode": args.mode,
         "action_enabled": args.action_enabled,
         "action_mode": args.action_mode,
@@ -467,9 +514,19 @@ def main():
         "updates_per_env_step": args.updates_per_env_step,
         "learn_every_env_steps": args.learn_every_env_steps,
         "wandb_enabled": args.wandb,
-        "sale_enabled": args.sale,
-        "lap_enabled": args.lap,
-        "critic_loss_mode": args.critic_loss_mode,
+        "sale_enabled": args.sale if args.algorithm == "td7" else False,
+        "lap_enabled": args.lap if args.algorithm == "td7" else False,
+        "critic_loss_mode": (
+            args.critic_loss_mode
+            if args.algorithm == "td7" or args.critic_loss_mode != "auto"
+            else "mse"
+        ),
+        "sac_temperature_lr": args.sac_temperature_lr,
+        "sac_initial_alpha": args.sac_initial_alpha,
+        "sac_target_entropy": args.sac_target_entropy,
+        "sac_tau": args.sac_tau,
+        "sac_log_std_min": args.sac_log_std_min,
+        "sac_log_std_max": args.sac_log_std_max,
         "wandb_log_interval": args.wandb_log_interval,
         "early_stop_queued_threshold": args.early_stop_queued_threshold,
         "early_stop_tat_threshold": args.early_stop_tat_threshold,
@@ -499,7 +556,8 @@ def main():
     )
     print(
         "[main-contextual] "
-        f"mode={args.mode}, action_enabled={args.action_enabled}, "
+        f"algorithm={client.config.algorithm}, mode={args.mode}, "
+        f"action_enabled={args.action_enabled}, "
         f"action_mode={args.action_mode}, "
         f"dispatch_mode={client.config.dispatch_mode}, "
         f"action_scale={client._action_scale()}, "

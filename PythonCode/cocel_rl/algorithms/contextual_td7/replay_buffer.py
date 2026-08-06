@@ -30,7 +30,7 @@ class ContextualReplayError(RuntimeError):
 
 
 REPLAY_VERSION = "contextual_step_snapshot_uniform_v1"
-REPLAY_SAMPLING_VERSION = "contextual_replay_sampling_modes_v2"
+REPLAY_SAMPLING_VERSION = "contextual_factory_snapshot_default_v3"
 REPLAY_SAMPLING_RAIL = "rail"
 REPLAY_SAMPLING_SNAPSHOT = "snapshot"
 REPLAY_SAMPLING_RANDOM_RAIL = "random_rail"

@@ -1,5 +1,26 @@
 # OHT Routing RL Experiment Log
 
+## 2026-08-02 - CO-GYM-style SAC for 0704 and contextual runtimes
+
+- Added algorithm version `sac_cogym_auto_entropy_v1` to the preserved 0704
+  runtime. The 18-dimensional observation, 0704 reward, `b_rl` mapping, and
+  action curriculum are unchanged.
+- Added contextual algorithm version `contextual_directional_sac_v1` with
+  variant `contextual_sac_uniform_v1`. It retains the directional context
+  encoder and applied-action critic contract, while using a tanh-squashed
+  Gaussian actor, twin-Q entropy target, automatic temperature tuning, and
+  Polyak soft targets.
+- Contextual SAC uses uniform replay with SALE/LAP disabled and obtains
+  exploration from the stochastic policy rather than an extra Gaussian-noise
+  schedule. Reward F and observation/action mappings are unchanged, so the
+  reward version is not incremented.
+- Added SAC-specific checkpoint version `contextual_sac_checkpoint_v1`, W&B
+  metadata/metrics, and online project `oht-routing-contextual-sac`.
+- Aligned the direct `ContextualRuntimeConfig` episode burn-in default with the
+  existing CLI default (`0`); production CLI behavior is unchanged.
+- Validation: six SAC smoke/integration tests and all 174 repository unit tests
+  passed without connecting to W&B or the external simulator.
+
 ## 2026-07-19 — W&B `5ytouc3j` 붕괴 분석 및 `checkpoint_9` 재학습 준비
 
 ### 목적
@@ -702,3 +723,25 @@ architectural stabilization change is selected.
 - Added aggregate dispatch diagnostics to W&B/export metadata. Reward F,
   learner, replay, observation, action mapping, and curriculum are unchanged.
 - No simulator or W&B run was launched for this implementation change.
+
+# 2026-08-03 - Full-factory snapshot replay becomes the default
+
+- Replay sampling version: `contextual_factory_snapshot_default_v3`.
+- `main_contextual.py` and `ContextualRuntimeConfig` now default to uniform
+  full-snapshot replay with `batch_size=1` and LAP disabled. One optimizer
+  batch therefore contains all 4,996 controlled rails from one selected
+  environment step exactly once.
+- `batch_size` means factory-step count in snapshot mode. The legacy rail
+  sampler remains available through `--replay-buffer-rail`; when TD7 rail
+  replay is explicitly selected, its dynamic defaults remain
+  `batch_size=1024` and LAP enabled.
+- Replay storage remains the existing shared raw state ring, so switching the
+  sampler does not duplicate each snapshot per rail. At capacity 10,000 the
+  estimated allocation for 4,999 physical / 4,996 controlled rails without
+  LAP is 3.54 GiB; capacity 2,000 is approximately 0.71 GiB.
+- The learner architecture is unchanged. Snapshot rows are flattened only
+  after selecting a factory step, and the mean actor/critic losses see every
+  controlled rail with equal inclusion frequency.
+- Added regression coverage for full-row membership, step grouping, distinct
+  snapshot selection, overflow rejection, and CLI defaults. No simulator or
+  W&B run was launched for this implementation change.

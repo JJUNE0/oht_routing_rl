@@ -25,20 +25,44 @@ EXPECTED_SIMULATION_STATES = {0, 1, 2, 3, 4, 5, 6}
 
 def ParseArgs():
     parser = argparse.ArgumentParser()
-    parser.add_argument(
+    implementation = parser.add_mutually_exclusive_group()
+    implementation.add_argument(
         "--region",
         action="store_true",
         help="Run ClientAlgorithm_region region-token TD7 harness.",
     )
+    implementation.add_argument(
+        "--version-0704",
+        action="store_true",
+        help="Run the preserved ClientAlgorithm_0704 harness.",
+    )
+    parser.add_argument(
+        "--algorithm",
+        choices=("TD3", "TD7", "SAC", "td3", "td7", "sac"),
+        default=None,
+        help="Algorithm override for --version-0704.",
+    )
     return parser.parse_args()
 
 
-def CreateClient(use_region):
+def CreateClient(use_region, use_0704=False, algorithm=None):
     if use_region:
+        if algorithm is not None:
+            raise ValueError("--algorithm is only supported with --version-0704")
         import ClientAlgorithm_region as ClientAlgorithmModule
 
         print("[main] using ClientAlgorithm_region (--region)")
+    elif use_0704:
+        import ClientAlgorithm_0704 as ClientAlgorithmModule
+
+        print(
+            "[main] using ClientAlgorithm_0704 "
+            f"(algorithm={(algorithm or 'TD7').upper()})"
+        )
+        return ClientAlgorithmModule.ClientAlgorithm(algorithm_name=algorithm)
     else:
+        if algorithm is not None:
+            raise ValueError("--algorithm is only supported with --version-0704")
         import ClientAlgorithm as ClientAlgorithmModule
 
         print("[main] using ClientAlgorithm")
@@ -95,7 +119,7 @@ def main():
     # 루프를 시작한다. CA 생성이 핸드셰이크 뒤에 오면 7초간 시뮬 데이터를 못 받아
     # 소켓 버퍼 오버플로 / 시뮬 타임아웃이 발생한다.
     # 포트를 열기 전에 생성하면 시뮬이 CA 준비 전에 연결 자체를 못 하므로 안전하다.
-    client = CreateClient(args.region)
+    client = CreateClient(args.region, args.version_0704, args.algorithm)
 
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.bind((HOST,PORT));

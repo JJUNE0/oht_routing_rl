@@ -14,6 +14,7 @@ from cocel_rl.algorithms.contextual_td7 import (
     ContextualLearnerConfig,
     ContextualNetworkConfig,
     ContextualTD7Learner,
+    REPLAY_SAMPLING_RAIL,
 )
 from cocel_rl.algorithms.contextual_td7.learner_types import (
     ContextualLearnerUpdate,
@@ -121,6 +122,10 @@ def training_runtime(**overrides):
         "device": "cpu",
         "seed": 12,
         "replay_capacity_env_steps": 64,
+        # Most legacy runtime tests intentionally exercise the original
+        # logical-rail batching contract. Full-factory behavior has dedicated
+        # replay/default regression tests.
+        "replay_sampling_mode": REPLAY_SAMPLING_RAIL,
         "batch_size": 16,
         "minimum_replay_env_steps": 2,
         "minimum_action_enabled_env_steps": 2,
@@ -424,6 +429,7 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
             wandb_enabled=False,
             sale_enabled=True,
             lap_enabled=True,
+            replay_sampling_mode=REPLAY_SAMPLING_RAIL,
         )
         runtime = ClientAlgorithm(config)
         runtime.topology = make_topology()

@@ -1,4 +1,61 @@
-# Contextual TD7 for OHT Routing
+# Contextual TD7/SAC for OHT Routing
+
+## 공장 전체 snapshot replay (기본값)
+
+Contextual runtime의 replay sample 하나는 기본적으로 simulator의 한 시점에
+해당합니다. 한 시점을 뽑으면 4,996개 제어 rail이 각각 정확히 한 번씩 같은
+optimizer update에 포함됩니다. 따라서 rail별 random/priority sampling으로 특정
+기본 cost 구간이 과대표집되는 문제를 피합니다. 1,004대 OHT의 상태는 기존과
+동일하게 rail local feature와 global feature에 집계됩니다.
+
+```powershell
+python .\PythonCode\main_contextual.py `
+  --mode training `
+  --action-enabled `
+  --replay-buffer-snapshot `
+  --batch-size 1 `
+  --no-lap `
+  --wandb
+```
+
+`snapshot` 모드에서 `--batch-size`는 rail 수가 아니라 동시에 학습할 공장
+시점의 수입니다. 기본값 1을 권장합니다. 기존 방식은
+`--replay-buffer-rail --batch-size 1024`로 명시할 수 있으며, TD7에서는 이때
+LAP가 기본 활성화됩니다.
+
+현재 4,999 physical rail / 4,996 controlled rail 구성에서 replay capacity
+10,000은 약 3.54 GiB를 사용합니다. 메모리가 부족하면
+`--replay-capacity-env-steps 2000`(약 0.71 GiB)부터 시작하십시오.
+
+## SAC experiments
+
+The preserved 0704 runtime now exposes CO-GYM-style SAC (tanh-squashed
+Gaussian policy, twin critic, automatic entropy temperature, and soft target
+updates). W&B is online by default in this runtime:
+
+```powershell
+python .\PythonCode\main.py --version-0704 --algorithm SAC
+```
+
+The contextual runtime keeps the directional context encoder and uses a
+separate contextual SAC learner. SAC uses uniform replay and its own
+stochastic policy, so TD7-only SALE/LAP and external Gaussian exploration are
+disabled:
+
+```powershell
+python .\PythonCode\main_contextual.py `
+  --algorithm sac `
+  --mode training `
+  --action-enabled `
+  --no-sale `
+  --no-lap `
+  --critic-loss-mode mse `
+  --wandb
+```
+
+Contextual SAC logs online to project `oht-routing-contextual-sac`. Its
+checkpoints are isolated under the contextual SAC runtime variant and include
+the learned entropy temperature and optimizer state.
 
 반도체 FAB OHT의 rail cost를 학습해 혼잡 구간을 우회시키는 contextual TD7 구현입니다.
 기본 학습 구성은 **Directional Context Encoder + TD7 + SALE + LAP**입니다.
@@ -166,7 +223,7 @@ $env:PYTHONPATH="$PWD;$PWD\PythonCode;$PWD\PythonCode\tests"
 python -m unittest discover -s .\PythonCode\tests -p "test_contextual*.py"
 ```
 
-현재 contextual 회귀 테스트: **157개**.
+현재 contextual 회귀 테스트: **168개** (전체 저장소 **174개**).
 
 
 ## Ablation study

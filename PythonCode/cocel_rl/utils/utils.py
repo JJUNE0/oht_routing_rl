@@ -41,32 +41,31 @@ def move_to_cpu(state_dict):
     return new_state_dict
 
 def create_onnx_policy(src, algorithm):
-    from algorithms.sac.network import SACONNXPolicy
-    from algorithms.td3.network import TD3ONNXPolicy
-    from algorithms.td7.network import TD7ONNXPolicy
-    from algorithms.tqc.network import TQCONNXPolicy
-    from algorithms.ddpg.network import DDPGONNXPolicy
-
+    algorithm = str(algorithm).lower()
     if algorithm == 'tqc':
+        from algorithms.tqc.network import TQCONNXPolicy
         onnx_policy = TQCONNXPolicy(src.obs_dim, src.act_dim, src.hidden_dims, src.action_bound, src.activation_fc_name)
         onnx_policy.input_layer = copy.deepcopy(src.input_layer)
         onnx_policy.hidden_layers = copy.deepcopy(src.hidden_layers)
         onnx_policy.mean_layer = copy.deepcopy(src.mean_layer)
     elif algorithm == 'td7':
+        from cocel_rl.algorithms.td7.network import TD7ONNXPolicy
         onnx_policy = TD7ONNXPolicy(src.obs_dim, src.act_dim, src.max_action, src.zs_dim, src.hidden_dims, src.encoder_hidden_dims, src.activation_fc_name)
         onnx_policy.mlp = copy.deepcopy(src.mlp)
         onnx_policy.fixed_encoder = copy.deepcopy(src.fixed_encoder)
     elif algorithm == 'sac':
+        from cocel_rl.algorithms.sac.network import SACONNXPolicy
         onnx_policy = SACONNXPolicy(src.obs_dim, src.act_dim, src.hidden_dims, src.action_bound, src.activation_fc_name)
-        onnx_policy.input_layer = copy.deepcopy(src.input_layer)
         onnx_policy.hidden_layers = copy.deepcopy(src.hidden_layers)
-        onnx_policy.output_layer = copy.deepcopy(src.mean_layer)
+        onnx_policy.mean_layer = copy.deepcopy(src.mean_layer)
     elif algorithm == 'td3':
+        from cocel_rl.algorithms.td3.network import TD3ONNXPolicy
         onnx_policy = TD3ONNXPolicy(src.obs_dim, src.act_dim, src.action_bound, src.hidden_dims, src.activation_fc_name)
         onnx_policy.input_layer = copy.deepcopy(src.input_layer)
         onnx_policy.hidden_layers = copy.deepcopy(src.hidden_layers)
         onnx_policy.output_layer = copy.deepcopy(src.output_layer)
     elif algorithm == 'ddpg':
+        from algorithms.ddpg.network import DDPGONNXPolicy
         onnx_policy = DDPGONNXPolicy(src.obs_dim, src.act_dim, src.action_bound, src.hidden_dims, src.activation_fc_name)
         onnx_policy.input_layer = copy.deepcopy(src.input_layer)
         onnx_policy.hidden_layers = copy.deepcopy(src.hidden_layers)
