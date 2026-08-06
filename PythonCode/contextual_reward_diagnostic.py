@@ -1,4 +1,4 @@
-"""Bounded, opt-in JSONL diagnostics for contextual Reward I."""
+"""Bounded JSONL/W&B diagnostics for contextual rail reward contracts."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 
 
-DIAGNOSTIC_SCHEMA_VERSION = "contextual_reward_diagnostic_v12"
+DIAGNOSTIC_SCHEMA_VERSION = "contextual_reward_diagnostic_v15_balanced_neutral2"
 DEFAULT_DIAGNOSTIC_WINDOWS = (
     (0, 1_000, "00000_01000"),
     (10_000, 11_000, "10000_11000"),
@@ -79,7 +79,7 @@ class RewardDiagnosticWriter:
     """Append windowed records and retain only bounded cycle samples."""
 
     def __init__(self, directory, windows=None, *, cycle_buffer_size=10_000):
-        self.directory = Path(directory)
+        self.directory = Path(directory) if directory is not None else None
         self.windows = parse_diagnostic_windows(windows)
         if int(cycle_buffer_size) <= 0:
             raise ValueError("cycle_buffer_size must be positive")
@@ -90,7 +90,20 @@ class RewardDiagnosticWriter:
     def window_name(self, global_step):
         return diagnostic_window_name(global_step, self.windows)
 
+    @property
+    def writes_json(self):
+        return self.directory is not None
+
+    def window_bounds(self, global_step):
+        step = int(global_step)
+        for start, end, name in self.windows:
+            if start <= step < end:
+                return int(start), int(end), str(name)
+        return None
+
     def _append(self, prefix, window, record):
+        if self.directory is None:
+            return None
         path = self.directory / f"{prefix}_window_{window}.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
         safe = _json_safe(record)
@@ -135,8 +148,25 @@ class RewardDiagnosticWriter:
     def cycle_summary(self, global_step):
         window = self.window_name(global_step)
         records = tuple(self._cycle_records.get(window, ()))
-        prefix = "reward/rail_tat/"
+        prefix = "reward/rail/"
         result = {
+            prefix + "mode": (
+                records[-1].get("rail_reward_mode") if records else None
+            ),
+            prefix + "free_flow_neutral_ratio": (
+                records[-1].get("rail_free_flow_neutral_ratio")
+                if records else None
+            ),
+            prefix + "neutral_ratio": (
+                records[-1].get("rail_free_flow_neutral_ratio")
+                if records else None
+            ),
+            prefix + "weight": (
+                records[-1].get("rail_tat_weight") if records else None
+            ),
+            prefix + "clip": (
+                records[-1].get("rail_tat_clip") if records else None
+            ),
             prefix + "cycle_count": float(len(records)),
             prefix + "reward_applied_cycle_count": float(sum(
                 bool(item.get("reward_applied")) for item in records
@@ -171,14 +201,17 @@ class RewardDiagnosticWriter:
         applied = [item for item in records if item.get("reward_applied")]
         denominator = max(1, len(applied))
         result.update({
-            prefix + "reward_cycle_ratio": float(sum(
-                (item.get("signed_excess") or 0.0) < 0 for item in applied
+            prefix + "positive_cycle_ratio": float(sum(
+                bool(item.get("cycle_is_positive_reward"))
+                for item in applied
             ) / denominator),
-            prefix + "penalty_cycle_ratio": float(sum(
-                (item.get("signed_excess") or 0.0) > 0 for item in applied
+            prefix + "negative_cycle_ratio": float(sum(
+                bool(item.get("cycle_is_negative_reward"))
+                for item in applied
             ) / denominator),
             prefix + "zero_cycle_ratio": float(sum(
-                (item.get("signed_excess") or 0.0) == 0 for item in applied
+                bool(item.get("cycle_is_zero_reward"))
+                for item in applied
             ) / denominator),
             prefix + "route_free_flow_available_ratio": float(sum(
                 bool(item.get("route_free_flow_available")) for item in records
@@ -187,4 +220,56 @@ class RewardDiagnosticWriter:
         for key in ("clip_assignment_ratio", "clip_removed_ratio"):
             values = self._finite(records, key)
             result[prefix + key] = float(values.mean()) if values.size else 0.0
+        for key, output in (
+            ("route_free_flow_ratio", "route_ratio"),
+            ("cycle_rail_reward_raw", "cycle_reward_raw"),
+        ):
+            values = self._finite(applied, key)
+            result[prefix + output + "_mean"] = (
+                float(values.mean()) if values.size else 0.0
+            )
+            percentiles = (50, 90, 95, 10) if key == "cycle_rail_reward_raw" else (50, 90, 95)
+            for percentile in percentiles:
+                result[prefix + output + f"_p{percentile}"] = (
+                    float(np.percentile(values, percentile))
+                    if values.size else 0.0
+                )
+        raw_nonzero = []
+        weighted_abs = []
+        postclip_nonzero = []
+        for item in applied:
+            for attribution in item.get("rail_attributions", ()):
+                raw = attribution.get("raw_reward")
+                weighted = attribution.get("weighted_preclip")
+                postclip = attribution.get("postclip")
+                if raw is not None and raw != 0:
+                    raw_nonzero.append(abs(float(raw)))
+                if weighted is not None:
+                    weighted_abs.append(abs(float(weighted)))
+                if postclip is not None and postclip != 0:
+                    postclip_nonzero.append(abs(float(postclip)))
+        result[prefix + "nonzero_reward_abs_mean"] = (
+            float(np.mean(raw_nonzero)) if raw_nonzero else 0.0
+        )
+        result[prefix + "nonzero_reward_abs_p50"] = (
+            float(np.percentile(raw_nonzero, 50)) if raw_nonzero else 0.0
+        )
+        result[prefix + "nonzero_reward_abs_p95"] = (
+            float(np.percentile(raw_nonzero, 95)) if raw_nonzero else 0.0
+        )
+        result[prefix + "weighted_preclip_abs_mean"] = (
+            float(np.mean(weighted_abs)) if weighted_abs else 0.0
+        )
+        result[prefix + "postclip_abs_mean"] = (
+            float(np.mean(postclip_nonzero)) if postclip_nonzero else 0.0
+        )
+        result[prefix + "nonzero_raw_abs_mean"] = result[
+            prefix + "nonzero_reward_abs_mean"
+        ]
+        result[prefix + "nonzero_weighted_abs_mean"] = result[
+            prefix + "weighted_preclip_abs_mean"
+        ]
+        result[prefix + "nonzero_postclip_abs_mean"] = result[
+            prefix + "postclip_abs_mean"
+        ]
         return result

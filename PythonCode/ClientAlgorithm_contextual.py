@@ -52,6 +52,8 @@ from contextual_observation import (
 )
 from contextual_topology import load_cached_contextual_topology
 from contextual_reward import (
+    RAIL_REWARD_FREE_FLOW_NEUTRAL_2,
+    RAIL_REWARD_MODES,
     REWARD_VERSION,
     ContextualRewardBuilder,
     ContextualRewardConfig,
@@ -90,9 +92,15 @@ class ContextualRuntimeConfig:
     warmup_steps: int = 10_000
     episode_burnin_steps: int = 2_000
     normalizer_freeze_steps: int = 10_000
-    local_reward_scale: float = 3.0
-    reward_rail_tat_weight: float = 100.0
-    reward_rail_tat_clip: float = 0.5
+    tat_weight: float = 18.4
+    backlog_weight: float = 0.0005
+    local_predicted_oht_weight: float = 0.10
+    local_reward_scale: float = 2.0
+    rail_reward_mode: str = RAIL_REWARD_FREE_FLOW_NEUTRAL_2
+    rail_free_flow_neutral_ratio: float = 2.0
+    rail_baseline_ratio_reference: float | None = None
+    reward_rail_tat_weight: float = 50.0
+    reward_rail_tat_clip: float = 1.0
     tat_raw_clip: float = 1.0
     reward_diagnostic_dir: str | None = None
     reward_diagnostic_windows: str = "0:1000,10000:11000,20000:21000"
@@ -129,6 +137,7 @@ class ContextualRuntimeConfig:
     early_stop_min_episode_steps: int = 100
     max_stale_sim_time_ticks: int = 5
     dispatch_mode: str = DISPATCH_FIRST_MATCH
+    minimum_sign_sample_count: int = 100
 
     def __post_init__(self):
         if self.mode not in {"baseline_only", "actor_inference", "training"}:
@@ -191,17 +200,36 @@ class ContextualRuntimeConfig:
         if (
             not np.isfinite((
                 self.local_reward_scale,
+                self.tat_weight,
+                self.backlog_weight,
+                self.local_predicted_oht_weight,
                 self.reward_rail_tat_weight,
                 self.reward_rail_tat_clip,
                 self.tat_raw_clip,
             )).all()
             or self.local_reward_scale <= 0
+            or self.tat_weight < 0
+            or self.backlog_weight < 0
+            or self.local_predicted_oht_weight < 0
             or self.reward_rail_tat_weight < 0
             or self.reward_rail_tat_clip <= 0
             or self.tat_raw_clip <= 0
         ):
             raise ValueError("invalid raw reward scaling configuration")
+        if self.rail_reward_mode not in RAIL_REWARD_MODES:
+            raise ValueError(
+                f"rail_reward_mode must be one of {RAIL_REWARD_MODES}"
+            )
+        if (
+            not np.isfinite(self.rail_free_flow_neutral_ratio)
+            or self.rail_free_flow_neutral_ratio <= 0
+        ):
+            raise ValueError(
+                "rail_free_flow_neutral_ratio must be finite and positive"
+            )
         parse_diagnostic_windows(self.reward_diagnostic_windows)
+        if self.minimum_sign_sample_count <= 0:
+            raise ValueError("minimum_sign_sample_count must be positive")
         if (
             not np.isfinite(self.exploration_noise_std)
             or self.exploration_noise_std < 0
@@ -276,6 +304,13 @@ class ClientAlgorithm:
         self.last_policy_action = None
         self.last_exploratory_action = None
         self.last_diagnostics: dict[str, float] = {}
+        self._phase2_global_scales = deque(maxlen=1_000)
+        self._phase2_local_scales = deque(maxlen=1_000)
+        self._phase2_rail_active_scales = deque(maxlen=100_000)
+        self._phase2_backlogs = deque(maxlen=1_000)
+        self._phase2_good_rewards = deque(maxlen=10_000)
+        self._phase2_bad_rewards = deque(maxlen=10_000)
+        self._phase2_q_means = deque(maxlen=1_001)
         self.reward_builder = None
         self.transition_aligner = None
         self.episode_id = 0
@@ -318,7 +353,8 @@ class ClientAlgorithm:
                 self.config.reward_diagnostic_dir,
                 self.config.reward_diagnostic_windows,
             )
-            if self.config.reward_diagnostic_dir else None
+            if self.config.reward_diagnostic_dir
+            or self.config.wandb_enabled else None
         )
 
     @property
@@ -369,6 +405,18 @@ class ClientAlgorithm:
                     ContextualRewardConfig(
                         freeze_after_env_steps=self.config.normalizer_freeze_steps,
                         local_reward_scale=self.config.local_reward_scale,
+                        tat_weight=self.config.tat_weight,
+                        backlog_weight=self.config.backlog_weight,
+                        local_predicted_oht_weight=(
+                            self.config.local_predicted_oht_weight
+                        ),
+                        rail_reward_mode=self.config.rail_reward_mode,
+                        rail_free_flow_neutral_ratio=(
+                            self.config.rail_free_flow_neutral_ratio
+                        ),
+                        rail_baseline_ratio_reference=(
+                            self.config.rail_baseline_ratio_reference
+                        ),
                         rail_tat_weight=self.config.reward_rail_tat_weight,
                         rail_tat_clip=self.config.reward_rail_tat_clip,
                         tat_raw_clip=self.config.tat_raw_clip,
@@ -411,6 +459,18 @@ class ClientAlgorithm:
             ContextualRewardConfig(
                 freeze_after_env_steps=self.config.normalizer_freeze_steps,
                 local_reward_scale=self.config.local_reward_scale,
+                tat_weight=self.config.tat_weight,
+                backlog_weight=self.config.backlog_weight,
+                local_predicted_oht_weight=(
+                    self.config.local_predicted_oht_weight
+                ),
+                rail_reward_mode=self.config.rail_reward_mode,
+                rail_free_flow_neutral_ratio=(
+                    self.config.rail_free_flow_neutral_ratio
+                ),
+                rail_baseline_ratio_reference=(
+                    self.config.rail_baseline_ratio_reference
+                ),
                 rail_tat_weight=self.config.reward_rail_tat_weight,
                 rail_tat_clip=self.config.reward_rail_tat_clip,
                 tat_raw_clip=self.config.tat_raw_clip,
@@ -1596,6 +1656,7 @@ class ClientAlgorithm:
                 completed.reward
             )
             self.last_diagnostics.update(reward_diagnostics)
+            self._update_phase2_reward_diagnostics(completed.reward)
             self.last_diagnostics.update({
                 # Compatibility aliases used by the per-rail/region dashboards.
                 "reward/step_reward": reward_diagnostics["reward/total_mean"],
@@ -1691,11 +1752,16 @@ class ClientAlgorithm:
         })
         if completed is not None and self.reward_diagnostic_writer is not None:
             self._write_reward_step_diagnostic(pclient, completed)
-            self.last_diagnostics.update(
-                self.reward_diagnostic_writer.cycle_summary(
-                    self.total_steps - 1
-                )
+            cycle_summary = self.reward_diagnostic_writer.cycle_summary(
+                self.total_steps - 1
             )
+            cycle_summary["reward/rail/mode"] = (
+                self.reward_builder.config.rail_reward_mode
+            )
+            cycle_summary["reward/rail/free_flow_neutral_ratio"] = (
+                self.reward_builder.config.rail_free_flow_neutral_ratio
+            )
+            self.last_diagnostics.update(cycle_summary)
         checkpoint_started = time.perf_counter()
         if self.config.mode == "training" and not self.training_failed:
             self._maybe_checkpoint()
@@ -1708,10 +1774,96 @@ class ClientAlgorithm:
         })
         return action_result
 
+    def _update_phase2_reward_diagnostics(self, batch) -> None:
+        """Maintain bounded, run-local diagnostics for provisional scaling."""
+        global_scale = abs(float(batch.global_component))
+        local_scale = float(np.mean(np.abs(batch.local_component)))
+        rail_active = np.abs(batch.rail_reward_postclip[
+            ~np.isclose(batch.rail_reward_postclip, 0.0)
+        ])
+        self._phase2_global_scales.append(global_scale)
+        self._phase2_local_scales.append(local_scale)
+        self._phase2_rail_active_scales.extend(float(x) for x in rail_active)
+        self._phase2_backlogs.append(float(batch.backlog))
+
+        backlog_p50 = float(np.median(self._phase2_backlogs))
+        total_mean = float(batch.total.mean())
+        if batch.total_tat_level < self.reward_builder.config.tat_reference and (
+            batch.backlog <= backlog_p50
+        ):
+            self._phase2_good_rewards.append(total_mean)
+        if batch.total_tat_level > self.reward_builder.config.tat_reference and (
+            batch.backlog >= backlog_p50
+        ):
+            self._phase2_bad_rewards.append(total_mean)
+
+        def median(values):
+            return float(np.median(values)) if values else 0.0
+
+        sg = median(self._phase2_global_scales)
+        sl = median(self._phase2_local_scales)
+        sr = median(self._phase2_rail_active_scales)
+        scale_array = np.asarray([sg, sl, sr], dtype=np.float64)
+        positive = scale_array[scale_array > 0.0]
+        scale_mean = float(positive.mean()) if positive.size else 0.0
+        balance_error = (
+            float(np.mean(np.abs(positive - scale_mean)) / scale_mean)
+            if scale_mean > 0.0 else 0.0
+        )
+        good_count = len(self._phase2_good_rewards)
+        bad_count = len(self._phase2_bad_rewards)
+        good_mean = (
+            float(np.mean(self._phase2_good_rewards)) if good_count else 0.0
+        )
+        bad_mean = (
+            float(np.mean(self._phase2_bad_rewards)) if bad_count else 0.0
+        )
+        smooth_scale = float(np.mean(np.abs(batch.smooth_penalty)))
+        main_scale_mean = float(scale_array.mean())
+        self.last_diagnostics.update({
+            "reward/scale/global_representative": sg,
+            "reward/scale/local_representative": sl,
+            "reward/scale/rail_active_representative": sr,
+            "reward/scale/global_to_local": sg / sl if sl > 0.0 else 0.0,
+            "reward/scale/global_to_rail": sg / sr if sr > 0.0 else 0.0,
+            "reward/scale/local_to_rail": sl / sr if sr > 0.0 else 0.0,
+            "reward/scale/main_balance_error": balance_error,
+            "reward/scale/smooth_excess_warning": float(
+                main_scale_mean > 0.0
+                and smooth_scale > 0.1 * main_scale_mean
+            ),
+            "reward/sign/good_state_sample_count": float(good_count),
+            "reward/sign/good_state_total_mean": good_mean,
+            "reward/sign/bad_state_sample_count": float(bad_count),
+            "reward/sign/bad_state_total_mean": bad_mean,
+            "reward/sign/good_minus_bad": good_mean - bad_mean,
+            "reward/sign/good_state_sufficient": float(
+                good_count >= self.config.minimum_sign_sample_count
+            ),
+            "reward/sign/bad_state_sufficient": float(
+                bad_count >= self.config.minimum_sign_sample_count
+            ),
+        })
+        q1 = self.last_diagnostics.get("critic/q1_mean")
+        q2 = self.last_diagnostics.get("critic/q2_mean")
+        if q1 is not None and q2 is not None:
+            q_mean = 0.5 * (float(q1) + float(q2))
+            if np.isfinite(q_mean):
+                self._phase2_q_means.append(q_mean)
+        for lag in (100, 1_000):
+            self.last_diagnostics[f"critic/q_mean_delta_{lag}"] = (
+                self._phase2_q_means[-1] - self._phase2_q_means[-lag - 1]
+                if len(self._phase2_q_means) > lag else 0.0
+            )
+
     def _write_reward_step_diagnostic(self, pclient, completed) -> None:
         writer = self.reward_diagnostic_writer
         global_step = self.total_steps - 1
-        if writer is None or writer.window_name(global_step) is None:
+        if (
+            writer is None
+            or not writer.writes_json
+            or writer.window_name(global_step) is None
+        ):
             return
         batch = completed.reward
 
@@ -1724,9 +1876,9 @@ class ClientAlgorithm:
             if abs_mean:
                 record[prefix + "_abs_mean"] = float(np.abs(array).mean())
 
-        rail_raw = batch.rail_tat_raw
-        rail_weighted = batch.rail_tat_weighted_preclip
-        rail_postclip = batch.rail_tat_penalty
+        rail_raw = batch.rail_reward_raw
+        rail_weighted = batch.rail_reward_weighted_preclip
+        rail_postclip = batch.rail_reward_postclip
         clip_mask = ~np.isclose(rail_weighted, rail_postclip)
         nonzero = ~np.isclose(rail_postclip, 0.0)
         top_count = min(10, len(rail_postclip))
@@ -1742,7 +1894,7 @@ class ClientAlgorithm:
         components = (
             global_vector,
             batch.local_component,
-            -batch.rail_tat_penalty,
+            batch.rail_reward_postclip,
             -batch.smooth_penalty,
         )
         abs_means = np.asarray([
@@ -1765,6 +1917,7 @@ class ClientAlgorithm:
             "sim_time": float(getattr(pclient, "SimTime", 0.0)),
             "total_tat": batch.total_tat_level,
             "tat_reference": self.reward_builder.config.tat_reference,
+            "tat_weight": self.reward_builder.config.tat_weight,
             "tat_signal_available": bool(batch.tat_signal_available),
             "tat_raw_preclip": batch.tat_raw_preclip,
             "tat_raw_postclip": batch.tat_raw_postclip,
@@ -1778,6 +1931,7 @@ class ClientAlgorithm:
             "waiting": batch.waiting,
             "queued": batch.queued,
             "backlog": batch.backlog,
+            "backlog_weight": self.reward_builder.config.backlog_weight,
             "backlog_raw": batch.backlog_raw,
             "global_raw": batch.global_raw,
             "global_alpha": self.reward_builder.config.global_alpha,
@@ -1795,6 +1949,9 @@ class ClientAlgorithm:
             "local_idle_reward_mean": float(batch.local_idle_raw.mean()),
             "local_idle_reward_max": float(batch.local_idle_raw.max()),
             "local_reward_scale": self.reward_builder.config.local_reward_scale,
+            "local_predicted_oht_weight": (
+                self.reward_builder.config.local_predicted_oht_weight
+            ),
             "local_alpha": self.reward_builder.config.local_alpha,
             "rail_tat_cycle_count": int(
                 self.reward_builder._last_rail_tat_cycle_count
@@ -1807,6 +1964,10 @@ class ClientAlgorithm:
             ),
             "rail_tat_weight": self.reward_builder.config.rail_tat_weight,
             "rail_tat_clip": self.reward_builder.config.rail_tat_clip,
+            "rail_reward_mode": self.reward_builder.config.rail_reward_mode,
+            "rail_free_flow_neutral_ratio": (
+                self.reward_builder.config.rail_free_flow_neutral_ratio
+            ),
             "rail_tat_clip_fraction": float(clip_mask.mean()),
             "rail_tat_clip_removed_abs_mean": float(
                 np.abs(rail_weighted - rail_postclip).mean()
@@ -1870,6 +2031,39 @@ class ClientAlgorithm:
             "smooth_abs_share": float(shares[3]),
             "reward_decomposition_error_mean": float(reward_error.mean()),
             "reward_decomposition_error_max": float(reward_error.max()),
+            "phase2_global_representative": diagnostics.get(
+                "reward/scale/global_representative", 0.0
+            ),
+            "phase2_local_representative": diagnostics.get(
+                "reward/scale/local_representative", 0.0
+            ),
+            "phase2_rail_active_representative": diagnostics.get(
+                "reward/scale/rail_active_representative", 0.0
+            ),
+            "phase2_main_balance_error": diagnostics.get(
+                "reward/scale/main_balance_error", 0.0
+            ),
+            "good_state_sample_count": diagnostics.get(
+                "reward/sign/good_state_sample_count", 0.0
+            ),
+            "good_state_total_mean": diagnostics.get(
+                "reward/sign/good_state_total_mean", 0.0
+            ),
+            "bad_state_sample_count": diagnostics.get(
+                "reward/sign/bad_state_sample_count", 0.0
+            ),
+            "bad_state_total_mean": diagnostics.get(
+                "reward/sign/bad_state_total_mean", 0.0
+            ),
+            "good_minus_bad": diagnostics.get(
+                "reward/sign/good_minus_bad", 0.0
+            ),
+            "q_mean_delta_100": diagnostics.get(
+                "critic/q_mean_delta_100", 0.0
+            ),
+            "q_mean_delta_1000": diagnostics.get(
+                "critic/q_mean_delta_1000", 0.0
+            ),
         }
         for prefix, values in (
             ("local_raw", batch.local_raw),

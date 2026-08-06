@@ -67,7 +67,8 @@ python .\PythonCode\main_contextual.py `
   --exploration-noise-clip 0.20 `
   --warmup-steps 10000 `
   --normalizer-freeze-steps 10000 `
-  --reward-diagnostic-dir .\diagnostics\reward_i `
+  --rail-free-flow-reference-config .\diagnostics\rail_free_flow_reference.json `
+  --reward-diagnostic-dir .\diagnostics\reward_j `
   --curriculum-end-step 20000 `
   --curriculum-scale-start 0.05 `
   --curriculum-scale-end 1.0 `
@@ -85,7 +86,7 @@ python .\PythonCode\main_contextual.py `
   --checkpoint-root .\checkpoints\contextual_noiseanneal_seed0
 ```
 
-Reward I uses the fixed-scale contextual reward directly; reward normalizers
+The Reward I predecessor uses the fixed-scale contextual reward directly; reward normalizers
 are inactive and there is no reward-normalizer CLI switch. Observation/state
 normalization is unchanged. `--reward-diagnostic-dir` is optional; when it is
 omitted, no Reward I JSONL records or free-flow occurrence diagnostics are
@@ -93,8 +94,33 @@ created. The default diagnostic windows are
 `0:1000,10000:11000,20000:21000` and can be overridden with
 `--reward-diagnostic-windows`.
 
-The fixed reward for controlled rail `i` is
+Its fixed reward for controlled rail `i` is
 `0.5 * global_raw + 0.5 * (local_raw / 3) - clip(100 * rail_tat_raw, -0.5, 0.5) - 0.25 * abs(delta_b_rl)`.
+
+## Reward J Phase 1: free-flow neutral-2 rail reward
+
+Reward J replaces only the rail term with
+`2.0 - route_time / route_free_flow_time`. A ratio below 2 is rewarded, 2 is
+neutral, and a ratio above 2 is penalized. Phase 1 uses `rail_tat_weight=1.0`
+and per-rail clipping to `[-1.0, 1.0]`.
+The global raw, local `/3`, idle-off, and `0.25 * abs(delta_b_rl)` terms from
+Reward I are unchanged.
+
+No offline baseline calibration or reference file is required. The neutral
+ratio can be overridden with `--rail-free-flow-neutral-ratio`, but defaults to
+`2.0`. Existing Reward I checkpoints and replay are incompatible with Reward J.
+
+## Reward K Phase 2 provisional first run
+
+The first balanced-scale run keeps `tat_reference=174.4236`, neutral ratio
+`2.0`, both global/local alpha values at `0.5`, and smooth weight at `0.25`.
+Its provisional coefficients are `tat_weight=18.4`,
+`backlog_weight=0.0005`, `local_predicted_oht_weight=0.10`,
+`local_reward_scale=2.0`, `rail_tat_weight=50.0`, and
+`rail_tat_clip=1.0`. These are first-run values, not validated calibration
+results. W&B and optional reward JSONL record representative global, local,
+active-rail scales, good/bad reward signs, clipping, and Q-mean deltas for the
+next calibration pass. Reward I/J checkpoints and replay are incompatible.
 
 실행 후 simulator GUI에서 Python 연동을 활성화하고 Run을 시작합니다.
 

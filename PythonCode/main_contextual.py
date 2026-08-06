@@ -30,6 +30,10 @@ from cocel_rl.algorithms.contextual_td7 import (
     read_contextual_runtime_config,
 )
 from contextual_action import ACTION_MODES, REGION_B_RL
+from contextual_reward import (
+    RAIL_REWARD_FREE_FLOW_NEUTRAL_2,
+    RAIL_REWARD_MODES,
+)
 
 
 HOST = "127.0.0.1"
@@ -164,9 +168,20 @@ def parse_args():
     parser.add_argument("--episode-burnin-steps", type=int, default=0)
     parser.add_argument("--normalizer-freeze-steps", type=int, default=10_000)
     parser.add_argument(
+        "--rail-reward-mode",
+        choices=RAIL_REWARD_MODES,
+        default=RAIL_REWARD_FREE_FLOW_NEUTRAL_2,
+    )
+    parser.add_argument(
+        "--rail-free-flow-neutral-ratio",
+        type=float,
+        default=2.0,
+        help="Route/free-flow ratio that receives zero rail reward.",
+    )
+    parser.add_argument(
         "--reward-diagnostic-dir",
         default=None,
-        help="Opt-in directory for Reward I step/cycle JSONL diagnostics.",
+        help="Opt-in directory for contextual reward step/cycle JSONL diagnostics.",
     )
     parser.add_argument(
         "--reward-diagnostic-windows",
@@ -475,6 +490,8 @@ def main():
         "warmup_steps": args.warmup_steps,
         "episode_burnin_steps": args.episode_burnin_steps,
         "normalizer_freeze_steps": args.normalizer_freeze_steps,
+        "rail_reward_mode": args.rail_reward_mode,
+        "rail_free_flow_neutral_ratio": args.rail_free_flow_neutral_ratio,
         "reward_diagnostic_dir": args.reward_diagnostic_dir,
         "reward_diagnostic_windows": args.reward_diagnostic_windows,
         "tat_confidence_n0": args.tat_confidence_n0,
@@ -535,6 +552,16 @@ def main():
         f"warmup_steps={client.config.warmup_steps}, "
         f"episode_burnin_steps={client.config.episode_burnin_steps}, "
         f"reward_diagnostic_dir={client.config.reward_diagnostic_dir}, "
+        f"rail_reward_mode={client.config.rail_reward_mode}, "
+        "rail_free_flow_neutral_ratio="
+        f"{client.config.rail_free_flow_neutral_ratio}, "
+        f"tat_weight={client.config.tat_weight}, "
+        f"backlog_weight={client.config.backlog_weight}, "
+        "local_predicted_oht_weight="
+        f"{client.config.local_predicted_oht_weight}, "
+        f"local_reward_scale={client.config.local_reward_scale}, "
+        f"rail_tat_weight={client.config.reward_rail_tat_weight}, "
+        f"rail_tat_clip={client.config.reward_rail_tat_clip}, "
         f"use_tat_confidence={client.config.tat_confidence_ramp}, "
         f"replay_sampling={client.config.replay_sampling_mode}, "
         f"batch_size={client.config.batch_size}, "

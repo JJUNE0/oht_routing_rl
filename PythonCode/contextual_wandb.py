@@ -26,18 +26,22 @@ EXP_META = {
     "action_range": "b_rl_0.0-1.0",
     "topology": "directed_10in_10out_controlled_centers_v2",
     "observation": "contextual_obs_controlled_v1",
-    "reward_version": "I",
+    "reward_version": "K",
     "reward_contract_version": REWARD_VERSION,
+    "calibration_status": "provisional",
     "reward_global_alpha": 0.5,
     "reward_local_alpha": 0.5,
     "tat_reference": 174.4236,
-    "tat_weight": 9.2,
+    "tat_weight": 18.4,
     "op_reference": 0.80,
     "op_weight": 5.0,
-    "backlog_weight": 0.002,
-    "local_reward_scale": 3.0,
-    "rail_tat_weight": 100.0,
-    "rail_tat_clip": 0.5,
+    "backlog_weight": 0.0005,
+    "local_predicted_oht_weight": 0.10,
+    "local_reward_scale": 2.0,
+    "rail_reward_mode": "free_flow_neutral_2",
+    "rail_free_flow_neutral_ratio": 2.0,
+    "rail_tat_weight": 50.0,
+    "rail_tat_clip": 1.0,
     "tat_raw_clip": 1.0,
     "tat_confidence_ramp": False,
     "action_scale": 0.05,
@@ -51,17 +55,19 @@ EXP_META = {
     "episode_burnin_version": "deterministic_policy_burnin_v1",
     "send_cost_logging_version": "post_send_v2",
     "protocol_version": "single_end_time_v2",
-    "diagnostic_schema_version": "contextual_reward_diagnostic_v12",
+    "diagnostic_schema_version": (
+        "contextual_reward_diagnostic_v15_balanced_neutral2"
+    ),
     "centering": False,
     "replay_sampling_version": REPLAY_SAMPLING_VERSION,
-    "note": "fixedscale_localdiv3_idleoff_rail100clip05_smooth025",
+    "note": "neutral2_balanced111_tatup_backlogdown_preddown",
     "description": (
-        "Reward I removes running global/local reward normalization, directly "
-        "uses fixed-scale raw global reward, divides local reward by 3, removes "
-        "the local idle-OHT term, scales the existing OHTTat-based rail-TAT "
-        "penalty by 100 with per-rail clipping to [-0.5, 0.5], and increases "
-        "REGION_B_RL temporal smoothing weight to 0.25. DistancePerVelocity is "
-        "collected for diagnostics only and does not affect reward in this version."
+        "Reward K preserves the global TotalTat reference at 174.4236 and the "
+        "free-flow-neutral-2 rail reward introduced in Phase 1. Phase 2 "
+        "increases the influence of TotalTat, reduces backlog and "
+        "predicted-OHT shaping, and provisionally targets representative "
+        "global, local, and active rail magnitudes toward a 1:1:1 ratio "
+        "without a constant reward shift or TAT trend term."
     ),
 }
 
@@ -177,6 +183,7 @@ WANDB_METRIC_KEYS = (
     "learner/replay_applied_action_std",
     "learner/critic_action_matches_applied",
     "critic/q1_mean", "critic/q2_mean", "critic/q_min", "critic/q_max",
+    "critic/q_mean_delta_100", "critic/q_mean_delta_1000",
     "critic/q_abs_diff_mean", "critic/q_abs_diff_max",
     "critic/parameter_l2_distance", "critic/parameter_max_abs_diff",
     "critic/q1_loss", "critic/q2_loss",
@@ -212,6 +219,7 @@ WANDB_METRIC_KEYS = (
 )
 
 WANDB_METRIC_KEYS += (
+    "reward/rail/mode", "reward/rail/free_flow_neutral_ratio",
     "reward/global/total_tat", "reward/global/tat_reference",
     "reward/global/tat_error", "reward/global/tat_weight",
     "reward/global/tat_signal_available",
@@ -239,6 +247,30 @@ WANDB_METRIC_KEYS += (
     "reward/config/local_reward_scale", "reward/config/rail_tat_weight",
     "reward/config/rail_tat_clip", "reward/config/tat_raw_clip",
     "reward/config/smooth_weight_effective",
+    "reward/global/tat_raw", "reward/global/tat_component",
+    "reward/global/backlog_component", "reward/global/op_component",
+    "reward/global/global_component",
+    "reward/local/predicted_oht_weight",
+    "reward/local/predicted_oht_component_abs_mean",
+    "reward/local/local_reward_scale",
+    "reward/local/local_component_abs_mean",
+    "reward/local/predicted_abs_share", "reward/local/oht_abs_share",
+    "reward/local/stop_abs_share", "reward/local/capacity_abs_share",
+    "reward/rail/neutral_ratio", "reward/rail/weight", "reward/rail/clip",
+    "reward/rail/nonzero_raw_abs_mean",
+    "reward/rail/nonzero_weighted_abs_mean",
+    "reward/rail/nonzero_postclip_abs_mean",
+    "reward/scale/global_representative",
+    "reward/scale/local_representative",
+    "reward/scale/rail_active_representative",
+    "reward/scale/global_to_local", "reward/scale/global_to_rail",
+    "reward/scale/local_to_rail", "reward/scale/main_balance_error",
+    "reward/scale/smooth_excess_warning",
+    "reward/sign/good_state_sample_count",
+    "reward/sign/good_state_total_mean",
+    "reward/sign/bad_state_sample_count",
+    "reward/sign/bad_state_total_mean", "reward/sign/good_minus_bad",
+    "reward/sign/good_state_sufficient", "reward/sign/bad_state_sufficient",
 ) + tuple(
     f"reward/local/{term}_raw_{stat}"
     for term in ("oht", "predicted", "stop", "idle", "capacity")
@@ -246,9 +278,9 @@ WANDB_METRIC_KEYS += (
 )
 
 WANDB_METRIC_KEYS += (
-    "reward/rail_tat/cycle_count",
-    "reward/rail_tat/reward_applied_cycle_count",
-    "reward/rail_tat/skipped_cycle_count",
+    "reward/rail/cycle_count",
+    "reward/rail/reward_applied_cycle_count",
+    "reward/rail/skipped_cycle_count",
     "reward/rail_tat/effective_oht_tat_mean",
     "reward/rail_tat/effective_oht_tat_p50",
     "reward/rail_tat/effective_oht_tat_p90",
@@ -266,8 +298,16 @@ WANDB_METRIC_KEYS += (
     "reward/rail_tat/route_delay_ratio_p95",
     "reward/rail_tat/effective_to_freeflow_ratio_mean",
     "reward/rail_tat/service_residual_time_mean",
-    "reward/rail_tat/clip_assignment_ratio",
-    "reward/rail_tat/clip_removed_ratio",
+    "reward/rail/clip_assignment_ratio", "reward/rail/clip_removed_ratio",
+    "reward/rail/route_ratio_mean", "reward/rail/route_ratio_p50",
+    "reward/rail/route_ratio_p90", "reward/rail/route_ratio_p95",
+    "reward/rail/cycle_reward_raw_mean", "reward/rail/cycle_reward_raw_p10",
+    "reward/rail/cycle_reward_raw_p50", "reward/rail/cycle_reward_raw_p90",
+    "reward/rail/cycle_reward_raw_p95", "reward/rail/positive_cycle_ratio",
+    "reward/rail/negative_cycle_ratio", "reward/rail/zero_cycle_ratio",
+    "reward/rail/nonzero_reward_abs_mean", "reward/rail/nonzero_reward_abs_p50",
+    "reward/rail/nonzero_reward_abs_p95",
+    "reward/rail/weighted_preclip_abs_mean", "reward/rail/postclip_abs_mean",
 )
 
 
@@ -280,6 +320,12 @@ def runtime_exp_meta(config) -> dict:
         tat_confidence_n0=config.tat_confidence_n0,
         tat_confidence_ramp=config.tat_confidence_ramp,
         local_reward_scale=config.local_reward_scale,
+        tat_weight=config.tat_weight,
+        backlog_weight=config.backlog_weight,
+        local_predicted_oht_weight=config.local_predicted_oht_weight,
+        rail_reward_mode=config.rail_reward_mode,
+        rail_free_flow_neutral_ratio=config.rail_free_flow_neutral_ratio,
+        rail_baseline_ratio_reference=config.rail_baseline_ratio_reference,
         rail_tat_weight=config.reward_rail_tat_weight,
         rail_tat_clip=config.reward_rail_tat_clip,
         tat_raw_clip=config.tat_raw_clip,
@@ -312,8 +358,15 @@ def runtime_exp_meta(config) -> dict:
     meta["reward_global_alpha"] = float(reward_config.global_alpha)
     meta["reward_local_alpha"] = float(reward_config.local_alpha)
     meta["local_reward_scale"] = float(reward_config.local_reward_scale)
+    meta["local_predicted_oht_weight"] = float(
+        reward_config.local_predicted_oht_weight
+    )
     meta["rail_tat_weight"] = float(reward_config.rail_tat_weight)
     meta["rail_tat_clip"] = float(reward_config.rail_tat_clip)
+    meta["rail_reward_mode"] = reward_config.rail_reward_mode
+    meta["rail_free_flow_neutral_ratio"] = float(
+        reward_config.rail_free_flow_neutral_ratio
+    )
     meta["tat_raw_clip"] = float(reward_config.tat_raw_clip)
     meta["tat_confidence_n0"] = float(reward_config.tat_confidence_n0)
     meta["tat_confidence_ramp"] = bool(reward_config.tat_confidence_ramp)
@@ -361,7 +414,7 @@ def runtime_exp_meta(config) -> dict:
         f"action_mode={action_mode}, dispatch_mode={config.dispatch_mode}, "
         f"critic_loss={config.critic_loss_mode}, "
         "independently initialized Q1/Q2 heads, "
-        f"reward I ({REWARD_VERSION}, global/local="
+        f"reward J ({REWARD_VERSION}, global/local="
         f"{reward_config.global_alpha:g}/{reward_config.local_alpha:g}), "
         "reward_normalizer=removed, fixed_scale=on, "
         f"replay_capacity={int(config.replay_capacity_env_steps)}, "

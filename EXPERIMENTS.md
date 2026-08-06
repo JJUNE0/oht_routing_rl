@@ -840,3 +840,42 @@ architectural stabilization change is selected.
   obsolete normalizer metrics removed. Start a fresh Reward I run; older
   checkpoints, replay snapshots, and reward-normalizer statistics are rejected
   by reward-version guards.
+
+## 2026-08-05 - Reward J Phase 1 free-flow neutral ratio 2
+
+- Reward version: `J`; contract version:
+  `contextual_controlled_reward_v12_free_flow_neutral2`.
+- Rail cycle raw reward is `2.0 - route_time / route_free_flow_time`; ratio 2
+  is neutral, lower ratios are positive, and higher ratios are negative.
+- Default mode has no offline baseline reference, calibration file, or online
+  reference update. The fixed-TAT and baseline modes remain compatibility-only.
+- Existing actual-elapsed-time controlled/uncontrolled rail attribution is
+  retained. Phase 1 uses `rail_tat_weight=1.0` and `rail_tat_clip=1.0`; scale
+  tuning is explicitly deferred to Phase 2.
+- Added `cycle_fully_observed`, free-flow ratio/reward, raw attribution,
+  and clip-scale cycle diagnostics plus bounded W&B summaries. Diagnostic
+  schema: `contextual_reward_diagnostic_v14_free_flow_neutral2`.
+- Added neutral/positive/negative, monotonicity, path-length invariance,
+  attribution conservation, clipping, total-sign, and invalid-cycle tests.
+- `EXP_META.note=ffreward_neutral2_w1_clip1`. Reward J requires a fresh
+  critic, target critic, replay, and reward-normalizer state; Reward I
+  checkpoints/replay are rejected by version guards.
+
+## 2026-08-06 - Reward K provisional balanced neutral-2 first run
+
+- Reward version: `K`; contract version:
+  `contextual_controlled_reward_v13_balanced_freeflow_neutral2`.
+- User-selected provisional coefficients: `tat_weight=18.4`,
+  `backlog_weight=0.0005`, `local_predicted_oht_weight=0.10`,
+  `local_reward_scale=2.0`, `rail_tat_weight=50.0`, and
+  `rail_tat_clip=1.0`.
+- Preserved invariants: `tat_reference=174.4236`, neutral ratio `2.0`,
+  `global_alpha=local_alpha=0.5`, `smooth_b_rl_weight=0.25`, and the Phase 1
+  occurrence-aware actual-elapsed rail attribution.
+- Calibration status is `provisional`; these values will be re-evaluated from
+  the fresh run's steady-state JSONL and W&B diagnostics.
+- Added bounded representative-scale, good/bad sign, rail clipping, and
+  100/1000-update Q-mean-delta metrics. Diagnostic schema:
+  `contextual_reward_diagnostic_v15_balanced_neutral2`.
+- `EXP_META.note=neutral2_balanced111_tatup_backlogdown_preddown`. Reward I/J
+  checkpoints and replay are rejected; start with a fresh critic and replay.
