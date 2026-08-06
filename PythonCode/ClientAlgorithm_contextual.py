@@ -8,7 +8,7 @@ import os
 import time
 import traceback
 from collections import defaultdict, deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from numbers import Integral
 from pathlib import Path
 
@@ -1355,6 +1355,15 @@ class ClientAlgorithm:
             done=done,
             dispatch=False,
         )
+        if completed is not None and done:
+            terminal_total = np.ascontiguousarray(
+                completed.reward.total - 2.0, dtype=np.float32
+            )
+            terminal_total.setflags(write=False)
+            completed = replace(
+                completed,
+                reward=replace(completed.reward, total=terminal_total),
+            )
 
         timing = {
             "runtime/state_collection_ms": state_collection_ms,
