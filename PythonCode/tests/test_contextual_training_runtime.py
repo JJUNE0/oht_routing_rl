@@ -211,9 +211,9 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
             "reward/local_norm", "reward/rail_tat",
             "reward/rail_tat_event_count", "reward/rail_tat_sum",
             "reward/rail_tat_mean", "reward/rail_tat_max",
-            "reward/alpha", "reward/local_normalized_std",
-            "reward/marginal_tat_ema", "reward/tat_signal_available",
-            "reward/marg_tat",
+            "reward/alpha", "reward/local_scaled_std",
+            "reward/global/tat_signal_available",
+            "reward/total_tat_level",
             "reward/backlog",
             "reward/smooth_mean", "curriculum/action_scale",
             "global/tat", "global/op_rate", "global/queued",
@@ -230,9 +230,15 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
             runtime.last_diagnostics["reward/step_reward"],
             runtime.last_diagnostics["reward/total_mean"],
         )
+        # Reward K is never normalized, so the "_norm" dashboard aliases now
+        # forward the fixed-scale raw values.
         self.assertEqual(
             runtime.last_diagnostics["reward/global_norm"],
-            runtime.last_diagnostics["reward/global_normalized"],
+            runtime.last_diagnostics["reward/global_raw"],
+        )
+        self.assertEqual(
+            runtime.last_diagnostics["reward/local_norm"],
+            runtime.last_diagnostics["reward/local_scaled_mean"],
         )
         self.assertNotIn(
             "reward/region_internal_std_mean", runtime.last_diagnostics

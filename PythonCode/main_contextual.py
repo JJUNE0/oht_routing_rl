@@ -34,6 +34,10 @@ from cocel_rl.algorithms.contextual_sac import (
     read_contextual_sac_runtime_config,
 )
 from contextual_action import ACTION_MODES, REGION_B_RL
+from contextual_reward import (
+    RAIL_REWARD_FREE_FLOW_NEUTRAL_2,
+    RAIL_REWARD_MODES,
+)
 
 
 HOST = "127.0.0.1"
@@ -51,8 +55,11 @@ RESUME_LAUNCH_CONTROL_FIELDS = {
     "resume_checkpoint_path",
     "rail_tat_diagnostic_path",
     "rail_tat_diagnostic_max_step",
+    "reward_diagnostic_dir",
+    "reward_diagnostic_windows",
     "wandb_enabled",
     "dispatch_mode",
+    "tat_confidence_ramp",
 }
 
 
@@ -147,7 +154,7 @@ def parse_args():
         choices=("geometric", "linear"),
         default="geometric",
     )
-    parser.add_argument("--smooth-b-rl-weight", type=float, default=0.05)
+    parser.add_argument("--smooth-b-rl-weight", type=float, default=0.25)
     parser.add_argument(
         "--smooth-exp-residual-weight", type=float, default=0.5
     )
@@ -173,15 +180,42 @@ def parse_args():
     parser.add_argument("--warmup-steps", type=int, default=10_000)
     parser.add_argument("--episode-burnin-steps", type=int, default=0)
     parser.add_argument("--normalizer-freeze-steps", type=int, default=10_000)
+    parser.add_argument(
+        "--rail-reward-mode",
+        choices=RAIL_REWARD_MODES,
+        default=RAIL_REWARD_FREE_FLOW_NEUTRAL_2,
+    )
+    parser.add_argument(
+        "--rail-free-flow-neutral-ratio",
+        type=float,
+        default=2.0,
+        help="Route/free-flow ratio that receives zero rail reward.",
+    )
+    parser.add_argument(
+        "--reward-diagnostic-dir",
+        default=None,
+        help="Opt-in directory for contextual reward step/cycle JSONL diagnostics.",
+    )
+    parser.add_argument(
+        "--reward-diagnostic-windows",
+        default="0:1000,10000:11000,20000:21000",
+        help="Start-inclusive:end-exclusive global-step windows.",
+    )
     parser.add_argument("--tat-confidence-n0", type=float, default=500.0)
     parser.add_argument(
-        "--tat-confidence-ramp",
-        action=argparse.BooleanOptionalAction,
-        default=True,
+        "--use-tat-confidence",
+        "--use-tat-cofidence",
+        dest="use_tat_cofidence",
+        action="store_true",
+        default=False,
+        help=(
+            "Apply completed/(completed + n0) confidence ramp to the TAT "
+            "reward term. Disabled by default."
+        ),
     )
     parser.add_argument("--device", default=None)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--replay-capacity-env-steps", type=int, default=10_000)
+    parser.add_argument("--replay-capacity-env-steps", type=int, default=50_000)
     replay_sampling = parser.add_mutually_exclusive_group()
     replay_sampling.add_argument(
         "--replay-buffer-rail",
@@ -266,9 +300,7 @@ def parse_args():
         "--rail-tat-diagnostic",
         default=None,
         help=(
-            "Append rail-TAT completion diagnostics as JSON Lines. "
-            "Defaults to CHECKPOINT_ROOT/diagnostics/"
-            "rail_tat_completion.jsonl."
+            "Opt in to the legacy rail-TAT completion JSONL at this path."
         ),
     )
     parser.add_argument(
@@ -458,9 +490,19 @@ def handle_command(
         ohts, from_nodes, to_nodes = pclient.GetNeedReRouteOht()
         pclient.SendReRoute(client.ReRoute(pclient, ohts, from_nodes, to_nodes))
     elif command == 6:
+        started = time.perf_counter()
         pclient.RecieveSimulationSnapshotData()
+        snapshot_done = time.perf_counter()
         jobs = pclient.GetAssignCommand()
-        pclient.SendAssignOht(client.Assign(pclient, jobs))
+        jobs_done = time.perf_counter()
+        assigned = client.Assign(pclient, jobs)
+        assign_done = time.perf_counter()
+        pclient.SendAssignOht(assigned)
+        send_done = time.perf_counter()
+        print(
+            f"[cmd6] jobs={len(jobs)} assigned={len(assigned)} snapshot_ms={(snapshot_done - started) * 1000:.1f} get_jobs_ms={(jobs_done - snapshot_done) * 1000:.1f} assign_ms={(assign_done - jobs_done) * 1000:.1f} send_ms={(send_done - assign_done) * 1000:.1f} total_ms={(send_done - started) * 1000:.1f}",
+            flush=True,
+        )
 
 
 def main():
@@ -495,8 +537,12 @@ def main():
         "warmup_steps": args.warmup_steps,
         "episode_burnin_steps": args.episode_burnin_steps,
         "normalizer_freeze_steps": args.normalizer_freeze_steps,
+        "rail_reward_mode": args.rail_reward_mode,
+        "rail_free_flow_neutral_ratio": args.rail_free_flow_neutral_ratio,
+        "reward_diagnostic_dir": args.reward_diagnostic_dir,
+        "reward_diagnostic_windows": args.reward_diagnostic_windows,
         "tat_confidence_n0": args.tat_confidence_n0,
-        "tat_confidence_ramp": args.tat_confidence_ramp,
+        "tat_confidence_ramp": args.use_tat_cofidence,
         "seed": args.seed,
         "exploration_noise_std": args.exploration_noise_std,
         "exploration_noise_final_std": args.exploration_noise_final_std,
@@ -563,6 +609,18 @@ def main():
         f"action_scale={client._action_scale()}, "
         f"warmup_steps={client.config.warmup_steps}, "
         f"episode_burnin_steps={client.config.episode_burnin_steps}, "
+        f"reward_diagnostic_dir={client.config.reward_diagnostic_dir}, "
+        f"rail_reward_mode={client.config.rail_reward_mode}, "
+        "rail_free_flow_neutral_ratio="
+        f"{client.config.rail_free_flow_neutral_ratio}, "
+        f"tat_weight={client.config.tat_weight}, "
+        f"backlog_weight={client.config.backlog_weight}, "
+        "local_predicted_oht_weight="
+        f"{client.config.local_predicted_oht_weight}, "
+        f"local_reward_scale={client.config.local_reward_scale}, "
+        f"rail_tat_weight={client.config.reward_rail_tat_weight}, "
+        f"rail_tat_clip={client.config.reward_rail_tat_clip}, "
+        f"use_tat_confidence={client.config.tat_confidence_ramp}, "
         f"replay_sampling={client.config.replay_sampling_mode}, "
         f"batch_size={client.config.batch_size}, "
         f"exploration_noise={client.config.exploration_noise_std}->"

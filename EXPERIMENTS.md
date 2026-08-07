@@ -665,6 +665,15 @@ architectural stabilization change is selected.
 - Reward E, topology, actor/critic architecture, TD7 targets, optimizers,
   replay sampling, and action curriculum equations are unchanged.
 
+# 2026-07-31 - Short checkpoint directory slug
+
+- Storage-path version: `contextual_checkpoint_dir_slug_v1`. Default
+  checkpoint directories now use a compact SALE/LAP/action/sampling slug plus
+  a ten-character hash of the full runtime variant. Full algorithm and replay
+  version strings remain unchanged in checkpoint and W&B metadata.
+- This is a Windows path-length fix only. Model, reward, replay sampling,
+  learner updates, and checkpoint payload contents are unchanged.
+
 # 2026-07-28 - Selectable rail/full-snapshot replay sampling
 
 - Replay sampling version:
@@ -724,7 +733,47 @@ architectural stabilization change is selected.
   learner, replay, observation, action mapping, and curriculum are unchanged.
 - No simulator or W&B run was launched for this implementation change.
 
-# 2026-08-03 - Full-factory snapshot replay becomes the default
+## 2026-07-30 — Command 6 indexed dispatch candidates
+
+- Dispatch selection version:
+  `command6_live_path_cost_v2_indexed_candidates`.
+- Replaced the per-Job full scan over every OHT with a per-command-6
+  `pickup rail -> OHT candidates` index built from `RouteList[:16]`.
+- Job order, OHT insertion order, first pickup occurrence, eligibility,
+  one-OHT-per-batch usage, first-match selection, and cost-mode tie-breaking
+  are unchanged.
+- A 510-Job/1004-OHT synthetic workload with approximately three candidates
+  per Job produced identical assignments and reduced dispatch selection time
+  from about 599 ms to 67 ms. Reward, observation, action, and learner
+  contracts are unchanged.
+
+## 2026-07-30 - Command 6 reassignment-churn safety fix
+
+- Dispatch selection version:
+  `command6_live_path_cost_v4_safe_assignment_payload`.
+- Python dispatch now proposes only `QUEUED` Jobs with no existing OHT and
+  only unbound `IDLE` OHTs. `RESERVATED`/`WAITING` Jobs and OHTs referenced
+  by `JobID`, `DispatchedCommand`, or another command's `OHTId` are preserved.
+- The selected OHT-to-pickup prefix is sent as the assignment route instead
+  of the stale Job snapshot route.
+- Continuation assignment buffers are zero-initialized after every send, and
+  three Job snapshot running-area copy/paste errors were corrected.
+- `EXP_META.note=dispatchsafe`. Reward F, observation, learner, replay, and
+  rail-cost action contracts are unchanged.
+
+## 2026-07-30 - First-match counterfactual dispatch diagnostics
+
+- Diagnostic schema version: `contextual_reward_trace_v8`.
+- Added cost-mode comparisons against the first-match candidate from the
+  exact same candidate set: absolute/relative saving, strict-improvement
+  ratio, candidate-cost spread, multi-candidate ratio, and first-match cost.
+- Added cost-snapshot readiness, fallback, age, and eligible/zero-candidate
+  coverage diagnostics. Existing dispatch metric names remain as aliases.
+- Updated `export_wandb_run.py` with the same dispatch schema.
+- `EXP_META.note=dispatchdiag`. Dispatch selection, reward F, observation,
+  action, learner, and replay contracts are unchanged.
+
+## 2026-08-03 - Full-factory snapshot replay becomes the default
 
 - Replay sampling version: `contextual_factory_snapshot_default_v3`.
 - `main_contextual.py` and `ContextualRuntimeConfig` now default to uniform
@@ -745,3 +794,131 @@ architectural stabilization change is selected.
 - Added regression coverage for full-row membership, step grouping, distinct
   snapshot selection, overflow rejection, and CLI defaults. No simulator or
   W&B run was launched for this implementation change.
+
+## 2026-08-03 - Same-snapshot action variance decomposition
+
+- Diagnostic schema version: `contextual_action_decomposition_v9`.
+- Added per-environment-step cross-rail deterministic-policy, raw exploration,
+  post-clip action, and effective-noise variance diagnostics.
+- Added policy-to-noise variance ratio, action-clip direction/frequency,
+  saturation, range, and noise-suppression diagnostics. These are computed in
+  normalized actor action space before `action_scale`; existing
+  `action/applied_controlled_*` metrics remain the critic/applied-action view.
+- Updated `export_wandb_run.py` with the same action decomposition schema.
+- `EXP_META.note=actiondecomp`. Reward F, observation, action mapping,
+  dispatch selection, learner, and replay contracts are unchanged.
+
+## 2026-08-03 - Optional TAT confidence ramp CLI
+
+- Added opt-in `args.use_tat_cofidence`. Omitting the option passes
+  `tat_confidence_ramp=False`; only `--use-tat-confidence` (or the requested
+  `--use-tat-cofidence` alias) enables it.
+- The CLI choice is a launch control and is therefore preserved when loading
+  a checkpoint instead of being overwritten by the checkpoint's saved value.
+- Enabled preserves the existing
+  `completed / (completed + tat_confidence_n0)` TAT reward ramp. Disabled
+  applies the unramped TAT term with confidence `1.0` whenever the TAT signal
+  is available.
+- `EXP_META.note=tatoptin`. Reward version F and diagnostic schema v9 are
+  unchanged because the existing reward branches and metrics are unchanged.
+
+## 2026-08-03 - Reward G global level terms
+
+- Reward version: `G`; contract version:
+  `contextual_controlled_reward_v9_global_tat_op_backlog_levels`.
+- Global raw reward is now
+  `9.2 * (174.4236 - marginal_tat_ema) / 174.4236`
+  `+ 5.0 * (0.80 - current_operation_rate)`
+  `- 0.002 * (waiting + queued)`.
+- Replaced the OP-rate delta reward with a current-level term. The previous
+  `op_delta` remains diagnostic-only; added `op_rate`, `op_reference`, and
+  `op_error` diagnostics.
+- TAT confidence defaults to disabled and remains opt-in through
+  `--use-tat-confidence`. TAT still uses the existing marginal-TAT EMA.
+- Local reward, rail-TAT penalty, smooth penalty, global/local alpha, replay,
+  action mapping, learner, and dispatch contracts are unchanged.
+- Diagnostic schema version: `contextual_global_reward_v10`; synchronized
+  `contextual_wandb.py` and `export_wandb_run.py`.
+
+## 2026-08-04 - Reward H direct TotalTat level
+
+- Reward version: `H`; contract version:
+  `contextual_controlled_reward_v10_total_tat_level`.
+- Removed marginal-TAT reconstruction from quantized cumulative `TotalTat` and
+  completion counts, including `_prev_tat_sum`, `_prev_completed`, and the
+  marginal EMA state. Global TAT reward now directly uses
+  `9.2 * (174.4236 - TotalTat) / 174.4236` whenever `TotalTat > 0`.
+- Completion counts remain diagnostic and are used only by the explicitly
+  enabled confidence ramp. OP level, backlog, local, rail-TAT, smooth-control,
+  action, replay sampling, learner, and dispatch formulas are unchanged.
+- Canonical diagnostics are `reward/total_tat_level` and
+  `reward/global/total_tat`; obsolete marginal-TAT metric names were removed.
+  Diagnostic schema version is now `contextual_global_reward_v11`.
+- `EXP_META.note=tatlevel`. Start a fresh run: do not reuse an old replay
+  buffer or reward normalizer, and do not reuse an old critic/target critic.
+  If reusing an actor, initialize critic, target critic, replay, and reward
+  normalizer from scratch. Reward-version checks reject incompatible
+  checkpoints, replay snapshots, and standalone normalizer statistics.
+
+## 2026-08-05 - Reward I fixed scale with rail-TAT diagnostics
+
+- Reward version: `I`; contract version:
+  `contextual_controlled_reward_v11_fixed_scale_rail100`.
+- Running global/local reward normalization is inactive and is never read,
+  updated, or frozen by Reward I. Deprecated persistence remains only for
+  compatibility/version rejection. Observation/state normalization is unchanged.
+- The default contextual reward is `0.5 * global_raw +
+  0.5 * (local_raw / 3) - clip(100 * rail_tat_raw, -0.5, 0.5) -
+  0.25 * abs(delta_b_rl)`.
+- The weighted global TAT term is clipped to `[-1, 1]`; local idle-OHT reward
+  is zero while the idle count remains diagnostic-only. Rail-TAT retains the
+  existing OHTTat/fixed-reference/elapsed-time attribution contract, with its
+  weight applied exactly once before per-rail clipping.
+- Opt-in append-only step/cycle JSONL diagnostics use global-step windows
+  `0:1000`, `10000:11000`, and `20000:21000`. Occurrence-aware
+  DistancePerVelocity free-flow values are diagnostic-only and never affect
+  reward. Diagnostic schema version: `contextual_reward_diagnostic_v12`.
+- `EXP_META.note=fixedscale_localdiv3_idleoff_rail100clip05_smooth025`;
+  W&B and export schemas contain fixed-scale and bounded cycle summaries, with
+  obsolete normalizer metrics removed. Start a fresh Reward I run; older
+  checkpoints, replay snapshots, and reward-normalizer statistics are rejected
+  by reward-version guards.
+
+## 2026-08-05 - Reward J Phase 1 free-flow neutral ratio 2
+
+- Reward version: `J`; contract version:
+  `contextual_controlled_reward_v12_free_flow_neutral2`.
+- Rail cycle raw reward is `2.0 - route_time / route_free_flow_time`; ratio 2
+  is neutral, lower ratios are positive, and higher ratios are negative.
+- Default mode has no offline baseline reference, calibration file, or online
+  reference update. The fixed-TAT and baseline modes remain compatibility-only.
+- Existing actual-elapsed-time controlled/uncontrolled rail attribution is
+  retained. Phase 1 uses `rail_tat_weight=1.0` and `rail_tat_clip=1.0`; scale
+  tuning is explicitly deferred to Phase 2.
+- Added `cycle_fully_observed`, free-flow ratio/reward, raw attribution,
+  and clip-scale cycle diagnostics plus bounded W&B summaries. Diagnostic
+  schema: `contextual_reward_diagnostic_v14_free_flow_neutral2`.
+- Added neutral/positive/negative, monotonicity, path-length invariance,
+  attribution conservation, clipping, total-sign, and invalid-cycle tests.
+- `EXP_META.note=ffreward_neutral2_w1_clip1`. Reward J requires a fresh
+  critic, target critic, replay, and reward-normalizer state; Reward I
+  checkpoints/replay are rejected by version guards.
+
+## 2026-08-06 - Reward K provisional balanced neutral-2 first run
+
+- Reward version: `K`; contract version:
+  `contextual_controlled_reward_v13_balanced_freeflow_neutral2`.
+- User-selected provisional coefficients: `tat_weight=18.4`,
+  `backlog_weight=0.0005`, `local_predicted_oht_weight=0.10`,
+  `local_reward_scale=2.0`, `rail_tat_weight=50.0`, and
+  `rail_tat_clip=1.0`.
+- Preserved invariants: `tat_reference=174.4236`, neutral ratio `2.0`,
+  `global_alpha=local_alpha=0.5`, `smooth_b_rl_weight=0.25`, and the Phase 1
+  occurrence-aware actual-elapsed rail attribution.
+- Calibration status is `provisional`; these values will be re-evaluated from
+  the fresh run's steady-state JSONL and W&B diagnostics.
+- Added bounded representative-scale, good/bad sign, rail clipping, and
+  100/1000-update Q-mean-delta metrics. Diagnostic schema:
+  `contextual_reward_diagnostic_v15_balanced_neutral2`.
+- `EXP_META.note=neutral2_balanced111_tatup_backlogdown_preddown`. Reward I/J
+  checkpoints and replay are rejected; start with a fresh critic and replay.

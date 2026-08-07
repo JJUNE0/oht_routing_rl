@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import heapq
+import hashlib
 import os
 import time
 import traceback
 from collections import defaultdict, deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from numbers import Integral
 from pathlib import Path
 
@@ -58,13 +59,30 @@ from contextual_observation import (
     ObservationNormalizerConfig,
 )
 from contextual_topology import load_cached_contextual_topology
-from contextual_reward import ContextualRewardBuilder, ContextualRewardConfig
+from contextual_reward import (
+    RAIL_REWARD_FREE_FLOW_NEUTRAL_2,
+    RAIL_REWARD_MODES,
+    REWARD_VERSION,
+    ContextualRewardBuilder,
+    ContextualRewardConfig,
+)
+from contextual_reward_diagnostic import (
+    RewardDiagnosticWriter,
+    parse_diagnostic_windows,
+)
 from contextual_transition import ContextualTransitionAligner
 from contextual_wandb import ContextualWandbLogger
 
 
+QUEUED_JOB_STATE = 1
+IDLE_OHT_STATE = 0
+
+
 class ContextualTrainingFailure(RuntimeError):
     """Fatal training failure requiring an explicit process restart."""
+
+
+CHECKPOINT_DIRECTORY_VERSION = "contextual_checkpoint_dir_slug_v1"
 
 
 @dataclass(frozen=True)
@@ -78,13 +96,25 @@ class ContextualRuntimeConfig:
     curriculum_scale_start: float = 0.05
     curriculum_scale_end: float = 1.0
     curriculum_shape: str = "geometric"
-    smooth_b_rl_weight: float = 0.05
+    smooth_b_rl_weight: float = 0.25
     smooth_exp_residual_weight: float = 0.5
     warmup_steps: int = 10_000
     episode_burnin_steps: int = 0
     normalizer_freeze_steps: int = 10_000
+    tat_weight: float = 18.4
+    backlog_weight: float = 0.0005
+    local_predicted_oht_weight: float = 0.10
+    local_reward_scale: float = 2.0
+    rail_reward_mode: str = RAIL_REWARD_FREE_FLOW_NEUTRAL_2
+    rail_free_flow_neutral_ratio: float = 2.0
+    rail_baseline_ratio_reference: float | None = None
+    reward_rail_tat_weight: float = 50.0
+    reward_rail_tat_clip: float = 1.0
+    tat_raw_clip: float = 1.0
+    reward_diagnostic_dir: str | None = None
+    reward_diagnostic_windows: str = "0:1000,10000:11000,20000:21000"
     tat_confidence_n0: float = 50.0
-    tat_confidence_ramp: bool = True
+    tat_confidence_ramp: bool = False
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     seed: int = 0
     topology_cache_path: str | None = None
@@ -128,6 +158,7 @@ class ContextualRuntimeConfig:
     early_stop_min_episode_steps: int = 100
     max_stale_sim_time_ticks: int = 5
     dispatch_mode: str = DISPATCH_FIRST_MATCH
+    minimum_sign_sample_count: int = 100
 
     def __post_init__(self):
         if self.algorithm not in {"td7", "sac"}:
@@ -204,6 +235,39 @@ class ContextualRuntimeConfig:
             or self.smooth_exp_residual_weight < 0
         ):
             raise ValueError("smooth penalty weights must be non-negative")
+        if (
+            not np.isfinite((
+                self.local_reward_scale,
+                self.tat_weight,
+                self.backlog_weight,
+                self.local_predicted_oht_weight,
+                self.reward_rail_tat_weight,
+                self.reward_rail_tat_clip,
+                self.tat_raw_clip,
+            )).all()
+            or self.local_reward_scale <= 0
+            or self.tat_weight < 0
+            or self.backlog_weight < 0
+            or self.local_predicted_oht_weight < 0
+            or self.reward_rail_tat_weight < 0
+            or self.reward_rail_tat_clip <= 0
+            or self.tat_raw_clip <= 0
+        ):
+            raise ValueError("invalid raw reward scaling configuration")
+        if self.rail_reward_mode not in RAIL_REWARD_MODES:
+            raise ValueError(
+                f"rail_reward_mode must be one of {RAIL_REWARD_MODES}"
+            )
+        if (
+            not np.isfinite(self.rail_free_flow_neutral_ratio)
+            or self.rail_free_flow_neutral_ratio <= 0
+        ):
+            raise ValueError(
+                "rail_free_flow_neutral_ratio must be finite and positive"
+            )
+        parse_diagnostic_windows(self.reward_diagnostic_windows)
+        if self.minimum_sign_sample_count <= 0:
+            raise ValueError("minimum_sign_sample_count must be positive")
         if (
             not np.isfinite(self.exploration_noise_std)
             or self.exploration_noise_std < 0
@@ -286,6 +350,13 @@ class ClientAlgorithm:
         self.last_policy_action = None
         self.last_exploratory_action = None
         self.last_diagnostics: dict[str, float] = {}
+        self._phase2_global_scales = deque(maxlen=1_000)
+        self._phase2_local_scales = deque(maxlen=1_000)
+        self._phase2_rail_active_scales = deque(maxlen=100_000)
+        self._phase2_backlogs = deque(maxlen=1_000)
+        self._phase2_good_rewards = deque(maxlen=10_000)
+        self._phase2_bad_rewards = deque(maxlen=10_000)
+        self._phase2_q_means = deque(maxlen=1_001)
         self.reward_builder = None
         self.transition_aligner = None
         self.episode_id = 0
@@ -317,13 +388,19 @@ class ClientAlgorithm:
         root = Path(__file__).resolve().parent.parent
         self.checkpoint_root = Path(
             self.config.checkpoint_root
-            or root / "checkpoints" / self.runtime_variant
+            or root / "checkpoints" / self.checkpoint_variant
         )
-        self.rail_tat_diagnostic_path = Path(
-            self.config.rail_tat_diagnostic_path
-            or self.checkpoint_root
-            / "diagnostics"
-            / "rail_tat_completion.jsonl"
+        self.rail_tat_diagnostic_path = (
+            Path(self.config.rail_tat_diagnostic_path)
+            if self.config.rail_tat_diagnostic_path else None
+        )
+        self.reward_diagnostic_writer = (
+            RewardDiagnosticWriter(
+                self.config.reward_diagnostic_dir,
+                self.config.reward_diagnostic_windows,
+            )
+            if self.config.reward_diagnostic_dir
+            or self.config.wandb_enabled else None
         )
 
     @property
@@ -359,6 +436,19 @@ class ClientAlgorithm:
             f"{self.config.replay_sampling_mode}"
         )
 
+    @property
+    def checkpoint_variant(self):
+        """Short, collision-resistant directory name for Windows paths."""
+        digest = hashlib.sha256(
+            self.runtime_variant.encode("utf-8")
+        ).hexdigest()[:10]
+        return (
+            f"ctx_td7_s{int(self.config.sale_enabled)}_"
+            f"l{int(self.config.lap_enabled)}_"
+            f"{self.config.action_mode}_"
+            f"{self.config.replay_sampling_mode}_{digest}"
+        )
+
     def _synchronize(self):
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
@@ -370,6 +460,22 @@ class ClientAlgorithm:
                     self.topology,
                     ContextualRewardConfig(
                         freeze_after_env_steps=self.config.normalizer_freeze_steps,
+                        local_reward_scale=self.config.local_reward_scale,
+                        tat_weight=self.config.tat_weight,
+                        backlog_weight=self.config.backlog_weight,
+                        local_predicted_oht_weight=(
+                            self.config.local_predicted_oht_weight
+                        ),
+                        rail_reward_mode=self.config.rail_reward_mode,
+                        rail_free_flow_neutral_ratio=(
+                            self.config.rail_free_flow_neutral_ratio
+                        ),
+                        rail_baseline_ratio_reference=(
+                            self.config.rail_baseline_ratio_reference
+                        ),
+                        rail_tat_weight=self.config.reward_rail_tat_weight,
+                        rail_tat_clip=self.config.reward_rail_tat_clip,
+                        tat_raw_clip=self.config.tat_raw_clip,
                         action_mode=self.config.action_mode,
                         smooth_b_rl_weight=self.config.smooth_b_rl_weight,
                         smooth_exp_residual_weight=(
@@ -383,6 +489,7 @@ class ClientAlgorithm:
                     completion_diagnostic_max_global_step=(
                         self.config.rail_tat_diagnostic_max_step
                     ),
+                    reward_diagnostic_writer=self.reward_diagnostic_writer,
                 )
                 self.transition_aligner = ContextualTransitionAligner(
                     self.topology, self.reward_builder
@@ -407,6 +514,22 @@ class ClientAlgorithm:
             self.topology,
             ContextualRewardConfig(
                 freeze_after_env_steps=self.config.normalizer_freeze_steps,
+                local_reward_scale=self.config.local_reward_scale,
+                tat_weight=self.config.tat_weight,
+                backlog_weight=self.config.backlog_weight,
+                local_predicted_oht_weight=(
+                    self.config.local_predicted_oht_weight
+                ),
+                rail_reward_mode=self.config.rail_reward_mode,
+                rail_free_flow_neutral_ratio=(
+                    self.config.rail_free_flow_neutral_ratio
+                ),
+                rail_baseline_ratio_reference=(
+                    self.config.rail_baseline_ratio_reference
+                ),
+                rail_tat_weight=self.config.reward_rail_tat_weight,
+                rail_tat_clip=self.config.reward_rail_tat_clip,
+                tat_raw_clip=self.config.tat_raw_clip,
                 action_mode=self.config.action_mode,
                 smooth_b_rl_weight=self.config.smooth_b_rl_weight,
                 smooth_exp_residual_weight=(
@@ -420,6 +543,7 @@ class ClientAlgorithm:
             completion_diagnostic_max_global_step=(
                 self.config.rail_tat_diagnostic_max_step
             ),
+            reward_diagnostic_writer=self.reward_diagnostic_writer,
         )
         self.transition_aligner = ContextualTransitionAligner(
             self.topology, self.reward_builder
@@ -559,8 +683,6 @@ class ClientAlgorithm:
             and getattr(
                 self.observation_builder.global_normalizer, "frozen", False
             )
-            and getattr(self.reward_builder.local_normalizer, "frozen", False)
-            and getattr(self.reward_builder.global_normalizer, "frozen", False)
         )
 
     def _training_gate(self):
@@ -592,6 +714,8 @@ class ClientAlgorithm:
         return {
             "algorithm": self.config.algorithm,
             "algorithm_version": self.runtime_variant,
+            "checkpoint_directory_version": CHECKPOINT_DIRECTORY_VERSION,
+            "checkpoint_variant": self.checkpoint_variant,
             "uniform_replay": not self.config.lap_enabled,
             "sale": self.config.sale_enabled,
             "lap": self.config.lap_enabled,
@@ -996,26 +1120,64 @@ class ClientAlgorithm:
             for row, rail_id in enumerate(rail_ids)
         }
         self.latest_dispatch_cost_tick = int(self.total_steps)
+        self._dispatch_cost_snapshot_step = int(self.total_steps)
         self.dispatch_cost_ready = True
 
     def _reset_dispatch_diagnostics(self):
         self._dispatch_job_count = 0
+        self._dispatch_eligible_job_count = 0
+        self._dispatch_zero_candidate_count = 0
         self._dispatch_candidate_total = 0
         self._dispatch_selected_count = 0
         self._dispatch_selected_hops_total = 0
+        self._dispatch_cost_attempt_count = 0
         self._dispatch_path_cost_count = 0
         self._dispatch_path_cost_total = 0.0
+        self._dispatch_first_match_path_cost_total = 0.0
+        self._dispatch_first_match_hops_total = 0
+        self._dispatch_cost_saving_total = 0.0
+        self._dispatch_relative_cost_saving_total = 0.0
+        self._dispatch_candidate_cost_spread_total = 0.0
+        self._dispatch_multi_candidate_count = 0
         self._dispatch_changed_count = 0
+        self._dispatch_strict_cost_improvement_count = 0
         self._dispatch_margin_count = 0
         self._dispatch_margin_total = 0.0
         self._dispatch_cost_snapshot_fallback_count = 0
         self._dispatch_invalid_cost_count = 0
+        self._dispatch_cost_snapshot_step = None
+
+    @staticmethod
+    def _safe_ratio(numerator, denominator):
+        return (
+            float(numerator) / float(denominator)
+            if denominator > 0
+            else 0.0
+        )
 
     def _dispatch_diagnostics(self):
-        job_count = max(1, self._dispatch_job_count)
-        selected_count = max(1, self._dispatch_selected_count)
-        path_cost_count = max(1, self._dispatch_path_cost_count)
-        margin_count = max(1, self._dispatch_margin_count)
+        eligible = self._dispatch_eligible_job_count
+        selected = self._dispatch_selected_count
+        attempts = self._dispatch_cost_attempt_count
+        decisions = self._dispatch_path_cost_count
+        snapshot_age = (
+            -1.0
+            if self._dispatch_cost_snapshot_step is None
+            else float(
+                max(
+                    0,
+                    self.total_steps - self._dispatch_cost_snapshot_step,
+                )
+            )
+        )
+        changed_ratio = self._safe_ratio(
+            self._dispatch_changed_count,
+            decisions,
+        )
+        selection_margin = self._safe_ratio(
+            self._dispatch_margin_total,
+            self._dispatch_margin_count,
+        )
         return {
             "dispatch/mode_first_match": float(
                 self.config.dispatch_mode == DISPATCH_FIRST_MATCH
@@ -1024,21 +1186,98 @@ class ClientAlgorithm:
             "dispatch/mode_live_td7_path_cost": float(
                 self.config.dispatch_mode == DISPATCH_COST
             ),
+            "dispatch/cost_mode_active": float(
+                self.config.dispatch_mode == DISPATCH_COST
+            ),
+            "dispatch/cost_snapshot_ready": float(
+                self.dispatch_cost_ready
+            ),
+            "dispatch/cost_snapshot_ready_ratio": self._safe_ratio(
+                decisions,
+                attempts,
+            ),
+            "dispatch/cost_snapshot_age_steps": snapshot_age,
+            "dispatch/eligible_job_count_total": float(eligible),
             "dispatch/candidate_count_mean": (
-                float(self._dispatch_candidate_total) / job_count
+                self._safe_ratio(
+                    self._dispatch_candidate_total,
+                    self._dispatch_job_count,
+                )
+            ),
+            "dispatch/candidate_count_mean_per_eligible_job": (
+                self._safe_ratio(
+                    self._dispatch_candidate_total,
+                    eligible,
+                )
+            ),
+            "dispatch/zero_candidate_ratio_per_eligible_job": (
+                self._safe_ratio(
+                    self._dispatch_zero_candidate_count,
+                    eligible,
+                )
+            ),
+            "dispatch/selected_ratio_per_eligible_job": (
+                self._safe_ratio(selected, eligible)
             ),
             "dispatch/selected_pickup_hops_mean": (
-                float(self._dispatch_selected_hops_total) / selected_count
+                self._safe_ratio(
+                    self._dispatch_selected_hops_total,
+                    selected,
+                )
+            ),
+            "dispatch/first_match_pickup_hops_mean": (
+                self._safe_ratio(
+                    self._dispatch_first_match_hops_total,
+                    decisions,
+                )
+            ),
+            "dispatch/first_match_path_cost_mean": (
+                self._safe_ratio(
+                    self._dispatch_first_match_path_cost_total,
+                    decisions,
+                )
             ),
             "dispatch/selected_path_cost_mean": (
-                self._dispatch_path_cost_total / path_cost_count
+                self._safe_ratio(
+                    self._dispatch_path_cost_total,
+                    decisions,
+                )
             ),
-            "dispatch/selection_changed_from_first_match_ratio": (
-                float(self._dispatch_changed_count) / path_cost_count
+            "dispatch/cost_saving_vs_first_mean": (
+                self._safe_ratio(
+                    self._dispatch_cost_saving_total,
+                    decisions,
+                )
             ),
-            "dispatch/best_second_margin_mean": (
-                self._dispatch_margin_total / margin_count
+            "dispatch/cost_saving_vs_first_ratio_mean": (
+                self._safe_ratio(
+                    self._dispatch_relative_cost_saving_total,
+                    decisions,
+                )
             ),
+            "dispatch/candidate_cost_spread_mean": (
+                self._safe_ratio(
+                    self._dispatch_candidate_cost_spread_total,
+                    decisions,
+                )
+            ),
+            "dispatch/multi_candidate_ratio": self._safe_ratio(
+                self._dispatch_multi_candidate_count,
+                decisions,
+            ),
+            "dispatch/changed_from_first_ratio": changed_ratio,
+            "dispatch/strict_cost_improvement_ratio": self._safe_ratio(
+                self._dispatch_strict_cost_improvement_count,
+                decisions,
+            ),
+            "dispatch/cost_snapshot_fallback_ratio": self._safe_ratio(
+                self._dispatch_cost_snapshot_fallback_count,
+                attempts,
+            ),
+            "dispatch/selection_margin_mean": selection_margin,
+            # Compatibility aliases for existing dashboards.
+            "dispatch/selection_changed_from_first_match_ratio": changed_ratio,
+            "dispatch/best_second_margin_mean": selection_margin,
             "dispatch/cost_snapshot_fallback_count": float(
                 self._dispatch_cost_snapshot_fallback_count
             ),
@@ -1215,6 +1454,15 @@ class ClientAlgorithm:
             done=done,
             dispatch=False,
         )
+        if completed is not None and done:
+            terminal_total = np.ascontiguousarray(
+                completed.reward.total - 2.0, dtype=np.float32
+            )
+            terminal_total.setflags(write=False)
+            completed = replace(
+                completed,
+                reward=replace(completed.reward, total=terminal_total),
+            )
 
         timing = {
             "runtime/state_collection_ms": state_collection_ms,
@@ -1250,6 +1498,8 @@ class ClientAlgorithm:
             )
             timing.update(inference_timing)
         controlled_action = deterministic_policy.copy()
+        raw_exploration_noise = np.zeros_like(deterministic_policy)
+        preclip_action = deterministic_policy.copy()
         exploration_noise_std = (
             0.0
             if burnin_active or self.config.algorithm == "sac"
@@ -1273,19 +1523,29 @@ class ClientAlgorithm:
             and should_apply
             and not burnin_active
         ):
-            noise = self.exploration_rng.normal(
+            raw_exploration_noise = self.exploration_rng.normal(
                 0.0,
                 exploration_noise_std,
                 size=controlled_action.shape,
             )
-            noise = np.clip(
-                noise,
+            raw_exploration_noise = np.clip(
+                raw_exploration_noise,
                 -self.config.exploration_noise_clip,
                 self.config.exploration_noise_clip,
-            )
-            controlled_action = np.clip(
-                controlled_action + noise, -1.0, 1.0
             ).astype(np.float32)
+            preclip_action = (
+                deterministic_policy + raw_exploration_noise
+            )
+            controlled_action = np.clip(preclip_action, -1.0, 1.0).astype(
+                np.float32
+            )
+
+        effective_noise = controlled_action - deterministic_policy
+        policy_variance = float(np.var(deterministic_policy))
+        noise_variance = float(np.var(raw_exploration_noise))
+        positive_clip_mask = preclip_action > 1.0
+        negative_clip_mask = preclip_action < -1.0
+        clipped_mask = positive_clip_mask | negative_clip_mask
 
         policy_delta_mean, policy_delta_std = self._temporal_delta(
             deterministic_policy, self.last_policy_action
@@ -1416,6 +1676,49 @@ class ClientAlgorithm:
             "action/policy_saturation_ratio": float(
                 (np.abs(deterministic_policy) >= 0.999).mean()
             ),
+            "action/cross_rail_policy_std": float(
+                deterministic_policy.std()
+            ),
+            "action/cross_rail_applied_std": float(
+                controlled_action.std()
+            ),
+            "action/cross_rail_noise_std": float(
+                raw_exploration_noise.std()
+            ),
+            "action/cross_rail_noise_residual_std": float(
+                effective_noise.std()
+            ),
+            "action/cross_rail_policy_range": float(
+                np.ptp(deterministic_policy)
+            ),
+            "action/policy_to_noise_variance_ratio": float(
+                policy_variance / (noise_variance + 1e-12)
+            ),
+            "action/noise_abs_mean": float(
+                np.abs(raw_exploration_noise).mean()
+            ),
+            "action/noise_residual_abs_mean": float(
+                np.abs(effective_noise).mean()
+            ),
+            "action/clipped_fraction": float(clipped_mask.mean()),
+            "action/positive_clip_ratio": float(
+                positive_clip_mask.mean()
+            ),
+            "action/negative_clip_ratio": float(
+                negative_clip_mask.mean()
+            ),
+            "action/noise_suppressed_by_clip_mean": float(
+                (
+                    np.abs(raw_exploration_noise)
+                    - np.abs(effective_noise)
+                ).mean()
+            ),
+            "action/policy_positive_saturation_ratio": float(
+                (deterministic_policy > 0.95).mean()
+            ),
+            "action/policy_negative_saturation_ratio": float(
+                (deterministic_policy < -0.95).mean()
+            ),
             "action/policy_temporal_delta_mean": policy_delta_mean,
             "action/policy_temporal_delta_std": policy_delta_std,
             "action/exploratory_mean": float(controlled_action.mean()),
@@ -1469,15 +1772,12 @@ class ClientAlgorithm:
                 completed.reward
             )
             self.last_diagnostics.update(reward_diagnostics)
+            self._update_phase2_reward_diagnostics(completed.reward)
             self.last_diagnostics.update({
                 # Compatibility aliases used by the per-rail/region dashboards.
                 "reward/step_reward": reward_diagnostics["reward/total_mean"],
-                "reward/global_norm": reward_diagnostics[
-                    "reward/global_normalized"
-                ],
-                "reward/local_norm": reward_diagnostics[
-                    "reward/local_normalized_mean"
-                ],
+                "reward/global_norm": reward_diagnostics["reward/global_raw"],
+                "reward/local_norm": reward_diagnostics["reward/local_scaled_mean"],
                 "reward/rail_tat": reward_diagnostics[
                     "reward/rail_tat_vector_mean"
                 ],
@@ -1502,9 +1802,6 @@ class ClientAlgorithm:
                 "reward/alpha": float(
                     self.reward_builder.config.global_alpha
                 ),
-                "reward/marg_tat": reward_diagnostics[
-                    "reward/marginal_tat_ema"
-                ],
                 "reward/backlog": float(
                     (getattr(pclient, "WaitingCommandCount", 0) or 0)
                     + (getattr(pclient, "QueuedCommandCount", 0) or 0)
@@ -1569,6 +1866,18 @@ class ClientAlgorithm:
             "oht/loading": float(oht_states.count(3)),
             "oht/unloading": float(oht_states.count(5)),
         })
+        if completed is not None and self.reward_diagnostic_writer is not None:
+            self._write_reward_step_diagnostic(pclient, completed)
+            cycle_summary = self.reward_diagnostic_writer.cycle_summary(
+                self.total_steps - 1
+            )
+            cycle_summary["reward/rail/mode"] = (
+                self.reward_builder.config.rail_reward_mode
+            )
+            cycle_summary["reward/rail/free_flow_neutral_ratio"] = (
+                self.reward_builder.config.rail_free_flow_neutral_ratio
+            )
+            self.last_diagnostics.update(cycle_summary)
         checkpoint_started = time.perf_counter()
         if self.config.mode == "training" and not self.training_failed:
             self._maybe_checkpoint()
@@ -1580,6 +1889,341 @@ class ClientAlgorithm:
             "runtime/total_ms": total_algorithm_ms,
         })
         return action_result
+
+    def _update_phase2_reward_diagnostics(self, batch) -> None:
+        """Maintain bounded, run-local diagnostics for provisional scaling."""
+        global_scale = abs(float(batch.global_component))
+        local_scale = float(np.mean(np.abs(batch.local_component)))
+        rail_active = np.abs(batch.rail_reward_postclip[
+            ~np.isclose(batch.rail_reward_postclip, 0.0)
+        ])
+        self._phase2_global_scales.append(global_scale)
+        self._phase2_local_scales.append(local_scale)
+        self._phase2_rail_active_scales.extend(float(x) for x in rail_active)
+        self._phase2_backlogs.append(float(batch.backlog))
+
+        backlog_p50 = float(np.median(self._phase2_backlogs))
+        total_mean = float(batch.total.mean())
+        if batch.total_tat_level < self.reward_builder.config.tat_reference and (
+            batch.backlog <= backlog_p50
+        ):
+            self._phase2_good_rewards.append(total_mean)
+        if batch.total_tat_level > self.reward_builder.config.tat_reference and (
+            batch.backlog >= backlog_p50
+        ):
+            self._phase2_bad_rewards.append(total_mean)
+
+        def median(values):
+            return float(np.median(values)) if values else 0.0
+
+        sg = median(self._phase2_global_scales)
+        sl = median(self._phase2_local_scales)
+        sr = median(self._phase2_rail_active_scales)
+        scale_array = np.asarray([sg, sl, sr], dtype=np.float64)
+        positive = scale_array[scale_array > 0.0]
+        scale_mean = float(positive.mean()) if positive.size else 0.0
+        balance_error = (
+            float(np.mean(np.abs(positive - scale_mean)) / scale_mean)
+            if scale_mean > 0.0 else 0.0
+        )
+        good_count = len(self._phase2_good_rewards)
+        bad_count = len(self._phase2_bad_rewards)
+        good_mean = (
+            float(np.mean(self._phase2_good_rewards)) if good_count else 0.0
+        )
+        bad_mean = (
+            float(np.mean(self._phase2_bad_rewards)) if bad_count else 0.0
+        )
+        smooth_scale = float(np.mean(np.abs(batch.smooth_penalty)))
+        main_scale_mean = float(scale_array.mean())
+        self.last_diagnostics.update({
+            "reward/scale/global_representative": sg,
+            "reward/scale/local_representative": sl,
+            "reward/scale/rail_active_representative": sr,
+            "reward/scale/global_to_local": sg / sl if sl > 0.0 else 0.0,
+            "reward/scale/global_to_rail": sg / sr if sr > 0.0 else 0.0,
+            "reward/scale/local_to_rail": sl / sr if sr > 0.0 else 0.0,
+            "reward/scale/main_balance_error": balance_error,
+            "reward/scale/smooth_excess_warning": float(
+                main_scale_mean > 0.0
+                and smooth_scale > 0.1 * main_scale_mean
+            ),
+            "reward/sign/good_state_sample_count": float(good_count),
+            "reward/sign/good_state_total_mean": good_mean,
+            "reward/sign/bad_state_sample_count": float(bad_count),
+            "reward/sign/bad_state_total_mean": bad_mean,
+            "reward/sign/good_minus_bad": good_mean - bad_mean,
+            "reward/sign/good_state_sufficient": float(
+                good_count >= self.config.minimum_sign_sample_count
+            ),
+            "reward/sign/bad_state_sufficient": float(
+                bad_count >= self.config.minimum_sign_sample_count
+            ),
+        })
+        q1 = self.last_diagnostics.get("critic/q1_mean")
+        q2 = self.last_diagnostics.get("critic/q2_mean")
+        if q1 is not None and q2 is not None:
+            q_mean = 0.5 * (float(q1) + float(q2))
+            if np.isfinite(q_mean):
+                self._phase2_q_means.append(q_mean)
+        for lag in (100, 1_000):
+            self.last_diagnostics[f"critic/q_mean_delta_{lag}"] = (
+                self._phase2_q_means[-1] - self._phase2_q_means[-lag - 1]
+                if len(self._phase2_q_means) > lag else 0.0
+            )
+
+    def _write_reward_step_diagnostic(self, pclient, completed) -> None:
+        writer = self.reward_diagnostic_writer
+        global_step = self.total_steps - 1
+        if (
+            writer is None
+            or not writer.writes_json
+            or writer.window_name(global_step) is None
+        ):
+            return
+        batch = completed.reward
+
+        def stats(record, prefix, values, *, abs_mean=False):
+            array = np.asarray(values, dtype=np.float64)
+            record[prefix + "_mean"] = float(array.mean())
+            record[prefix + "_std"] = float(array.std())
+            record[prefix + "_min"] = float(array.min())
+            record[prefix + "_max"] = float(array.max())
+            if abs_mean:
+                record[prefix + "_abs_mean"] = float(np.abs(array).mean())
+
+        rail_raw = batch.rail_reward_raw
+        rail_weighted = batch.rail_reward_weighted_preclip
+        rail_postclip = batch.rail_reward_postclip
+        clip_mask = ~np.isclose(rail_weighted, rail_postclip)
+        nonzero = ~np.isclose(rail_postclip, 0.0)
+        top_count = min(10, len(rail_postclip))
+        top_rows = np.argsort(np.abs(rail_postclip))[-top_count:][::-1]
+        policy = np.asarray(completed.action, dtype=np.float64).reshape(-1)
+        applied = np.asarray(
+            completed.applied_action, dtype=np.float64
+        ).reshape(-1)
+        b_rl = 0.5 + 0.5 * applied
+        global_vector = np.full_like(
+            batch.local_component, batch.global_component
+        )
+        components = (
+            global_vector,
+            batch.local_component,
+            batch.rail_reward_postclip,
+            -batch.smooth_penalty,
+        )
+        abs_means = np.asarray([
+            np.mean(np.abs(value)) for value in components
+        ], dtype=np.float64)
+        shares = abs_means / (abs_means.sum() + np.finfo(np.float64).eps)
+        reconstructed = sum(components)
+        reward_error = np.abs(batch.total - reconstructed)
+        diagnostics = self.last_diagnostics
+        learner_available = bool(
+            diagnostics.get("update/learner_count", 0.0) > 0
+            and "critic/q1_mean" in diagnostics
+        )
+
+        record = {
+            "reward_version": REWARD_VERSION,
+            "global_step": int(global_step),
+            "episode_id": int(completed.episode_id),
+            "episode_step": int(completed.env_step),
+            "sim_time": float(getattr(pclient, "SimTime", 0.0)),
+            "total_tat": batch.total_tat_level,
+            "tat_reference": self.reward_builder.config.tat_reference,
+            "tat_weight": self.reward_builder.config.tat_weight,
+            "tat_signal_available": bool(batch.tat_signal_available),
+            "tat_raw_preclip": batch.tat_raw_preclip,
+            "tat_raw_postclip": batch.tat_raw_postclip,
+            "tat_clip_applied": not np.isclose(
+                batch.tat_raw_preclip, batch.tat_raw_postclip
+            ),
+            "op_rate": batch.op_rate,
+            "op_reference": batch.op_reference,
+            "op_error": batch.op_error,
+            "op_raw": batch.op_raw,
+            "waiting": batch.waiting,
+            "queued": batch.queued,
+            "backlog": batch.backlog,
+            "backlog_weight": self.reward_builder.config.backlog_weight,
+            "backlog_raw": batch.backlog_raw,
+            "global_raw": batch.global_raw,
+            "global_alpha": self.reward_builder.config.global_alpha,
+            "global_component": batch.global_component,
+            "global_decomposition_error": abs(
+                batch.global_raw - batch.tat_raw_postclip
+                - batch.op_raw - batch.backlog_raw
+            ),
+            "idle_oht_observation_mean": float(
+                batch.idle_oht_observation.mean()
+            ),
+            "idle_oht_observation_max": float(
+                batch.idle_oht_observation.max()
+            ),
+            "local_idle_reward_mean": float(batch.local_idle_raw.mean()),
+            "local_idle_reward_max": float(batch.local_idle_raw.max()),
+            "local_reward_scale": self.reward_builder.config.local_reward_scale,
+            "local_predicted_oht_weight": (
+                self.reward_builder.config.local_predicted_oht_weight
+            ),
+            "local_alpha": self.reward_builder.config.local_alpha,
+            "rail_tat_cycle_count": int(
+                self.reward_builder._last_rail_tat_cycle_count
+            ),
+            "rail_tat_controlled_assignment_count": int(
+                self.reward_builder._last_rail_tat_controlled_assignment_count
+            ),
+            "rail_tat_uncontrolled_assignment_count": int(
+                self.reward_builder._last_rail_tat_uncontrolled_assignment_count
+            ),
+            "rail_tat_weight": self.reward_builder.config.rail_tat_weight,
+            "rail_tat_clip": self.reward_builder.config.rail_tat_clip,
+            "rail_reward_mode": self.reward_builder.config.rail_reward_mode,
+            "rail_free_flow_neutral_ratio": (
+                self.reward_builder.config.rail_free_flow_neutral_ratio
+            ),
+            "rail_tat_clip_fraction": float(clip_mask.mean()),
+            "rail_tat_clip_removed_abs_mean": float(
+                np.abs(rail_weighted - rail_postclip).mean()
+            ),
+            "rail_tat_clip_removed_abs_sum": float(
+                np.abs(rail_weighted - rail_postclip).sum()
+            ),
+            "rail_tat_positive_ratio": float((rail_postclip > 0).mean()),
+            "rail_tat_negative_ratio": float((rail_postclip < 0).mean()),
+            "rail_tat_nonzero_ratio": float(nonzero.mean()),
+            "rail_tat_raw_nonzero_ratio": float(
+                (~np.isclose(rail_raw, 0.0)).mean()
+            ),
+            "rail_tat_top_abs": [
+                {
+                    "rail_id": int(batch.controlled_rail_ids[row]),
+                    "raw": float(rail_raw[row]),
+                    "weighted_preclip": float(rail_weighted[row]),
+                    "postclip": float(rail_postclip[row]),
+                    "clip_applied": bool(clip_mask[row]),
+                }
+                for row in top_rows if not np.isclose(rail_postclip[row], 0.0)
+            ],
+            "smooth_weight": batch.smooth_weight_effective,
+            "control_delta_nonzero_ratio": float(
+                (~np.isclose(batch.smooth_control_delta, 0.0)).mean()
+            ),
+            "action_clipped_fraction": diagnostics.get(
+                "action/clipped_fraction", 0.0
+            ),
+            "policy_saturation_ratio": diagnostics.get(
+                "action/policy_saturation_ratio", 0.0
+            ),
+            "curriculum_action_scale": diagnostics.get(
+                "curriculum/action_scale", 0.0
+            ),
+            "exploration_noise_std": diagnostics.get(
+                "action/exploration_noise_std", 0.0
+            ),
+            "env_tat": diagnostics.get("env/tat", batch.total_tat_level),
+            "operation_rate": diagnostics.get("env/operation_rate", batch.op_rate),
+            "completed_delta": batch.completed_delta,
+            "transfer_count": diagnostics.get("env/transferring", 0.0),
+            "oht_idle": diagnostics.get("oht/idle_count", 0.0),
+            "oht_move_to_load": diagnostics.get("oht/move_to_load", 0.0),
+            "oht_loading": diagnostics.get("oht/loading", 0.0),
+            "oht_move_to_unload": diagnostics.get("oht/move_to_unload", 0.0),
+            "oht_unloading": diagnostics.get("oht/unloading", 0.0),
+            "mean_reassign": diagnostics.get("job/mean_reassign", 0.0),
+            "learner_available": learner_available,
+            "learner_updates": diagnostics.get("learner/updates", 0.0),
+            "reward_total_abs_mean": float(np.abs(batch.total).mean()),
+            "reward_finite_ratio": float(np.isfinite(batch.total).mean()),
+            "global_component_abs_mean": float(abs_means[0]),
+            "local_component_abs_mean": float(abs_means[1]),
+            "rail_tat_component_abs_mean": float(abs_means[2]),
+            "smooth_component_abs_mean": float(abs_means[3]),
+            "global_abs_share": float(shares[0]),
+            "local_abs_share": float(shares[1]),
+            "rail_tat_abs_share": float(shares[2]),
+            "smooth_abs_share": float(shares[3]),
+            "reward_decomposition_error_mean": float(reward_error.mean()),
+            "reward_decomposition_error_max": float(reward_error.max()),
+            "phase2_global_representative": diagnostics.get(
+                "reward/scale/global_representative", 0.0
+            ),
+            "phase2_local_representative": diagnostics.get(
+                "reward/scale/local_representative", 0.0
+            ),
+            "phase2_rail_active_representative": diagnostics.get(
+                "reward/scale/rail_active_representative", 0.0
+            ),
+            "phase2_main_balance_error": diagnostics.get(
+                "reward/scale/main_balance_error", 0.0
+            ),
+            "good_state_sample_count": diagnostics.get(
+                "reward/sign/good_state_sample_count", 0.0
+            ),
+            "good_state_total_mean": diagnostics.get(
+                "reward/sign/good_state_total_mean", 0.0
+            ),
+            "bad_state_sample_count": diagnostics.get(
+                "reward/sign/bad_state_sample_count", 0.0
+            ),
+            "bad_state_total_mean": diagnostics.get(
+                "reward/sign/bad_state_total_mean", 0.0
+            ),
+            "good_minus_bad": diagnostics.get(
+                "reward/sign/good_minus_bad", 0.0
+            ),
+            "q_mean_delta_100": diagnostics.get(
+                "critic/q_mean_delta_100", 0.0
+            ),
+            "q_mean_delta_1000": diagnostics.get(
+                "critic/q_mean_delta_1000", 0.0
+            ),
+        }
+        for prefix, values in (
+            ("local_raw", batch.local_raw),
+            ("local_oht_raw", batch.local_oht_raw),
+            ("local_predicted_raw", batch.local_predicted_raw),
+            ("local_stop_raw", batch.local_stop_raw),
+            ("local_capacity_raw", batch.local_capacity_raw),
+            ("local_scaled", batch.local_scaled),
+            ("local_component", batch.local_component),
+            ("rail_tat_raw", rail_raw),
+            ("rail_tat_weighted_preclip", rail_weighted),
+            ("rail_tat_postclip", rail_postclip),
+            ("control_delta", batch.smooth_control_delta),
+            ("smooth_penalty", batch.smooth_penalty),
+            ("policy_action", policy),
+            ("applied_action", applied),
+            ("b_rl", b_rl),
+            ("b_rl_temporal_delta", batch.smooth_control_delta),
+            ("reward_total", batch.total),
+        ):
+            stats(record, prefix, values, abs_mean=prefix in {
+                "rail_tat_raw", "rail_tat_weighted_preclip",
+                "rail_tat_postclip", "smooth_penalty", "reward_total",
+            })
+        learner_fields = {
+            "q1_mean": "critic/q1_mean",
+            "q2_mean": "critic/q2_mean",
+            "target_q_mean": "critic/target_q_mean",
+            "q_min": "critic/q_min",
+            "q_max": "critic/q_max",
+            "q1_q2_abs_diff_mean": "critic/q_abs_diff_mean",
+            "critic_loss": "learner/critic_loss",
+            "q1_loss": "critic/q1_loss",
+            "q2_loss": "critic/q2_loss",
+            "td_error_mean": "critic/td_error_mean",
+            "td_error_max": "critic/td_error_max",
+            "critic_grad_norm": "grad/critic_norm",
+            "encoder_grad_norm": "grad/encoder_norm",
+            "actor_loss": "learner/actor_loss_last",
+            "actor_grad_norm": "learner/actor_grad_norm_last",
+        }
+        for output, source in learner_fields.items():
+            record[output] = diagnostics.get(source) if learner_available else None
+        writer.append_step(global_step, record)
 
     def record_send_cost_ms(self, elapsed_ms: float):
         send_ms = float(elapsed_ms)
@@ -1643,13 +2287,55 @@ class ClientAlgorithm:
         }
 
     def Assign(self, pclient, job_list):
-        assigned = defaultdict(int)
+        assigned = {}
         used = set()
-        for job in job_list:
-            candidates = []
-            for iteration_index, (oht_id, oht) in enumerate(
-                pclient.OHT_DIC.items()
+        jobs = list(job_list)
+        owned_oht_ids = {
+            int(job.OHTId)
+            for job in jobs
+            if int(job.OHTId) != 0
+        }
+        pickup_candidates = defaultdict(list)
+        for iteration_index, (oht_id, oht) in enumerate(
+            pclient.OHT_DIC.items()
+        ):
+            if (
+                oht.State != IDLE_OHT_STATE
+                or oht.JobID != 0
+                or oht.DispatchedCommand != 0
+                or int(oht_id) in owned_oht_ids
             ):
+                continue
+            route_window = tuple(list(oht.RouteList)[:16])
+            seen_rails = set()
+            for pickup_index, rail_id in enumerate(route_window):
+                if rail_id in seen_rails:
+                    continue
+                seen_rails.add(rail_id)
+                pickup_candidates[rail_id].append(
+                    (
+                        iteration_index,
+                        oht_id,
+                        oht,
+                        route_window[: pickup_index + 1],
+                        pickup_index + 1,
+                    )
+                )
+
+        for job in jobs:
+            self._dispatch_job_count += 1
+            if job.State != QUEUED_JOB_STATE or job.OHTId != 0:
+                continue
+            self._dispatch_eligible_job_count += 1
+
+            candidates = []
+            for (
+                iteration_index,
+                oht_id,
+                oht,
+                pickup_path,
+                pickup_hops,
+            ) in pickup_candidates.get(job.FromNode, ()):
                 carrier_ok = any(
                     value in job.CarrierTypes for value in oht.CarrierTypes
                 )
@@ -1658,26 +2344,23 @@ class ClientAlgorithm:
                     or oht.RunningAreaType == 0
                     or job.RunningAreaTyes[0] == 0
                 )
-                if oht.State == 3 or not carrier_ok or not area_ok or oht_id in used:
+                if not carrier_ok or not area_ok or oht_id in used:
                     continue
-                route_window = list(oht.RouteList)[:16]
-                if job.FromNode not in route_window:
-                    continue
-                pickup_index = route_window.index(job.FromNode)
                 candidates.append({
                     "oht_id": oht_id,
-                    "pickup_path": tuple(route_window[: pickup_index + 1]),
-                    "pickup_hops": pickup_index + 1,
+                    "pickup_path": pickup_path,
+                    "pickup_hops": pickup_hops,
                     "iteration_index": iteration_index,
                 })
 
-            self._dispatch_job_count += 1
             self._dispatch_candidate_total += len(candidates)
             if not candidates:
+                self._dispatch_zero_candidate_count += 1
                 continue
 
             selected = candidates[0]
             if self.config.dispatch_mode == DISPATCH_COST:
+                self._dispatch_cost_attempt_count += 1
                 if not self.dispatch_cost_ready:
                     self._dispatch_cost_snapshot_fallback_count += 1
                 else:
@@ -1701,6 +2384,12 @@ class ClientAlgorithm:
                                 )
                             score += cost
                         scored.append((score, candidate))
+                    first_match_score = scored[0][0]
+                    first_match_hops = candidates[0]["pickup_hops"]
+                    candidate_scores = [item[0] for item in scored]
+                    candidate_cost_spread = (
+                        max(candidate_scores) - min(candidate_scores)
+                    )
                     scored.sort(
                         key=lambda item: (
                             item[0],
@@ -1709,18 +2398,47 @@ class ClientAlgorithm:
                         )
                     )
                     selected_score, selected = scored[0]
-                    self._dispatch_path_cost_count += 1
-                    self._dispatch_path_cost_total += selected_score
-                    self._dispatch_changed_count += int(
+                    cost_saving = max(
+                        0.0,
+                        first_match_score - selected_score,
+                    )
+                    relative_saving = (
+                        cost_saving / first_match_score
+                        if first_match_score > 1e-12
+                        else 0.0
+                    )
+                    changed = (
                         selected["oht_id"] != candidates[0]["oht_id"]
                     )
+                    strict_improvement = cost_saving > 1e-9
+                    self._dispatch_path_cost_count += 1
+                    self._dispatch_path_cost_total += selected_score
+                    self._dispatch_first_match_path_cost_total += (
+                        first_match_score
+                    )
+                    self._dispatch_first_match_hops_total += first_match_hops
+                    self._dispatch_cost_saving_total += cost_saving
+                    self._dispatch_relative_cost_saving_total += (
+                        relative_saving
+                    )
+                    self._dispatch_candidate_cost_spread_total += (
+                        candidate_cost_spread
+                    )
+                    self._dispatch_changed_count += int(changed)
+                    self._dispatch_strict_cost_improvement_count += int(
+                        strict_improvement
+                    )
                     if len(scored) > 1:
+                        self._dispatch_multi_candidate_count += 1
                         self._dispatch_margin_count += 1
                         self._dispatch_margin_total += (
                             scored[1][0] - scored[0][0]
                         )
 
-            assigned[job.ID] = selected["oht_id"]
+            assigned[job.ID] = {
+                "oht_id": selected["oht_id"],
+                "pickup_path": list(selected["pickup_path"]),
+            }
             used.add(selected["oht_id"])
             self._dispatch_selected_count += 1
             self._dispatch_selected_hops_total += selected["pickup_hops"]

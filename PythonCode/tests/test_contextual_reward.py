@@ -52,10 +52,20 @@ class ContextualRewardTests(unittest.TestCase):
             - batch.rail_tat_penalty - batch.smooth_penalty
         )
         np.testing.assert_allclose(batch.total, expected)
-        self.assertEqual(builder.local_normalizer.update_calls, 1)
-        self.assertEqual(builder.local_normalizer.count, CONTROLLED_COUNT)
-        self.assertEqual(builder.global_normalizer.update_calls, 1)
-        self.assertEqual(builder.global_normalizer.count, 1)
+        # Reward K uses fixed scaling. The running normalizers are retained only
+        # so older checkpoints stay loadable, and must never be updated.
+        self.assertEqual(builder.local_normalizer.update_calls, 0)
+        self.assertEqual(builder.global_normalizer.update_calls, 0)
+        self.assertAlmostEqual(
+            float(batch.global_component),
+            self.config.global_alpha * batch.global_raw,
+        )
+        np.testing.assert_allclose(
+            batch.local_component,
+            self.config.local_alpha
+            * batch.local_raw
+            / self.config.local_reward_scale,
+        )
         self.assertGreater(float(np.std(batch.local_raw)), 0)
         self.assertFalse(batch.total.flags.writeable)
 
@@ -99,11 +109,11 @@ class ContextualRewardTests(unittest.TestCase):
             self.assertEqual(source.local_normalizer.count,
                              restored.local_normalizer.count)
 
-    def test_no_completed_job_does_not_receive_maximum_tat_reward(self):
+    def test_global_tat_reads_total_tat_level_and_never_differences_it(self):
         builder = ContextualRewardBuilder(self.topology, self.config)
         client = reward_client()
         action = np.zeros(CONTROLLED_COUNT)
-        builder.build(
+        first = builder.build(
             client, applied_action=action, previous_applied_action=None,
             env_step=0, episode_id=0,
         )
@@ -111,14 +121,32 @@ class ContextualRewardTests(unittest.TestCase):
             client, applied_action=action, previous_applied_action=action,
             env_step=1, episode_id=0,
         )
-        self.assertEqual(second.tat_signal_available, 0.0)
-        self.assertEqual(second.marginal_tat_ema, 0.0)
+        # Reward K reads TotalTat as a level and never gates it on the
+        # completed-command count, so a tick with zero completions still
+        # carries the global TAT signal.
+        self.assertEqual(second.tat_signal_available, 1.0)
+        tat_error = (
+            self.config.tat_reference - client.TotalTat
+        ) / self.config.tat_reference
+        expected_tat = float(np.clip(
+            self.config.tat_weight * tat_error,
+            -self.config.tat_raw_clip,
+            self.config.tat_raw_clip,
+        ))
+        expected_op = self.config.op_weight * (
+            self.config.op_reference - client.TotalOhtOperationRate
+        )
+        expected_backlog = -self.config.backlog_weight * (
+            client.WaitingCommandCount + client.QueuedCommandCount
+        )
         self.assertAlmostEqual(
             second.global_raw,
-            -self.config.backlog_weight * (
-                client.WaitingCommandCount + client.QueuedCommandCount
-            ),
+            expected_tat + expected_op + expected_backlog,
         )
+        # Recovering a marginal TAT by differencing TotalTat would amplify its
+        # 0.1 s transport quantization by the cumulative job count. With
+        # TotalTat held constant the global term must not move at all.
+        self.assertAlmostEqual(first.global_raw, second.global_raw)
 
     def test_region_smooth_penalty_uses_b_rl_delta(self):
         config = ContextualRewardConfig(
