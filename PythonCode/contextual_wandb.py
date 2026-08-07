@@ -18,6 +18,8 @@ from cocel_rl.algorithms.contextual_sac import (
     CHECKPOINT_VERSION as SAC_CHECKPOINT_VERSION,
 )
 from contextual_action import (
+    B_RL_NEUTRAL,
+    B_RL_SPAN,
     EXPLORATION_SCHEDULE_VERSION,
     REGION_B_RL,
     action_version,
@@ -25,9 +27,19 @@ from contextual_action import (
 from contextual_dispatch import DISPATCH_SELECTION_VERSION
 from contextual_reward import ContextualRewardConfig, REWARD_VERSION
 
+
+def _b_rl_action_range() -> str:
+    """Reachable congestion-multiplier interval at full action scale."""
+    return (
+        f"b_rl_{B_RL_NEUTRAL - B_RL_SPAN:g}-{B_RL_NEUTRAL + B_RL_SPAN:g}"
+    )
+
+
 EXP_META = {
     "cost_structure": "b_rl",
-    "action_range": "b_rl_0.0-1.0",
+    "action_range": _b_rl_action_range(),
+    "b_rl_neutral": B_RL_NEUTRAL,
+    "b_rl_span": B_RL_SPAN,
     "topology": "directed_10in_10out_controlled_centers_v2",
     "observation": "contextual_obs_controlled_v1",
     "reward_version": "K",
@@ -401,10 +413,12 @@ def runtime_exp_meta(config) -> dict:
     if action_mode == REGION_B_RL:
         meta["cost_structure"] = "b_rl"
         meta["action_range"] = (
-            "b_rl_0.0-1.0_"
+            f"{_b_rl_action_range()}_"
             f"curriculum_{float(config.curriculum_scale_start):g}-"
             f"{float(config.curriculum_scale_end):g}"
         )
+        meta["b_rl_neutral"] = B_RL_NEUTRAL
+        meta["b_rl_span"] = B_RL_SPAN
     else:
         meta["cost_structure"] = "baseline_exp_residual"
         meta["action_range"] = f"{float(config.action_scale):g}-scaled"

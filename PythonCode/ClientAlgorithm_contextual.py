@@ -42,6 +42,8 @@ from cocel_rl.algorithms.contextual_sac import (
 )
 from contextual_action import (
     ACTION_MODES,
+    B_RL_NEUTRAL,
+    B_RL_SPAN,
     EXP_RESIDUAL,
     EXPLORATION_SCHEDULE_VERSION,
     REGION_B_RL,
@@ -1094,7 +1096,9 @@ class ClientAlgorithm:
             future = float(self.parameterC.get(rail_id, 0.0))
             base_cost[row] = base
             congestion_cost[row] = weight * future
-        baseline = base_cost + 0.5 * congestion_cost
+        # Must stay B_RL_NEUTRAL so the zero action reproduces this exactly;
+        # apply_controlled_action fails closed if the two ever disagree.
+        baseline = base_cost + B_RL_NEUTRAL * congestion_cost
         if not all(
             np.isfinite(value).all()
             for value in (base_cost, congestion_cost, baseline)
@@ -2003,7 +2007,7 @@ class ClientAlgorithm:
         applied = np.asarray(
             completed.applied_action, dtype=np.float64
         ).reshape(-1)
-        b_rl = 0.5 + 0.5 * applied
+        b_rl = B_RL_NEUTRAL + B_RL_SPAN * applied
         global_vector = np.full_like(
             batch.local_component, batch.global_component
         )

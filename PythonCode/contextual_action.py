@@ -14,9 +14,29 @@ REGION_B_RL = "region_b_rl"
 EXP_RESIDUAL = "exp_residual"
 ACTION_MODES = (REGION_B_RL, EXP_RESIDUAL)
 ACTION_VERSIONS = {
-    REGION_B_RL: "contextual_region_b_rl_v1",
+    REGION_B_RL: "contextual_region_b_rl_v2",
     EXP_RESIDUAL: "contextual_exp_residual_v2",
 }
+
+# region_b_rl maps the applied action onto the congestion multiplier b of
+#     final_cost = base_cost + congestion_cost * b
+# The neutral action (applied == 0) must reproduce the baseline cost exactly, so
+# B_RL_NEUTRAL is simultaneously the baseline's congestion share and the cost
+# the policy starts from.
+#
+# v1 used neutral 0.5 with span 0.5, i.e. b in [0.0, 1.0]. The fixed-b sweep
+# over b in {0, 0.25, 0.5, 0.75, 1, 1.5, 2} measured TAT as a U-shaped curve
+# whose minimum sits near b = 0.75 (~171-173), while the low side degrades
+# sharply: b = 0.25 reached ~185 and b = 0 collapsed the queue and terminated
+# the episode. Centering on 0.5 therefore put the empirical optimum a
+# persistent +0.5 action away and left the collapse region inside the
+# exploration range.
+#
+# v2 centers on the measured optimum and narrows the span so the collapse
+# region is unreachable by construction: b in [0.40, 1.10]. The upper bound is
+# also above nothing useful - the sweep degrades monotonically for b > 1.
+B_RL_NEUTRAL = 0.75
+B_RL_SPAN = 0.35
 EXPLORATION_SCHEDULE_VERSION = "contextual_exploration_linear_anneal_v1"
 # Default contract for standalone replay/test construction.
 ACTION_VERSION = ACTION_VERSIONS[REGION_B_RL]
@@ -159,12 +179,12 @@ def apply_controlled_action(
         congestion = _finite_vector(
             "congestion_cost", congestion_cost, physical_count
         )
-        neutral = base + 0.5 * congestion
+        neutral = base + B_RL_NEUTRAL * congestion
         if not np.allclose(neutral, baseline, rtol=1e-10, atol=1e-10):
             raise ContextualActionError(
                 "region_b_rl neutral cost does not match baseline"
             )
-        b_rl = 0.5 + 0.5 * applied
+        b_rl = B_RL_NEUTRAL + B_RL_SPAN * applied
         final_cost[controlled_rows] = (
             base[controlled_rows]
             + congestion[controlled_rows] * b_rl

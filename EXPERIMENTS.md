@@ -922,3 +922,36 @@ architectural stabilization change is selected.
   `contextual_reward_diagnostic_v15_balanced_neutral2`.
 - `EXP_META.note=neutral2_balanced111_tatup_backlogdown_preddown`. Reward I/J
   checkpoints and replay are rejected; start with a fresh critic and replay.
+
+## 2026-08-07 - Action v2 recenters b_rl on the measured fixed-b optimum
+
+- Action version: `contextual_region_b_rl_v1` -> `contextual_region_b_rl_v2`.
+  `EXP_META.action_range` is now derived, reporting `b_rl_0.4-1.1`.
+- Motivation is the fixed-b baseline sweep over
+  `b in {0, 0.25, 0.5, 0.75, 1, 1.5, 2}` at `step_in_b <= 45000`. TAT is
+  U-shaped in `b` with its minimum near `b = 0.75` (~171-173). The low side
+  degrades much faster than the high side: `b = 0.25` reached ~185 and `b = 0`
+  drove the queue to ~500 and hit queue termination, while `b = 1.5` and
+  `b = 2` only reached ~180-181.
+- v1 used `b_rl = 0.5 + 0.5 * applied`, so the neutral action sat at `b = 0.5`
+  and the reachable interval was `[0.0, 1.0]`. That placed the empirical
+  optimum a persistent `applied = +0.5` away from the policy's initialization
+  and left the collapse region fully inside the exploration range.
+- v2 uses shared constants `B_RL_NEUTRAL = 0.75`, `B_RL_SPAN = 0.35`, giving
+  `b_rl = 0.75 + 0.35 * applied` and a reachable interval of `[0.40, 1.10]`.
+  The neutral action now reproduces the best measured constant `b`, and both
+  failure regions (collapse below ~0.4, monotonic degradation above ~1.1) are
+  unreachable by construction rather than by the action-scale curriculum.
+- `ClientAlgorithm_contextual._cost_components` now builds the baseline as
+  `base_cost + B_RL_NEUTRAL * congestion_cost` from the same constant.
+  `apply_controlled_action` still fails closed if the two ever disagree, so the
+  neutral-cost invariant cannot silently drift.
+- Reward, observation, replay, learner, dispatch, and the action-scale
+  curriculum are unchanged. The preserved 0704 runtime keeps its own
+  independent `0.5 + 0.5 * a` mapping and is deliberately untouched.
+- Because the action version changed, existing contextual checkpoints and
+  replay snapshots are rejected by the version guards; start from a fresh
+  critic and replay. Note the baseline cost itself moved, so v1 and v2
+  `cost/controlled_ratio_*` diagnostics are not comparable.
+- Validation: full suite 177 passed. No simulator or W&B run was launched for
+  this implementation change.

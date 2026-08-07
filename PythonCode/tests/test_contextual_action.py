@@ -3,6 +3,8 @@ import unittest
 import numpy as np
 
 from contextual_action import (
+    B_RL_NEUTRAL,
+    B_RL_SPAN,
     EXP_RESIDUAL,
     REGION_B_RL,
     ContextualActionError,
@@ -160,10 +162,10 @@ class ContextualActionTests(unittest.TestCase):
         np.testing.assert_array_equal(baseline, baseline_before)
         np.testing.assert_array_equal(action, action_before)
 
-    def test_region_b_rl_matches_legacy_mapping_at_full_scale(self):
+    def test_region_b_rl_spans_neutral_plus_minus_span_at_full_scale(self):
         base = np.linspace(1.0, 2.0, PHYSICAL_COUNT)
         congestion = np.linspace(2.0, 4.0, PHYSICAL_COUNT)
-        baseline = base + 0.5 * congestion
+        baseline = base + B_RL_NEUTRAL * congestion
         action = np.zeros(CONTROLLED_COUNT)
         action[:3] = (-1.0, 0.0, 1.0)
         result = apply_controlled_action(
@@ -177,22 +179,29 @@ class ContextualActionTests(unittest.TestCase):
             congestion_cost=congestion,
         )
         rows = self.topology.controlled_row_to_physical_index
-        self.assertAlmostEqual(result.final_cost[rows[0]], base[rows[0]])
+        self.assertAlmostEqual(
+            result.final_cost[rows[0]],
+            base[rows[0]] + (B_RL_NEUTRAL - B_RL_SPAN) * congestion[rows[0]],
+        )
         self.assertAlmostEqual(result.final_cost[rows[1]], baseline[rows[1]])
         self.assertAlmostEqual(
             result.final_cost[rows[2]],
-            base[rows[2]] + congestion[rows[2]],
+            base[rows[2]] + (B_RL_NEUTRAL + B_RL_SPAN) * congestion[rows[2]],
         )
         np.testing.assert_allclose(
             result.applied_controlled_action[:3], (-1.0, 0.0, 1.0)
         )
+        # v2 keeps the queue-collapse region (b well under 0.4) unreachable and
+        # never exceeds the monotonically worse b > 1.1 region.
+        self.assertGreaterEqual(result.diagnostics["b_rl/min"], 0.4 - 1e-9)
+        self.assertLessEqual(result.diagnostics["b_rl/max"], 1.1 + 1e-9)
 
     def test_region_curriculum_scale_and_zero_congestion_contract(self):
         base = np.linspace(1.0, 2.0, PHYSICAL_COUNT)
         congestion = np.ones(PHYSICAL_COUNT)
         rows = self.topology.controlled_row_to_physical_index
         congestion[rows[1]] = 0.0
-        baseline = base + 0.5 * congestion
+        baseline = base + B_RL_NEUTRAL * congestion
         action = np.zeros(CONTROLLED_COUNT)
         action[:2] = (1.0, -1.0)
         result = apply_controlled_action(
@@ -205,10 +214,12 @@ class ContextualActionTests(unittest.TestCase):
             base_cost=base,
             congestion_cost=congestion,
         )
-        self.assertAlmostEqual(result.diagnostics["b_rl/min"], 0.45)
-        self.assertAlmostEqual(result.diagnostics["b_rl/max"], 0.55)
+        low = B_RL_NEUTRAL - 0.1 * B_RL_SPAN
+        high = B_RL_NEUTRAL + 0.1 * B_RL_SPAN
+        self.assertAlmostEqual(result.diagnostics["b_rl/min"], low)
+        self.assertAlmostEqual(result.diagnostics["b_rl/max"], high)
         self.assertAlmostEqual(
-            result.final_cost[rows[0]], base[rows[0]] + 0.55
+            result.final_cost[rows[0]], base[rows[0]] + high
         )
         self.assertEqual(result.final_cost[rows[1]], base[rows[1]])
 
