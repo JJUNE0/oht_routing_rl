@@ -21,22 +21,40 @@ ACTION_VERSIONS = {
 # region_b_rl maps the applied action onto the congestion multiplier b of
 #     final_cost = base_cost + congestion_cost * b
 # The neutral action (applied == 0) must reproduce the baseline cost exactly, so
-# B_RL_NEUTRAL is simultaneously the baseline's congestion share and the cost
-# the policy starts from.
+# B_RL_NEUTRAL is simultaneously the baseline's congestion share and the b the
+# policy starts from, since a freshly initialized actor outputs approximately 0
+# on every rail.
 #
-# v1 used neutral 0.5 with span 0.5, i.e. b in [0.0, 1.0]. The fixed-b sweep
-# over b in {0, 0.25, 0.5, 0.75, 1, 1.5, 2} measured TAT as a U-shaped curve
-# whose minimum sits near b = 0.75 (~171-173), while the low side degrades
-# sharply: b = 0.25 reached ~185 and b = 0 collapsed the queue and terminated
-# the episode. Centering on 0.5 therefore put the empirical optimum a
-# persistent +0.5 action away and left the collapse region inside the
-# exploration range.
+# v1 used neutral 0.5 with span 0.5, i.e. b in [0.0, 1.0].
 #
-# v2 centers on the measured optimum and narrows the span so the collapse
-# region is unreachable by construction: b in [0.40, 1.10]. The upper bound is
-# also above nothing useful - the sweep degrades monotonically for b > 1.
+# The fixed-b sweep over b in {0, 0.25, 0.5, 0.75, 1, 1.5, 2} measured TAT as a
+# U-shaped curve with its minimum near b = 0.75 (~171-173); b = 0.25 reached
+# ~185 and b = 0 drove the queue to ~500 and hit queue termination. That sweep
+# holds b *uniform across all 4,996 rails*, so it constrains exactly one thing
+# here: the neutral point, which is the only b the initial policy applies
+# everywhere at once. Neutral 0.75 therefore starts training from ~171-173
+# instead of ~174. It says nothing about the span, because once the policy
+# differentiates, the sweep's curve no longer applies - measured on run
+# xk7dxp8g over the 58,485 full-action-scale steps:
+#
+#   - b_rl/min was below 0.05 on 93.8% of steps and below 0.40 on 99.4%, i.e.
+#     the policy continuously drove individual rails to b ~ 0 to make them
+#     attractive, and env/queued still never exceeded 101 (p50 = 41, never
+#     above 300). Per-rail b ~ 0 does not reproduce the uniform b = 0 collapse.
+#   - The cross-rail mean drifts slowly (lag-1 autocorrelation 0.990) and spans
+#     0.421-0.810 even in 5,000-step rolling windows, while TAT over the same
+#     windows only spans 170.4-174.4, with corr(mean b, TAT) = -0.157. Under
+#     uniform b that same level range would span roughly 174-185.
+#   - corr(b_rl/std, TAT) = -0.176: more per-rail spread goes with slightly
+#     *lower* TAT, consistent with TD7 reaching 3.1% versus 1.95% for the best
+#     constant b.
+#
+# v2 therefore keeps neutral at the measured uniform optimum and widens the span
+# rather than narrowing it, so b = 0 stays reachable as the traffic-attraction
+# action: b in [0.00, 1.50]. The upper end is not a cliff either - the sweep
+# reached only ~180 at b = 1.5.
 B_RL_NEUTRAL = 0.75
-B_RL_SPAN = 0.35
+B_RL_SPAN = 0.75
 EXPLORATION_SCHEDULE_VERSION = "contextual_exploration_linear_anneal_v1"
 # Default contract for standalone replay/test construction.
 ACTION_VERSION = ACTION_VERSIONS[REGION_B_RL]

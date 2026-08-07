@@ -923,25 +923,41 @@ architectural stabilization change is selected.
 - `EXP_META.note=neutral2_balanced111_tatup_backlogdown_preddown`. Reward I/J
   checkpoints and replay are rejected; start with a fresh critic and replay.
 
-## 2026-08-07 - Action v2 recenters b_rl on the measured fixed-b optimum
+## 2026-08-07 - Action v2 recenters b_rl and widens the span
 
 - Action version: `contextual_region_b_rl_v1` -> `contextual_region_b_rl_v2`.
-  `EXP_META.action_range` is now derived, reporting `b_rl_0.4-1.1`.
-- Motivation is the fixed-b baseline sweep over
-  `b in {0, 0.25, 0.5, 0.75, 1, 1.5, 2}` at `step_in_b <= 45000`. TAT is
-  U-shaped in `b` with its minimum near `b = 0.75` (~171-173). The low side
-  degrades much faster than the high side: `b = 0.25` reached ~185 and `b = 0`
-  drove the queue to ~500 and hit queue termination, while `b = 1.5` and
-  `b = 2` only reached ~180-181.
-- v1 used `b_rl = 0.5 + 0.5 * applied`, so the neutral action sat at `b = 0.5`
-  and the reachable interval was `[0.0, 1.0]`. That placed the empirical
-  optimum a persistent `applied = +0.5` away from the policy's initialization
-  and left the collapse region fully inside the exploration range.
-- v2 uses shared constants `B_RL_NEUTRAL = 0.75`, `B_RL_SPAN = 0.35`, giving
-  `b_rl = 0.75 + 0.35 * applied` and a reachable interval of `[0.40, 1.10]`.
-  The neutral action now reproduces the best measured constant `b`, and both
-  failure regions (collapse below ~0.4, monotonic degradation above ~1.1) are
-  unreachable by construction rather than by the action-scale curriculum.
+  `EXP_META.action_range` is now derived, reporting `b_rl_0-1.5`.
+- The fixed-b baseline sweep over `b in {0, 0.25, 0.5, 0.75, 1, 1.5, 2}` at
+  `step_in_b <= 45000` measured TAT as U-shaped in `b` with its minimum near
+  `b = 0.75` (~171-173); `b = 0.25` reached ~185 and `b = 0` drove the queue to
+  ~500 and hit queue termination, while `b = 1.5` and `b = 2` only reached
+  ~180-181.
+- That sweep holds `b` **uniform across all 4,996 rails**, so it constrains
+  exactly one quantity here: the neutral point, which is the only `b` a freshly
+  initialized policy applies everywhere at once. v1's neutral `0.5` started
+  training from ~174; v2's neutral `0.75` starts from ~171-173.
+- The sweep does **not** constrain the span. Measured on run `xk7dxp8g` over
+  the 58,485 full-action-scale steps:
+  - `b_rl/min` was below `0.05` on 93.8% of steps and below `0.40` on 99.4%,
+    i.e. the policy continuously drove individual rails to `b ~ 0` to attract
+    work, and `env/queued` still never exceeded 101 (p50 = 41, never above
+    300). Per-rail `b ~ 0` does not reproduce the uniform `b = 0` collapse.
+  - The cross-rail mean drifts slowly (lag-1 autocorrelation 0.990) and spans
+    `0.421-0.810` even in 5,000-step rolling windows, while TAT over the same
+    windows spans only `170.4-174.4`, with `corr(mean b, TAT) = -0.157`. Under
+    uniform `b` that level range would span roughly 174-185.
+  - `corr(b_rl/std, TAT) = -0.176`: more per-rail spread goes with slightly
+    *lower* TAT, consistent with TD7 reaching 3.1% against 1.95% for the best
+    constant `b`.
+- v2 therefore uses shared constants `B_RL_NEUTRAL = 0.75`, `B_RL_SPAN = 0.75`,
+  giving `b_rl = 0.75 + 0.75 * applied` over `[0.00, 1.50]`. `b = 0` stays
+  reachable as the traffic-attraction action and the span is 0.5 -> 0.75, i.e.
+  wider than v1 rather than narrower.
+- Superseded within the same day: the first v2 draft used `B_RL_SPAN = 0.35`
+  for `[0.40, 1.10]`, on the incorrect assumption that the uniform `b = 0`
+  collapse also applied per rail. The run data above refutes that, and the
+  narrower span would have removed the low tail the policy used on 93.8% of
+  steps. No run was launched against the withdrawn draft.
 - `ClientAlgorithm_contextual._cost_components` now builds the baseline as
   `base_cost + B_RL_NEUTRAL * congestion_cost` from the same constant.
   `apply_controlled_action` still fails closed if the two ever disagree, so the
