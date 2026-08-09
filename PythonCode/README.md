@@ -122,6 +122,23 @@ results. W&B and optional reward JSONL record representative global, local,
 active-rail scales, good/bad reward signs, clipping, and Q-mean deltas for the
 next calibration pass. Reward I/J checkpoints and replay are incompatible.
 
+## Reward N unbounded one-sided TAT penalty
+
+The current fresh-run contract keeps Reward M except for continuous TAT. Global
+TAT reward is `-11 * max(0, TotalTat - 160) / 165`, so it is zero through 160
+and decreases linearly without saturation above 160. `tat_raw_clip` is disabled
+for this mode, including beyond the termination threshold. TAT termination is
+still disabled for the first 10,000 episode-local steps, then requires 300
+consecutive steps at `TotalTat >= 170`; the final replay transition broadcasts
+`-20` once with `done=True`. Fixed provisional coefficients remain
+`tat_weight=11`, `op_weight=4`,
+`backlog_weight=0.0004`, `local_predicted_oht_weight=0.075`, and
+`rail_tat_weight=30` with clip `1`. Backlog growth over 300 steps and a
+penalty-only global idle reserve below 200 OHTs are the only new reward terms.
+All other leading, distribution, flow, route-tail, composite, and delayed
+correlation signals are diagnostic-only. Reward N requires a fresh critic,
+target critic, replay, and reward-version state.
+
 실행 후 simulator GUI에서 Python 연동을 활성화하고 Run을 시작합니다.
 
 ## Command 6 dispatch mode

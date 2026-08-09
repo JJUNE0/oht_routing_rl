@@ -257,8 +257,9 @@ def parse_args():
     parser.add_argument("--wandb-log-interval", type=int, default=10)
     parser.add_argument("--console-log-interval", type=int, default=100)
     parser.add_argument("--early-stop-queued-threshold", type=float, default=500.0)
-    parser.add_argument("--early-stop-tat-threshold", type=float, default=500.0)
-    parser.add_argument("--early-stop-min-episode-steps", type=int, default=100)
+    parser.add_argument("--early-stop-tat-threshold", type=float, default=170.0)
+    parser.add_argument("--tat-termination-grace-steps", type=int, default=10_000)
+    parser.add_argument("--tat-above-threshold-patience", type=int, default=300)
     parser.add_argument("--max-stale-sim-time-ticks", type=int, default=5)
     parser.add_argument("--checkpoint-root", default=None)
     parser.add_argument("--resume-checkpoint", default=None)
@@ -519,7 +520,8 @@ def main():
         "wandb_log_interval": args.wandb_log_interval,
         "early_stop_queued_threshold": args.early_stop_queued_threshold,
         "early_stop_tat_threshold": args.early_stop_tat_threshold,
-        "early_stop_min_episode_steps": args.early_stop_min_episode_steps,
+        "tat_termination_grace_steps": args.tat_termination_grace_steps,
+        "tat_above_threshold_patience": args.tat_above_threshold_patience,
         "max_stale_sim_time_ticks": args.max_stale_sim_time_ticks,
         "checkpoint_root": args.checkpoint_root,
         "resume_checkpoint_path": args.resume_checkpoint,
@@ -556,7 +558,10 @@ def main():
         "rail_free_flow_neutral_ratio="
         f"{client.config.rail_free_flow_neutral_ratio}, "
         f"tat_weight={client.config.tat_weight}, "
+        f"op_weight={client.config.op_weight}, "
         f"backlog_weight={client.config.backlog_weight}, "
+        f"backlog_growth_weight={client.config.backlog_growth_weight}, "
+        f"idle_reserve_weight={client.config.idle_reserve_weight}, "
         "local_predicted_oht_weight="
         f"{client.config.local_predicted_oht_weight}, "
         f"local_reward_scale={client.config.local_reward_scale}, "

@@ -26,23 +26,31 @@ EXP_META = {
     "action_range": "b_rl_0.0-1.0",
     "topology": "directed_10in_10out_controlled_centers_v2",
     "observation": "contextual_obs_controlled_v1",
-    "reward_version": "K",
+    "reward_version": "N",
     "reward_contract_version": REWARD_VERSION,
     "calibration_status": "provisional",
     "reward_global_alpha": 0.5,
     "reward_local_alpha": 0.5,
-    "tat_reference": 174.4236,
-    "tat_weight": 18.4,
+    "tat_reference": 165.0,
+    "tat_weight": 11.0,
+    "tat_penalty_start": 160.0,
     "op_reference": 0.80,
-    "op_weight": 5.0,
-    "backlog_weight": 0.0005,
-    "local_predicted_oht_weight": 0.10,
+    "op_weight": 4.0,
+    "backlog_weight": 0.0004,
+    "backlog_growth_enabled": True,
+    "backlog_growth_horizon": 300,
+    "backlog_growth_scale": 30.0,
+    "backlog_growth_weight": 0.16,
+    "idle_reserve_target": 200.0,
+    "idle_reserve_scale": 50.0,
+    "idle_reserve_weight": 0.20,
+    "local_predicted_oht_weight": 0.075,
     "local_reward_scale": 2.0,
     "rail_reward_mode": "free_flow_neutral_2",
     "rail_free_flow_neutral_ratio": 2.0,
-    "rail_tat_weight": 50.0,
+    "rail_tat_weight": 30.0,
     "rail_tat_clip": 1.0,
-    "tat_raw_clip": 1.0,
+    "tat_raw_clip": None,
     "tat_confidence_ramp": False,
     "action_scale": 0.05,
     "exploration_noise_std": 0.10,
@@ -56,18 +64,29 @@ EXP_META = {
     "send_cost_logging_version": "post_send_v2",
     "protocol_version": "single_end_time_v2",
     "diagnostic_schema_version": (
-        "contextual_reward_diagnostic_v15_balanced_neutral2"
+        "contextual_reward_diagnostic_v16_leading_indicators"
+    ),
+    "wandb_metric_schema_version": "contextual_wandb_compact_v1",
+    "rail_budget_calibration": "median_abs_nonzero_active_postclip",
+    "arrival_tracking_source": "PClient.JOB_DIC.Job.ID_command_id",
+    "arrival_tracking_reuse_fail_safe": True,
+    "diagnostic_only_leading_indicators": (
+        "predicted_oht_distribution,backlog_idle_op_rollups,route_ratio_tail,"
+        "arrival_completion_flow,oht_utilization,leadlag,composite_pressure"
     ),
     "centering": False,
     "replay_sampling_version": REPLAY_SAMPLING_VERSION,
-    "note": "neutral2_balanced111_tatup_backlogdown_preddown",
+    "tat_termination_grace_steps": 10_000,
+    "early_stop_tat_threshold": 170.0,
+    "tat_above_threshold_patience": 300,
+    "terminal_tat_penalty": -20.0,
+    "note": "tatonesided_unbounded_grace10k_patience300_terminal20",
     "description": (
-        "Reward K preserves the global TotalTat reference at 174.4236 and the "
-        "free-flow-neutral-2 rail reward introduced in Phase 1. Phase 2 "
-        "increases the influence of TotalTat, reduces backlog and "
-        "predicted-OHT shaping, and provisionally targets representative "
-        "global, local, and active rail magnitudes toward a 1:1:1 ratio "
-        "without a constant reward shift or TAT trend term."
+        "Reward N changes only Reward M continuous TAT behavior: global TAT "
+        "is a one-sided linear penalty above 160 with no saturation and no "
+        "tat_raw_clip. The 10,000-step grace, 170 threshold, 300-step "
+        "patience, replayed terminal -20, and all non-TAT Reward M terms are "
+        "unchanged."
     ),
 }
 
@@ -232,6 +251,17 @@ WANDB_METRIC_KEYS += (
     "reward/global/op_weight",
     "reward/global/op_raw", "reward/global/backlog",
     "reward/global/backlog_weight", "reward/global/backlog_raw",
+    "reward/global/backlog_growth_enabled",
+    "reward/global/backlog_growth_horizon",
+    "reward/global/backlog_growth_scale",
+    "reward/global/backlog_growth_weight",
+    "reward/global/backlog_growth_signal",
+    "reward/global/backlog_growth_raw",
+    "reward/global/backlog_growth_component",
+    "reward/global/idle_oht_count", "reward/global/idle_reserve_target",
+    "reward/global/idle_reserve_scale", "reward/global/idle_reserve_weight",
+    "reward/global/idle_reserve_signal", "reward/global/idle_reserve_raw",
+    "reward/global/idle_reserve_component",
     "reward/global/raw_sum", "reward/global/raw_decomposition_error",
     "reward/local/raw_decomposition_error_max",
     "reward/contribution/global_mean", "reward/contribution/local_mean",
@@ -247,6 +277,7 @@ WANDB_METRIC_KEYS += (
     "reward/config/local_reward_scale", "reward/config/rail_tat_weight",
     "reward/config/rail_tat_clip", "reward/config/tat_raw_clip",
     "reward/config/smooth_weight_effective",
+    "reward/terminal_penalty",
     "reward/global/tat_raw", "reward/global/tat_component",
     "reward/global/backlog_component", "reward/global/op_component",
     "reward/global/global_component",
@@ -271,6 +302,17 @@ WANDB_METRIC_KEYS += (
     "reward/sign/bad_state_sample_count",
     "reward/sign/bad_state_total_mean", "reward/sign/good_minus_bad",
     "reward/sign/good_state_sufficient", "reward/sign/bad_state_sufficient",
+) + tuple(
+    f"reward/budget/{name}"
+    for name in (
+        "tat_abs", "op_abs", "backlog_level_abs", "backlog_growth_abs",
+        "backlog_flow_abs", "idle_reserve_abs", "current_oht_abs",
+        "predicted_oht_abs", "stop_abs", "capacity_abs", "rail_active_abs",
+        "rail_overall_abs", "smooth_abs", "tat_share",
+        "predicted_oht_share", "backlog_flow_share", "idle_reserve_share",
+        "rail_active_share", "op_share", "other_share", "share_sum_error",
+        "target_band_violation_count",
+    )
 ) + tuple(
     f"reward/local/{term}_raw_{stat}"
     for term in ("oht", "predicted", "stop", "idle", "capacity")
@@ -310,6 +352,176 @@ WANDB_METRIC_KEYS += (
     "reward/rail/weighted_preclip_abs_mean", "reward/rail/postclip_abs_mean",
 )
 
+WANDB_METRIC_KEYS += tuple(
+    f"lead/{series}/delta_{horizon}"
+    for series, horizons in (
+        ("backlog", (100, 300, 500, 1_000)),
+        ("queued", (100, 300, 500)),
+        ("waiting", (100, 300, 500)),
+        ("idle", (100, 300, 500, 1_000)),
+        ("op", (100, 300, 500)),
+    )
+    for horizon in horizons
+) + tuple(
+    f"lead/op/ema_{horizon}" for horizon in (100, 300, 500)
+) + tuple(
+    f"lead/predicted_oht/{name}"
+    for name in (
+        "available", "mean", "p50", "p75", "p90", "p95", "p99",
+        "max", "std", "top10_mean", "top50_mean", "top100_mean",
+        "fraction_gt_5", "fraction_gt_10",
+    )
+) + tuple(
+    f"lead/route_ratio/{name}"
+    for name in (
+        "available", "mean", "p50", "p75", "p90", "p95", "p99",
+        "max", "ratio_gt_2", "negative_reward_cycle_ratio",
+    )
+) + tuple(
+    f"lead/flow/{name}_{horizon}"
+    for horizon in (100, 300, 500, 1_000)
+    for name in (
+        "arrival_count", "completion_count", "arrival_rate",
+        "completion_rate", "imbalance_count", "imbalance_rate",
+    )
+) + tuple(
+    f"leadlag/{feature}_vs_future_tat_{horizon}"
+    for horizon in (200, 500, 1_000)
+    for feature in (
+        "predicted_mean", "predicted_p90", "predicted_p95", "backlog",
+        "backlog_delta_300", "queue", "idle", "idle_delta_300", "op",
+        "op_ema300", "transferring", "route_ratio_p90",
+        "route_ratio_p95", "flow_imbalance", "composite",
+    )
+)
+
+WANDB_METRIC_KEYS += (
+    "lead/backlog/value", "lead/queued/value", "lead/waiting/value",
+    "lead/idle/value", "lead/idle/reserve_signal", "lead/idle/below_target",
+    "lead/op/value", "lead/op/above_078", "lead/op/above_080",
+    "lead/op/consecutive_above_080", "lead/oht/idle",
+    "lead/oht/move_to_load", "lead/oht/loading",
+    "lead/oht/move_to_unload", "lead/oht/unloading",
+    "lead/oht/transferring", "lead/oht/transferring_delta_300",
+    "lead/oht/move_to_unload_delta_300", "lead/flow/arrival_available",
+    "lead/flow/new_job_count", "lead/flow/duplicate_job_id_count",
+    "lead/flow/job_id_reuse_count", "lead/composite_pressure",
+    "lead/composite_available", "leadlag/sample_count_200",
+    "leadlag/sample_count_500", "leadlag/sample_count_1000",
+)
+
+# Runtime diagnostics remain rich for JSONL and local debugging. W&B receives
+# only this experiment-facing compact profile so charts stay interpretable and
+# history exports remain small.
+WANDB_METRIC_KEYS = (
+    # Environment / performance state.
+    "env/step",
+    "env/episode",
+    "episode/step",
+    "env/tat",
+    "env/operation_rate",
+    "env/queued",
+    "env/waiting",
+    "env/transferring",
+    "oht/idle_count",
+    "termination/done",
+    "termination/by_tat",
+    "env/termination_reason",
+    # Actor / applied control.
+    "action/policy_mean",
+    "action/policy_std",
+    "action/cross_rail_policy_std",
+    "action/policy_saturation_ratio",
+    "action/clipped_fraction",
+    "action/exploration_noise_std",
+    "action/applied_mean",
+    "action/applied_std",
+    "curriculum/action_scale",
+    "b_rl/mean",
+    "b_rl/std",
+    # Reward and representative contribution budget.
+    "reward/total_mean",
+    "reward/total_std",
+    "reward/terminal_penalty",
+    "reward/global/tat_component",
+    "reward/global/op_component",
+    "reward/global/backlog_component",
+    "reward/global/backlog_growth_component",
+    "reward/global/idle_reserve_component",
+    "reward/local/predicted_oht_component_abs_mean",
+    "reward/budget/tat_share",
+    "reward/budget/op_share",
+    "reward/budget/backlog_flow_share",
+    "reward/budget/idle_reserve_share",
+    "reward/budget/predicted_oht_share",
+    "reward/budget/rail_active_share",
+    "reward/budget/other_share",
+    "reward/budget/share_sum_error",
+    "reward/rail/route_ratio_mean",
+    "reward/rail/route_ratio_p95",
+    "reward/rail/positive_cycle_ratio",
+    "reward/rail/negative_cycle_ratio",
+    "reward/rail/clip_assignment_ratio",
+    "reward/rail/clip_removed_ratio",
+    "reward/scale/rail_active_representative",
+    # Learner / critic / replay health.
+    "learner/critic_loss",
+    "learner/actor_loss_last",
+    "learner/actor_grad_norm_last",
+    "critic/q1_mean",
+    "critic/q2_mean",
+    "critic/target_q_mean",
+    "critic/q_abs_diff_mean",
+    "critic/td_error_mean",
+    "critic/td_error_max",
+    "grad/encoder_norm",
+    "grad/critic_norm",
+    "learner/actor_updates_total",
+    "learner/updates",
+    "replay/size_env_steps",
+    "replay/reward_mean",
+    "replay/reward_std",
+    "numeric/learner_finite_ratio",
+    # SALE essentials only.
+    "sale/loss",
+    "sale/prediction_error_mean",
+    "sale/online_grad_norm",
+    "sale/fixed_online_distance",
+    # Compact leading state: 300-step change and 500-step future TAT.
+    "lead/backlog/value",
+    "lead/backlog/delta_300",
+    "lead/idle/value",
+    "lead/idle/delta_300",
+    "lead/idle/reserve_signal",
+    "lead/op/value",
+    "lead/predicted_oht/mean",
+    "lead/predicted_oht/p95",
+    "lead/route_ratio/p95",
+    "lead/flow/arrival_available",
+    "lead/flow/imbalance_count_300",
+    "lead/composite_pressure",
+    "leadlag/predicted_p95_vs_future_tat_500",
+    "leadlag/backlog_delta_300_vs_future_tat_500",
+    "leadlag/idle_delta_300_vs_future_tat_500",
+    "leadlag/flow_imbalance_vs_future_tat_500",
+    "leadlag/composite_vs_future_tat_500",
+    "leadlag/sample_count_500",
+)
+
+REMOVED_WANDB_PREFIXES = (
+    "lap/",
+    "dispatch/",
+    "burnin/",
+    "attention/",
+    "boundary/",
+    "protocol/",
+    "value/",
+)
+if len(WANDB_METRIC_KEYS) != len(set(WANDB_METRIC_KEYS)):
+    raise RuntimeError("compact W&B metric schema contains duplicate keys")
+if any(key.startswith(REMOVED_WANDB_PREFIXES) for key in WANDB_METRIC_KEYS):
+    raise RuntimeError("removed metric group leaked into compact W&B schema")
+
 
 def runtime_exp_meta(config) -> dict:
     meta = dict(EXP_META)
@@ -321,7 +533,15 @@ def runtime_exp_meta(config) -> dict:
         tat_confidence_ramp=config.tat_confidence_ramp,
         local_reward_scale=config.local_reward_scale,
         tat_weight=config.tat_weight,
+        op_weight=config.op_weight,
         backlog_weight=config.backlog_weight,
+        backlog_growth_enabled=config.backlog_growth_enabled,
+        backlog_growth_horizon=config.backlog_growth_horizon,
+        backlog_growth_scale=config.backlog_growth_scale,
+        backlog_growth_weight=config.backlog_growth_weight,
+        idle_reserve_target=config.idle_reserve_target,
+        idle_reserve_scale=config.idle_reserve_scale,
+        idle_reserve_weight=config.idle_reserve_weight,
         local_predicted_oht_weight=config.local_predicted_oht_weight,
         rail_reward_mode=config.rail_reward_mode,
         rail_free_flow_neutral_ratio=config.rail_free_flow_neutral_ratio,
@@ -367,7 +587,11 @@ def runtime_exp_meta(config) -> dict:
     meta["rail_free_flow_neutral_ratio"] = float(
         reward_config.rail_free_flow_neutral_ratio
     )
-    meta["tat_raw_clip"] = float(reward_config.tat_raw_clip)
+    meta["tat_raw_clip"] = (
+        None
+        if reward_config.tat_raw_clip is None
+        else float(reward_config.tat_raw_clip)
+    )
     meta["tat_confidence_n0"] = float(reward_config.tat_confidence_n0)
     meta["tat_confidence_ramp"] = bool(reward_config.tat_confidence_ramp)
     meta["tat_reference"] = float(reward_config.tat_reference)
@@ -375,6 +599,31 @@ def runtime_exp_meta(config) -> dict:
     meta["op_reference"] = float(reward_config.op_reference)
     meta["op_weight"] = float(reward_config.op_weight)
     meta["backlog_weight"] = float(reward_config.backlog_weight)
+    meta["backlog_growth_enabled"] = bool(
+        reward_config.backlog_growth_enabled
+    )
+    meta["backlog_growth_horizon"] = int(
+        reward_config.backlog_growth_horizon
+    )
+    meta["backlog_growth_scale"] = float(
+        reward_config.backlog_growth_scale
+    )
+    meta["backlog_growth_weight"] = float(
+        reward_config.backlog_growth_weight
+    )
+    meta["idle_reserve_target"] = float(reward_config.idle_reserve_target)
+    meta["idle_reserve_scale"] = float(reward_config.idle_reserve_scale)
+    meta["idle_reserve_weight"] = float(reward_config.idle_reserve_weight)
+    meta["early_stop_tat_threshold"] = float(
+        config.early_stop_tat_threshold
+    )
+    meta["tat_termination_grace_steps"] = int(
+        config.tat_termination_grace_steps
+    )
+    meta["tat_above_threshold_patience"] = int(
+        config.tat_above_threshold_patience
+    )
+    meta["terminal_tat_penalty"] = float(config.terminal_tat_penalty)
     meta["curriculum_end_step"] = int(config.curriculum_end_step)
     meta["replay_capacity_env_steps"] = int(
         config.replay_capacity_env_steps
@@ -414,7 +663,7 @@ def runtime_exp_meta(config) -> dict:
         f"action_mode={action_mode}, dispatch_mode={config.dispatch_mode}, "
         f"critic_loss={config.critic_loss_mode}, "
         "independently initialized Q1/Q2 heads, "
-        f"reward J ({REWARD_VERSION}, global/local="
+        f"reward N ({REWARD_VERSION}, global/local="
         f"{reward_config.global_alpha:g}/{reward_config.local_alpha:g}), "
         "reward_normalizer=removed, fixed_scale=on, "
         f"replay_capacity={int(config.replay_capacity_env_steps)}, "

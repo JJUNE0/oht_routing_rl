@@ -879,3 +879,72 @@ architectural stabilization change is selected.
   `contextual_reward_diagnostic_v15_balanced_neutral2`.
 - `EXP_META.note=neutral2_balanced111_tatup_backlogdown_preddown`. Reward I/J
   checkpoints and replay are rejected; start with a fresh critic and replay.
+
+## 2026-08-07 - Reward L leading-pressure rebalance and diagnostics
+
+- Reward version: `L`; contract version:
+  `contextual_controlled_reward_v14_leading_pressure_rebalanced`.
+- Fixed provisional coefficients are `tat_weight=11.0`, `op_weight=4.0`,
+  `backlog_weight=0.0004`, `local_predicted_oht_weight=0.075`,
+  `rail_tat_weight=30.0`, and `rail_tat_clip=1.0`. Preserved settings include
+  `tat_reference=165.0`, neutral-2 rail reward, actual elapsed-time rail
+  attribution, global/local alpha `0.5/0.5`, local divisor `2.0`, and b_rl
+  smooth weight `0.25`.
+- Added global backlog-growth pressure
+  `-0.16 * clip(max(0, B_t-B_{t-300})/30, 0, 1)` and idle-reserve pressure
+  `-0.20 * clip(max(0, 200-idle)/50, 0, 1)`. Local idle reward remains zero.
+- TAT early termination remains `TotalTat > 170` after the configured minimum
+  episode steps. The final replay transition retains `done=True` and a
+  broadcast terminal penalty of `-2`, excluded from continuous reward budgets.
+- Added final-alpha/divisor contribution budgets using median absolute nonzero
+  active-rail reward for rail calibration, target-band diagnostics, bounded
+  100/300/500/1000-step leading indicators, job-ID arrival/completion flow,
+  route-ratio tails, Welford composite pressure, and constant-memory delayed
+  Pearson correlations at 200/500/1000 steps. Diagnostic schema:
+  `contextual_reward_diagnostic_v16_leading_indicators`.
+- `EXP_META.note=leadreward_tat30_pred20_flow15_idle10_rail18_op7`. Reward L
+  changes the reward contract, so start a fresh critic, target critic, replay,
+  and reward-normalizer/version state; older checkpoints and replay snapshots
+  are rejected by the reward-version guards.
+
+## 2026-08-07 - Compact W&B metric profile
+
+- Added W&B metric schema `contextual_wandb_compact_v1`: the training logger
+  and both exporters now share an exact 86-key allowlist.
+- Kept only the requested environment, action, reward-budget, rail, learner,
+  critic, replay, SALE, 300-step lead, and 500-step lead-lag metrics.
+- Removed all `lap/*`, `dispatch/*`, `burnin/*`, `attention/*`, `boundary/*`,
+  `protocol/*`, and `value/*` metrics from W&B, together with redundant reward,
+  critic, action, and lead variants.
+- This is a logging/export-only change. Rich runtime and JSONL diagnostics stay
+  available for debugging; Reward L, replay compatibility, and checkpoint
+  compatibility are unchanged.
+
+## 2026-08-09 - Reward M one-sided TAT and patient termination
+
+- Reward version: `M`; contract version:
+  `contextual_controlled_reward_v15_tat_one_sided_patience`.
+- Replaced only global TAT reward with
+  `-11 * clip(TotalTat - 160, 0, 10) / 165`; global alpha remains `0.5` and all
+  OP, backlog, backlog-growth, idle-reserve, local, neutral-2 rail, and smooth
+  reward terms remain unchanged.
+- TAT termination is disabled through episode step 9,999, then requires 300
+  consecutive steps at `TotalTat >= 170`. The terminating replay transition
+  stores `done=True` and broadcasts terminal penalty `-20` exactly once.
+- `EXP_META.note=tatonesided_grace10k_patience300_terminal20`. Reward L
+  checkpoints, replay, and normalizer version state are incompatible; start a
+  fresh Reward M run.
+
+## 2026-08-09 - Reward N unbounded one-sided TAT penalty
+
+- Reward version: `N`; contract version:
+  `contextual_controlled_reward_v16_tat_one_sided_unbounded`.
+- Replaced only continuous global TAT with
+  `-11 * max(0, TotalTat - 160) / 165`. It no longer saturates at 170 and the
+  one-sided mode bypasses `tat_raw_clip` (`None` by default).
+- The episode-local 10,000-step grace, `TotalTat >= 170` threshold, 300-step
+  patience, terminal replay broadcast `-20`, and every non-TAT reward term are
+  unchanged.
+- `EXP_META.note=tatonesided_unbounded_grace10k_patience300_terminal20`.
+  Reward M checkpoints, replay, and normalizer version state are incompatible;
+  start a fresh Reward N run.

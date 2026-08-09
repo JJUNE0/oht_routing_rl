@@ -59,6 +59,7 @@ from contextual_reward import (
     ContextualRewardConfig,
 )
 from contextual_reward_diagnostic import (
+    LeadingIndicatorTracker,
     RewardDiagnosticWriter,
     parse_diagnostic_windows,
 )
@@ -92,16 +93,24 @@ class ContextualRuntimeConfig:
     warmup_steps: int = 10_000
     episode_burnin_steps: int = 2_000
     normalizer_freeze_steps: int = 10_000
-    tat_weight: float = 18.4
-    backlog_weight: float = 0.0005
-    local_predicted_oht_weight: float = 0.10
+    tat_weight: float = 11.0
+    op_weight: float = 4.0
+    backlog_weight: float = 0.0004
+    backlog_growth_enabled: bool = True
+    backlog_growth_horizon: int = 300
+    backlog_growth_scale: float = 30.0
+    backlog_growth_weight: float = 0.16
+    idle_reserve_target: float = 200.0
+    idle_reserve_scale: float = 50.0
+    idle_reserve_weight: float = 0.20
+    local_predicted_oht_weight: float = 0.075
     local_reward_scale: float = 2.0
     rail_reward_mode: str = RAIL_REWARD_FREE_FLOW_NEUTRAL_2
     rail_free_flow_neutral_ratio: float = 2.0
     rail_baseline_ratio_reference: float | None = None
-    reward_rail_tat_weight: float = 50.0
+    reward_rail_tat_weight: float = 30.0
     reward_rail_tat_clip: float = 1.0
-    tat_raw_clip: float = 1.0
+    tat_raw_clip: float | None = None
     reward_diagnostic_dir: str | None = None
     reward_diagnostic_windows: str = "0:1000,10000:11000,20000:21000"
     tat_confidence_n0: float = 50.0
@@ -133,8 +142,10 @@ class ContextualRuntimeConfig:
     lap_enabled: bool = True
     critic_loss_mode: str = "auto"
     early_stop_queued_threshold: float = 500.0
-    early_stop_tat_threshold: float = 500.0
-    early_stop_min_episode_steps: int = 100
+    tat_termination_grace_steps: int = 10_000
+    early_stop_tat_threshold: float = 170.0
+    tat_above_threshold_patience: int = 300
+    terminal_tat_penalty: float = -20.0
     max_stale_sim_time_ticks: int = 5
     dispatch_mode: str = DISPATCH_FIRST_MATCH
     minimum_sign_sample_count: int = 100
@@ -201,21 +212,41 @@ class ContextualRuntimeConfig:
             not np.isfinite((
                 self.local_reward_scale,
                 self.tat_weight,
+                self.op_weight,
                 self.backlog_weight,
+                self.backlog_growth_scale,
+                self.backlog_growth_weight,
+                self.idle_reserve_target,
+                self.idle_reserve_scale,
+                self.idle_reserve_weight,
                 self.local_predicted_oht_weight,
                 self.reward_rail_tat_weight,
                 self.reward_rail_tat_clip,
-                self.tat_raw_clip,
             )).all()
             or self.local_reward_scale <= 0
             or self.tat_weight < 0
+            or self.op_weight < 0
             or self.backlog_weight < 0
+            or self.backlog_growth_scale <= 0
+            or self.backlog_growth_weight < 0
+            or self.idle_reserve_target < 0
+            or self.idle_reserve_scale <= 0
+            or self.idle_reserve_weight < 0
             or self.local_predicted_oht_weight < 0
             or self.reward_rail_tat_weight < 0
             or self.reward_rail_tat_clip <= 0
-            or self.tat_raw_clip <= 0
         ):
             raise ValueError("invalid raw reward scaling configuration")
+        if self.tat_raw_clip is not None and (
+            not np.isfinite(self.tat_raw_clip) or self.tat_raw_clip <= 0
+        ):
+            raise ValueError("tat_raw_clip must be positive or None")
+        if (
+            isinstance(self.backlog_growth_horizon, bool)
+            or not isinstance(self.backlog_growth_horizon, Integral)
+            or self.backlog_growth_horizon <= 0
+        ):
+            raise ValueError("backlog_growth_horizon must be a positive integer")
         if self.rail_reward_mode not in RAIL_REWARD_MODES:
             raise ValueError(
                 f"rail_reward_mode must be one of {RAIL_REWARD_MODES}"
@@ -250,11 +281,25 @@ class ContextualRuntimeConfig:
             raise ValueError("training counts/intervals must be positive")
         if (
             self.early_stop_queued_threshold <= 0
+            or not np.isfinite(self.early_stop_tat_threshold)
             or self.early_stop_tat_threshold <= 0
-            or self.early_stop_min_episode_steps < 0
             or self.max_stale_sim_time_ticks <= 0
         ):
             raise ValueError("early-stop/watchdog settings are invalid")
+        if (
+            isinstance(self.tat_termination_grace_steps, bool)
+            or not isinstance(self.tat_termination_grace_steps, Integral)
+            or self.tat_termination_grace_steps < 0
+            or isinstance(self.tat_above_threshold_patience, bool)
+            or not isinstance(self.tat_above_threshold_patience, Integral)
+            or self.tat_above_threshold_patience <= 0
+        ):
+            raise ValueError("TAT termination counts are invalid")
+        if (
+            not np.isfinite(self.terminal_tat_penalty)
+            or self.terminal_tat_penalty > 0.0
+        ):
+            raise ValueError("terminal_tat_penalty must be finite and non-positive")
         if self.rail_tat_diagnostic_max_step < 0:
             raise ValueError(
                 "rail_tat_diagnostic_max_step must be non-negative"
@@ -299,6 +344,8 @@ class ClientAlgorithm:
         self.parameterPassTimes: dict[int, list[float]] = {}
         self.total_steps = 0
         self.episode_steps = 0
+        self.tat_above_threshold_count = 0
+        self._tat_terminal_penalty_applied = False
         self.last_observation = None
         self.last_controlled_action = None
         self.last_policy_action = None
@@ -311,6 +358,7 @@ class ClientAlgorithm:
         self._phase2_good_rewards = deque(maxlen=10_000)
         self._phase2_bad_rewards = deque(maxlen=10_000)
         self._phase2_q_means = deque(maxlen=1_001)
+        self.leading_indicator_tracker = LeadingIndicatorTracker()
         self.reward_builder = None
         self.transition_aligner = None
         self.episode_id = 0
@@ -406,7 +454,21 @@ class ClientAlgorithm:
                         freeze_after_env_steps=self.config.normalizer_freeze_steps,
                         local_reward_scale=self.config.local_reward_scale,
                         tat_weight=self.config.tat_weight,
+                        op_weight=self.config.op_weight,
                         backlog_weight=self.config.backlog_weight,
+                        backlog_growth_enabled=(
+                            self.config.backlog_growth_enabled
+                        ),
+                        backlog_growth_horizon=(
+                            self.config.backlog_growth_horizon
+                        ),
+                        backlog_growth_scale=self.config.backlog_growth_scale,
+                        backlog_growth_weight=(
+                            self.config.backlog_growth_weight
+                        ),
+                        idle_reserve_target=self.config.idle_reserve_target,
+                        idle_reserve_scale=self.config.idle_reserve_scale,
+                        idle_reserve_weight=self.config.idle_reserve_weight,
                         local_predicted_oht_weight=(
                             self.config.local_predicted_oht_weight
                         ),
@@ -460,7 +522,15 @@ class ClientAlgorithm:
                 freeze_after_env_steps=self.config.normalizer_freeze_steps,
                 local_reward_scale=self.config.local_reward_scale,
                 tat_weight=self.config.tat_weight,
+                op_weight=self.config.op_weight,
                 backlog_weight=self.config.backlog_weight,
+                backlog_growth_enabled=self.config.backlog_growth_enabled,
+                backlog_growth_horizon=self.config.backlog_growth_horizon,
+                backlog_growth_scale=self.config.backlog_growth_scale,
+                backlog_growth_weight=self.config.backlog_growth_weight,
+                idle_reserve_target=self.config.idle_reserve_target,
+                idle_reserve_scale=self.config.idle_reserve_scale,
+                idle_reserve_weight=self.config.idle_reserve_weight,
                 local_predicted_oht_weight=(
                     self.config.local_predicted_oht_weight
                 ),
@@ -727,6 +797,10 @@ class ClientAlgorithm:
         self._stale_sim_time_ticks = 0
         self._burnin_last_applied_action = None
         self._burnin_previous_applied_action = None
+        self.tat_above_threshold_count = 0
+        self._tat_terminal_penalty_applied = False
+        if hasattr(self, "leading_indicator_tracker"):
+            self.leading_indicator_tracker.reset_episode()
         if self.transition_aligner is not None:
             self.transition_aligner.reset(self.episode_id)
         if self.reward_builder is not None:
@@ -854,10 +928,14 @@ class ClientAlgorithm:
         self._stale_sim_time_ticks = 0
         self._burnin_last_applied_action = None
         self._burnin_previous_applied_action = None
+        self.tat_above_threshold_count = 0
+        self._tat_terminal_penalty_applied = False
         self.latest_dispatch_live_cost_by_rail = {}
         self.latest_dispatch_cost_tick = None
         self.dispatch_cost_ready = False
         self._reset_dispatch_diagnostics()
+        if hasattr(self, "leading_indicator_tracker"):
+            self.leading_indicator_tracker.reset_episode()
         if self.transition_aligner is not None:
             self.transition_aligner.reset(self.episode_id)
         if self.reward_builder is not None:
@@ -1290,6 +1368,19 @@ class ClientAlgorithm:
             self._enter_training_failure(error)
             return self._baseline_only_result(pclient, baseline)
 
+    def _update_tat_termination(self, total_tat: float) -> bool:
+        if self.episode_steps < self.config.tat_termination_grace_steps:
+            self.tat_above_threshold_count = 0
+            return False
+        if total_tat >= self.config.early_stop_tat_threshold:
+            self.tat_above_threshold_count += 1
+        else:
+            self.tat_above_threshold_count = 0
+        return (
+            self.tat_above_threshold_count
+            >= self.config.tat_above_threshold_patience
+        )
+
     def _algorithm_impl(self, pclient):
         total_start = time.perf_counter()
         self._ensure_initialized(pclient)
@@ -1299,10 +1390,7 @@ class ClientAlgorithm:
         queued = float(getattr(pclient, "QueuedCommandCount", 0) or 0)
         total_tat = float(getattr(pclient, "TotalTat", 0.0) or 0.0)
         done_by_queue = queued > self.config.early_stop_queued_threshold
-        done_by_tat = (
-            total_tat > self.config.early_stop_tat_threshold
-            and self.episode_steps > self.config.early_stop_min_episode_steps
-        )
+        done_by_tat = self._update_tat_termination(total_tat)
         protocol_stalled = (
             self.config.mode == "training" and protocol_stalled
         )
@@ -1355,15 +1443,26 @@ class ClientAlgorithm:
             done=done,
             dispatch=False,
         )
-        if completed is not None and done:
+        if (
+            completed is not None
+            and done_by_tat
+            and not self._tat_terminal_penalty_applied
+        ):
             terminal_total = np.ascontiguousarray(
-                completed.reward.total - 2.0, dtype=np.float32
+                completed.reward.total + self.config.terminal_tat_penalty,
+                dtype=np.float64,
             )
             terminal_total.setflags(write=False)
             completed = replace(
                 completed,
-                reward=replace(completed.reward, total=terminal_total),
+                reward=replace(
+                    completed.reward,
+                    total=terminal_total,
+                    terminal_penalty=self.config.terminal_tat_penalty,
+                ),
             )
+            self.transition_aligner.last_completed = completed
+            self._tat_terminal_penalty_applied = True
 
         timing = {
             "runtime/state_collection_ms": state_collection_ms,
@@ -1759,6 +1858,32 @@ class ClientAlgorithm:
             "oht/loading": float(oht_states.count(3)),
             "oht/unloading": float(oht_states.count(5)),
         })
+        predicted_oht = [
+            float(
+                getattr(
+                    pclient.RAILLINE_DIC[int(rail_id)],
+                    "PredictedOHTCount",
+                    0.0,
+                ) or 0.0
+            )
+            for rail_id in self.topology.controlled_rail_ids
+            if int(rail_id) in getattr(pclient, "RAILLINE_DIC", {})
+        ]
+        self.last_diagnostics.update(
+            self.leading_indicator_tracker.update(
+                pclient,
+                predicted_oht=predicted_oht,
+                route_ratio_diagnostics=(
+                    self.reward_builder.route_ratio_diagnostics()
+                ),
+                idle_reserve_target=(
+                    self.reward_builder.config.idle_reserve_target
+                ),
+                idle_reserve_scale=(
+                    self.reward_builder.config.idle_reserve_scale
+                ),
+            )
+        )
         if completed is not None and self.reward_diagnostic_writer is not None:
             self._write_reward_step_diagnostic(pclient, completed)
             cycle_summary = self.reward_diagnostic_writer.cycle_summary(
@@ -1942,13 +2067,82 @@ class ClientAlgorithm:
             "backlog": batch.backlog,
             "backlog_weight": self.reward_builder.config.backlog_weight,
             "backlog_raw": batch.backlog_raw,
+            "backlog_growth_signal": batch.backlog_growth_signal,
+            "backlog_growth_raw": batch.backlog_growth_raw,
+            "idle_oht_count": batch.idle_oht_count,
+            "idle_reserve_signal": batch.idle_reserve_signal,
+            "idle_reserve_raw": batch.idle_reserve_raw,
             "global_raw": batch.global_raw,
             "global_alpha": self.reward_builder.config.global_alpha,
             "global_component": batch.global_component,
             "global_decomposition_error": abs(
                 batch.global_raw - batch.tat_raw_postclip
-                - batch.op_raw - batch.backlog_raw
+                - batch.op_raw
+                - batch.backlog_raw
+                - batch.backlog_growth_raw
+                - batch.idle_reserve_raw
             ),
+            "tat_component_final": (
+                self.reward_builder.config.global_alpha
+                * batch.tat_raw_postclip
+            ),
+            "op_component_final": (
+                self.reward_builder.config.global_alpha * batch.op_raw
+            ),
+            "backlog_level_component_final": (
+                self.reward_builder.config.global_alpha * batch.backlog_raw
+            ),
+            "backlog_growth_component_final": (
+                self.reward_builder.config.global_alpha
+                * batch.backlog_growth_raw
+            ),
+            "backlog_flow_component_final": (
+                self.reward_builder.config.global_alpha
+                * (batch.backlog_raw + batch.backlog_growth_raw)
+            ),
+            "idle_reserve_component_final": (
+                self.reward_builder.config.global_alpha
+                * batch.idle_reserve_raw
+            ),
+            "current_oht_component_abs_mean": diagnostics.get(
+                "reward/budget/current_oht_abs", 0.0
+            ),
+            "predicted_oht_component_abs_mean": diagnostics.get(
+                "reward/budget/predicted_oht_abs", 0.0
+            ),
+            "stop_component_abs_mean": diagnostics.get(
+                "reward/budget/stop_abs", 0.0
+            ),
+            "capacity_component_abs_mean": diagnostics.get(
+                "reward/budget/capacity_abs", 0.0
+            ),
+            "rail_active_component_representative": diagnostics.get(
+                "reward/budget/rail_active_abs", 0.0
+            ),
+            "rail_overall_component_abs_mean": diagnostics.get(
+                "reward/budget/rail_overall_abs", 0.0
+            ),
+            "smooth_component_abs_mean": diagnostics.get(
+                "reward/budget/smooth_abs", 0.0
+            ),
+            "terminal_penalty": batch.terminal_penalty,
+            "reward_budget_shares": {
+                name: diagnostics.get(f"reward/budget/{name}_share", 0.0)
+                for name in (
+                    "tat",
+                    "predicted_oht",
+                    "backlog_flow",
+                    "idle_reserve",
+                    "rail_active",
+                    "op",
+                    "other",
+                )
+            },
+            "leading_indicator_snapshot": {
+                key: value
+                for key, value in diagnostics.items()
+                if key.startswith("lead/") or key.startswith("leadlag/")
+            },
             "idle_oht_observation_mean": float(
                 batch.idle_oht_observation.mean()
             ),
