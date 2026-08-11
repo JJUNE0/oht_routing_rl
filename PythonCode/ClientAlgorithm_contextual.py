@@ -73,7 +73,7 @@ from contextual_reward_diagnostic import (
     parse_diagnostic_windows,
 )
 from contextual_transition import ContextualTransitionAligner
-from contextual_wandb import ContextualWandbLogger
+from contextual_wandb import ContextualWandbLogger, tat_derived_metrics
 
 
 QUEUED_JOB_STATE = 1
@@ -352,6 +352,7 @@ class ClientAlgorithm:
         self.last_policy_action = None
         self.last_exploratory_action = None
         self.last_diagnostics: dict[str, float] = {}
+        self._episode_accum: dict[str, list[float]] = {}
         self._phase2_global_scales = deque(maxlen=1_000)
         self._phase2_local_scales = deque(maxlen=1_000)
         self._phase2_rail_active_scales = deque(maxlen=100_000)
@@ -930,7 +931,65 @@ class ClientAlgorithm:
             congestion_cost=congestion_cost,
         )
 
+    # Episode aggregates -> (diagnostics key, keep-last instead of averaging).
+    # final_tat is the last observed level because global/tat is a cumulative
+    # within-episode mean that only becomes meaningful at the episode's end.
+    _EPISODE_TRACKED = (
+        ("final_tat", "global/tat", True),
+        ("mean_tat", "global/tat", False),
+        ("b_rl_mean", "b_rl/mean", False),
+        ("b_rl_std", "b_rl/std", False),
+        ("b_rl_level_deviation", "b_rl/level_deviation", False),
+        ("queued_mean", "global/queued", False),
+        ("op_rate_mean", "global/op_rate", False),
+        ("rail_tat_share_mean", "reward/scale/rail_tat_abs_share", False),
+        ("reward_total_mean", "reward/total_mean", False),
+        ("critic_loss_mean", "learner/critic_loss", False),
+    )
+
+    def _accumulate_episode_metrics(self):
+        for name, key, _keep_last in self._EPISODE_TRACKED:
+            value = self.last_diagnostics.get(key)
+            if value is None:
+                continue
+            value = float(value)
+            if not np.isfinite(value):
+                continue
+            self._episode_accum.setdefault(name, []).append(value)
+
+    def _episode_stats(self):
+        stats: dict[str, float | None] = {"steps": float(self.episode_steps)}
+        for name, _key, keep_last in self._EPISODE_TRACKED:
+            samples = self._episode_accum.get(name)
+            if not samples:
+                stats[name] = None
+                continue
+            stats[name] = samples[-1] if keep_last else (
+                sum(samples) / len(samples)
+            )
+        tat_samples = [
+            v for v in self._episode_accum.get("final_tat", []) if v > 0.0
+        ]
+        stats["min_tat"] = min(tat_samples) if tat_samples else None
+        if stats.get("final_tat") is not None and stats["final_tat"] <= 0.0:
+            stats["final_tat"] = None
+        return stats
+
+    def flush_episode_metrics(self):
+        """Emit the current episode's aggregates, then clear the accumulator.
+
+        Called on episode boundaries and again at run end, so the final
+        (possibly partial) episode is never silently dropped.
+        """
+        if not self._episode_accum:
+            return
+        self.wandb_logger.log_episode(
+            self.episode_id, self._episode_stats(), self.total_steps
+        )
+        self._episode_accum = {}
+
     def Reset(self, pclient):
+        self.flush_episode_metrics()
         self.episode_id += 1
         self.episode_steps = 0
         self.last_observation = None
@@ -1870,6 +1929,14 @@ class ClientAlgorithm:
             "oht/loading": float(oht_states.count(3)),
             "oht/unloading": float(oht_states.count(5)),
         })
+        self.last_diagnostics.update(tat_derived_metrics(
+            self.last_diagnostics.get("global/tat", 0.0),
+            b_rl_mean=self.last_diagnostics.get("b_rl/mean"),
+            rail_tat_share=self.last_diagnostics.get(
+                "reward/scale/rail_tat_abs_share"
+            ),
+        ))
+        self._accumulate_episode_metrics()
         if completed is not None and self.reward_diagnostic_writer is not None:
             self._write_reward_step_diagnostic(pclient, completed)
             cycle_summary = self.reward_diagnostic_writer.cycle_summary(
@@ -2249,6 +2316,7 @@ class ClientAlgorithm:
         if self.pending_failure is not None:
             error = self.pending_failure
             self.pending_failure = None
+            self.flush_episode_metrics()
             self.wandb_logger.finish_failed(error, self.failure_env_step)
             raise ContextualTrainingFailure(
                 "contextual training stopped after baseline fallback; "

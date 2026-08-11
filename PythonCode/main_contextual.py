@@ -713,13 +713,18 @@ def main():
                         )
                     print("[main-contextual] session failed; waiting for reconnect")
     except ContextualTrainingFailure as error:
+        client.flush_episode_metrics()
         client.wandb_logger.finish_failed(error, client.failure_env_step)
         raise
     except KeyboardInterrupt:
+        client.flush_episode_metrics()
         client.wandb_logger.finish_interrupted()
         raise
     finally:
         if not client.training_failed:
+            # Idempotent: a no-op if an except path already flushed. Without
+            # this the final, usually partial, episode is never recorded.
+            client.flush_episode_metrics()
             client.wandb_logger.finish_success()
         server.close()
 

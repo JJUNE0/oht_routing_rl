@@ -971,3 +971,44 @@ architectural stabilization change is selected.
   `cost/controlled_ratio_*` diagnostics are not comparable.
 - Validation: full suite 177 passed. No simulator or W&B run was launched for
   this implementation change.
+
+## 2026-08-11 - TAT-first W&B logging
+
+Logging-only change. Reward, action, observation, replay, and learner contracts
+are all unchanged.
+
+Motivated by run `sx4y5spd`: judging it required parsing the raw 2.4 GiB
+`.wandb` file, because the per-episode final TAT was never logged as a metric
+and the run summary carried only `run/status`.
+
+- New per-tick metrics, appended to `WANDB_METRIC_KEYS` so
+  `EXPORT_COLUMNS` picks them up automatically: `tat/level`,
+  `tat/improvement_pct`, `tat/gap_to_target`, `tat/baseline`, `tat/target`,
+  `credit/rail_tat_share`, `b_rl/level_deviation`.
+  `tat/improvement_pct` is signed against the fixed `tat_reference`
+  (174.4236), so the acceptance number is readable directly instead of being
+  computed by hand; `tat/target` is 165.7024.
+- New per-episode metrics on an `episode/index` axis (`EPISODE_METRIC_KEYS`):
+  final/mean/min TAT, improvement percent, target-reached flag, plus the
+  episode's `b_rl` level and spread, queue, op rate, rail-TAT share, reward,
+  and critic loss. `env/tat` is a within-episode cumulative mean, so a
+  per-episode final is the only figure comparable across runs.
+- Best-so-far tracking (`best/episode_tat`, `best/episode_index`,
+  `best/improvement_pct`) and a regression indicator
+  (`trend/tat_per_episode`, `trend/episodes_since_best`).
+- `define_metric` now sets the aggregation per metric, so W&B's auto-summary
+  reports the best episode instead of the last logged value. `env/tat` gets
+  `summary="none"` because neither its last nor its minimum value is a
+  run-level result. Each metric is declared in a single call: a second
+  `define_metric` for the same name replaces the first, which silently dropped
+  `step_metric` in the first draft.
+- `_write_tat_summary` pins the verdict into the run summary at finish:
+  best/last/mean/worst episode TAT, improvement percent, `target_reached`,
+  `gap_to_target`, `episodes_since_best`, and `regressing`.
+- `flush_episode_metrics` is called on episode boundaries and again on every
+  run-end path (success, interrupt, training failure), so the final, usually
+  partial, episode is recorded. It is idempotent, so the `finally` path cannot
+  double-log.
+- Validation: full suite 188 passed, including 11 new cases in
+  `tests/test_contextual_tat_logging.py`. No simulator or W&B run was launched
+  for this change.

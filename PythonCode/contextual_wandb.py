@@ -23,7 +23,7 @@ from contextual_action import (
     EXPLORATION_SCHEDULE_VERSION,
     REGION_B_RL,
     action_version,
-)
+)  # noqa: F401  (B_RL_SPAN is used by _b_rl_action_range)
 from contextual_dispatch import DISPATCH_SELECTION_VERSION
 from contextual_reward import ContextualRewardConfig, REWARD_VERSION
 
@@ -331,6 +331,61 @@ WANDB_METRIC_KEYS += (
     "reward/rail/weighted_preclip_abs_mean", "reward/rail/postclip_abs_mean",
 )
 
+# TAT is the project's acceptance metric, so it gets first-class treatment:
+# an absolute level, the signed improvement against the fixed baseline, and the
+# remaining gap to the -5% target. env/tat alone is easy to misread because it
+# is a within-episode cumulative mean that restarts every episode.
+TAT_BASELINE = float(ContextualRewardConfig().tat_reference)
+TAT_TARGET_IMPROVEMENT = 0.05
+TAT_TARGET = TAT_BASELINE * (1.0 - TAT_TARGET_IMPROVEMENT)
+
+WANDB_METRIC_KEYS += (
+    "tat/level", "tat/improvement_pct", "tat/gap_to_target",
+    "tat/baseline", "tat/target",
+    "credit/rail_tat_share", "b_rl/level_deviation",
+)
+
+# Logged once per finished episode against episode/index, not against env step.
+# A per-episode final TAT is the only comparable number across runs; before
+# this existed it had to be reconstructed by parsing the raw .wandb file.
+EPISODE_METRIC_KEYS = (
+    "episode/index", "episode/steps", "episode/final_tat",
+    "episode/improvement_pct", "episode/mean_tat", "episode/min_tat",
+    "episode/reached_target",
+    "episode/b_rl_mean", "episode/b_rl_std", "episode/b_rl_level_deviation",
+    "episode/queued_mean", "episode/op_rate_mean",
+    "episode/rail_tat_share_mean", "episode/reward_total_mean",
+    "episode/critic_loss_mean",
+    "best/episode_index", "best/episode_tat", "best/improvement_pct",
+    "trend/tat_per_episode", "trend/episodes_since_best",
+)
+
+
+def tat_improvement_pct(level) -> float:
+    """Percent improvement of a TAT level against the fixed baseline."""
+    return 100.0 * (TAT_BASELINE - float(level)) / TAT_BASELINE
+
+
+def tat_derived_metrics(level, *, b_rl_mean=None, rail_tat_share=None) -> dict:
+    """Per-tick TAT-centric metrics that need no post-hoc reconstruction."""
+    level = float(level)
+    result = {
+        "tat/level": level,
+        "tat/baseline": TAT_BASELINE,
+        "tat/target": TAT_TARGET,
+    }
+    if level > 0.0:
+        result["tat/improvement_pct"] = tat_improvement_pct(level)
+        result["tat/gap_to_target"] = level - TAT_TARGET
+    if b_rl_mean is not None:
+        # |b_mean - neutral|: how far the cross-rail level has drifted from the
+        # neutral action. Tracked because the level is a degree of freedom the
+        # fixed-b sweep already answered, so drift is pure loss.
+        result["b_rl/level_deviation"] = abs(float(b_rl_mean) - B_RL_NEUTRAL)
+    if rail_tat_share is not None:
+        result["credit/rail_tat_share"] = float(rail_tat_share)
+    return result
+
 
 def runtime_exp_meta(config) -> dict:
     meta = dict(EXP_META)
@@ -478,6 +533,8 @@ class ContextualWandbLogger:
         self.enabled = bool(config.wandb_enabled)
         self.run = None
         self._finished = False
+        self._episode_finals: list[tuple[int, float]] = []
+        self._best_episode: tuple[int, float] | None = None
         if not self.enabled:
             return
         import wandb
@@ -507,6 +564,44 @@ class ContextualWandbLogger:
             name=_make_run_name(meta),
             notes=meta["description"],
         )
+        self._define_metrics()
+
+    def _define_metrics(self):
+        """Make W&B's auto-summary report the right aggregate per metric.
+
+        Without this every summary value is simply the last logged one, which
+        for TAT means whatever the final partial episode happened to be - not
+        the best result the run achieved.
+        """
+        if self.run is None:
+            return
+        # One call per metric: a second define_metric for the same name
+        # replaces the first, so step_metric and summary must be set together.
+        specs: dict[str, dict[str, object]] = {
+            key: {"step_metric": "episode/index"}
+            for key in EPISODE_METRIC_KEYS
+        }
+        summaries = {
+            "episode/final_tat": "min",
+            "episode/improvement_pct": "max",
+            "episode/reached_target": "max",
+            "best/episode_tat": "min",
+            "best/improvement_pct": "max",
+            "tat/improvement_pct": "max",
+            "tat/gap_to_target": "min",
+            "credit/rail_tat_share": "mean",
+            # A within-episode cumulative mean: neither last nor min is
+            # meaningful as a run-level number, so suppress the auto-summary.
+            "env/tat": "none",
+        }
+        for key, summary in summaries.items():
+            specs.setdefault(key, {})["summary"] = summary
+        try:
+            for key, spec in specs.items():
+                self.run.define_metric(key, **spec)
+        except Exception:
+            # Never let metric bookkeeping take down a 40-hour run.
+            pass
 
     def log(self, diagnostics, step):
         if self.run is None:
@@ -518,6 +613,67 @@ class ContextualWandbLogger:
         }
         self.run.log(payload, step=int(step))
 
+    def log_episode(self, episode_index, stats, step):
+        """Log one finished episode and update the best-so-far record.
+
+        `stats` carries the episode aggregates; final_tat is the number that is
+        comparable across runs and against the baseline.
+        """
+        final_tat = stats.get("final_tat")
+        if final_tat is not None and float(final_tat) > 0.0:
+            final_tat = float(final_tat)
+            self._episode_finals.append((int(episode_index), final_tat))
+            if self._best_episode is None or final_tat < self._best_episode[1]:
+                self._best_episode = (int(episode_index), final_tat)
+        else:
+            final_tat = None
+        if self.run is None:
+            return
+        payload = {
+            "episode/index": int(episode_index),
+            "episode/steps": float(stats.get("steps", 0.0)),
+        }
+        for name in (
+            "mean_tat", "min_tat", "b_rl_mean", "b_rl_std",
+            "b_rl_level_deviation", "queued_mean", "op_rate_mean",
+            "rail_tat_share_mean", "reward_total_mean", "critic_loss_mean",
+        ):
+            if stats.get(name) is not None:
+                payload[f"episode/{name}"] = float(stats[name])
+        if final_tat is not None:
+            payload["episode/final_tat"] = final_tat
+            payload["episode/improvement_pct"] = tat_improvement_pct(final_tat)
+            payload["episode/reached_target"] = float(final_tat <= TAT_TARGET)
+        if self._best_episode is not None:
+            best_index, best_tat = self._best_episode
+            payload["best/episode_index"] = int(best_index)
+            payload["best/episode_tat"] = best_tat
+            payload["best/improvement_pct"] = tat_improvement_pct(best_tat)
+            payload["trend/episodes_since_best"] = float(
+                int(episode_index) - int(best_index)
+            )
+        slope = self._tat_trend()
+        if slope is not None:
+            payload["trend/tat_per_episode"] = slope
+        try:
+            self.run.log(payload, step=int(step))
+        except Exception:
+            pass
+
+    def _tat_trend(self):
+        """Least-squares TAT-per-episode slope; positive means regressing."""
+        if len(self._episode_finals) < 3:
+            return None
+        x = [float(i) for i, _ in self._episode_finals]
+        y = [t for _, t in self._episode_finals]
+        n = float(len(x))
+        mx = sum(x) / n
+        my = sum(y) / n
+        denom = sum((v - mx) ** 2 for v in x)
+        if denom <= 0.0:
+            return None
+        return sum((a - mx) * (b - my) for a, b in zip(x, y)) / denom
+
     def _finish(self, status, *, reason=None, step=None):
         if self.run is None or self._finished:
             return
@@ -528,10 +684,46 @@ class ContextualWandbLogger:
                 self.run.summary["run/failure_reason"] = str(reason)
             if step is not None:
                 self.run.summary["run/failure_step"] = int(step)
+            self._write_tat_summary()
             self.run.finish()
         except Exception:
             # Logging must never mask the runtime/learner exception.
             pass
+
+    def _write_tat_summary(self):
+        """Pin the run's headline TAT result into the summary.
+
+        Every run should end with its verdict readable without opening a chart:
+        the best episode TAT, its improvement against the baseline, whether the
+        -5% target was met, and whether the run was still improving or already
+        regressing when it stopped.
+        """
+        if self.run is None:
+            return
+        summary = self.run.summary
+        summary["tat/baseline"] = TAT_BASELINE
+        summary["tat/target"] = TAT_TARGET
+        summary["summary/episodes_completed"] = len(self._episode_finals)
+        if not self._episode_finals:
+            summary["summary/target_reached"] = 0.0
+            return
+        best_index, best_tat = self._best_episode
+        last_index, last_tat = self._episode_finals[-1]
+        summary["summary/best_episode_tat"] = best_tat
+        summary["summary/best_episode_index"] = int(best_index)
+        summary["summary/best_improvement_pct"] = tat_improvement_pct(best_tat)
+        summary["summary/last_episode_tat"] = last_tat
+        summary["summary/last_improvement_pct"] = tat_improvement_pct(last_tat)
+        summary["summary/target_reached"] = float(best_tat <= TAT_TARGET)
+        summary["summary/gap_to_target"] = best_tat - TAT_TARGET
+        summary["summary/episodes_since_best"] = int(last_index - best_index)
+        finals = [t for _, t in self._episode_finals]
+        summary["summary/mean_episode_tat"] = sum(finals) / len(finals)
+        summary["summary/worst_episode_tat"] = max(finals)
+        slope = self._tat_trend()
+        if slope is not None:
+            summary["summary/tat_per_episode"] = slope
+            summary["summary/regressing"] = float(slope > 0.0)
 
     def finish_success(self):
         self._finish("completed")
