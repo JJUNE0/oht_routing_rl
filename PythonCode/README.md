@@ -122,22 +122,22 @@ results. W&B and optional reward JSONL record representative global, local,
 active-rail scales, good/bad reward signs, clipping, and Q-mean deltas for the
 next calibration pass. Reward I/J checkpoints and replay are incompatible.
 
-## Reward N unbounded one-sided TAT penalty
+## Reward Q: Reward N pressure ablation without idle reserve
 
-The current fresh-run contract keeps Reward M except for continuous TAT. Global
-TAT reward is `-11 * max(0, TotalTat - 160) / 165`, so it is zero through 160
-and decreases linearly without saturation above 160. `tat_raw_clip` is disabled
-for this mode, including beyond the termination threshold. TAT termination is
-still disabled for the first 10,000 episode-local steps, then requires 300
-consecutive steps at `TotalTat >= 170`; the final replay transition broadcasts
-`-20` once with `done=True`. Fixed provisional coefficients remain
-`tat_weight=11`, `op_weight=4`,
-`backlog_weight=0.0004`, `local_predicted_oht_weight=0.075`, and
-`rail_tat_weight=30` with clip `1`. Backlog growth over 300 steps and a
-penalty-only global idle reserve below 200 OHTs are the only new reward terms.
-All other leading, distribution, flow, route-tail, composite, and delayed
-correlation signals are diagnostic-only. Reward N requires a fresh critic,
-target critic, replay, and reward-version state.
+Reward Q preserves the reward function used by W&B run `9qokskqq`: the global
+TAT raw term is the one-sided, unbounded
+`-11 * max(0, TotalTat - 160) / 165`, with no `tat_raw_clip`. For
+`B_t = Queued_t + Waiting_t`, its global raw reward is
+`tat_raw + 4*(0.8-OP) - 0.0008*B_t`
+`- 0.24*clip(max(0, B_t-B_{t-300})/30, 0, 1)`. The idle-reserve term is
+disabled with `idle_reserve_weight=0.0`; global alpha remains `0.5`.
+
+The ablation uses `local_predicted_oht_weight=0.10`, `rail_tat_weight=40`,
+`rail_tat_clip=1`, local divisor `2`, and smooth weight `0.25`. It restores the
+actual `9qokskqq` termination configuration: 10,000-step episode grace,
+`TotalTat >= 200` for 300 consecutive steps, then one replayed terminal
+penalty of `-20`. Reward Q requires fresh critic, target critic, replay, and
+reward-version state.
 
 실행 후 simulator GUI에서 Python 연동을 활성화하고 Run을 시작합니다.
 

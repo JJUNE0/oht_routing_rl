@@ -257,7 +257,7 @@ def parse_args():
     parser.add_argument("--wandb-log-interval", type=int, default=10)
     parser.add_argument("--console-log-interval", type=int, default=100)
     parser.add_argument("--early-stop-queued-threshold", type=float, default=500.0)
-    parser.add_argument("--early-stop-tat-threshold", type=float, default=170.0)
+    parser.add_argument("--early-stop-tat-threshold", type=float, default=200.0)
     parser.add_argument("--tat-termination-grace-steps", type=int, default=10_000)
     parser.add_argument("--tat-above-threshold-patience", type=int, default=300)
     parser.add_argument("--max-stale-sim-time-ticks", type=int, default=5)
@@ -567,6 +567,11 @@ def main():
         f"local_reward_scale={client.config.local_reward_scale}, "
         f"rail_tat_weight={client.config.reward_rail_tat_weight}, "
         f"rail_tat_clip={client.config.reward_rail_tat_clip}, "
+        "tat_termination="
+        f"{client.config.early_stop_tat_threshold:g}x"
+        f"{client.config.tat_above_threshold_patience} after "
+        f"{client.config.tat_termination_grace_steps}, "
+        f"terminal_tat_penalty={client.config.terminal_tat_penalty:g}, "
         f"use_tat_confidence={client.config.tat_confidence_ramp}, "
         f"replay_sampling={client.config.replay_sampling_mode}, "
         f"batch_size={client.config.batch_size}, "

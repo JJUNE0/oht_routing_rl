@@ -17,9 +17,8 @@ from contextual_reward_diagnostic import RewardDiagnosticWriter
 from contextual_topology import ContextualTopology
 
 REWARD_VERSION = (
-    "contextual_controlled_reward_v16_tat_one_sided_unbounded"
+    "contextual_controlled_reward_v19_n_pressure_ablation_no_idle"
 )
-
 TAT_PENALTY_START = 160.0
 
 RAIL_REWARD_FIXED_TAT_REFERENCE = "fixed_tat_reference"
@@ -51,7 +50,7 @@ class ContextualRewardError(RuntimeError):
 class ContextualRewardConfig:
     global_alpha: float = 0.5
     local_alpha: float = 0.5
-    rail_tat_weight: float = 30.0
+    rail_tat_weight: float = 40.0
     rail_reward_mode: str = RAIL_REWARD_FREE_FLOW_NEUTRAL_2
     rail_free_flow_neutral_ratio: float = 2.0
     rail_baseline_ratio_reference: float | None = None
@@ -60,15 +59,15 @@ class ContextualRewardConfig:
     smooth_exp_residual_weight: float = 0.5
     tat_weight: float = 11.0
     op_weight: float = 4.0
-    backlog_weight: float = 0.0004
+    backlog_weight: float = 0.0008
     backlog_growth_enabled: bool = True
     backlog_growth_horizon: int = 300
     backlog_growth_scale: float = 30.0
-    backlog_growth_weight: float = 0.16
+    backlog_growth_weight: float = 0.24
     idle_reserve_target: float = 200.0
     idle_reserve_scale: float = 50.0
-    idle_reserve_weight: float = 0.20
-    local_predicted_oht_weight: float = 0.075
+    idle_reserve_weight: float = 0.0
+    local_predicted_oht_weight: float = 0.10
     use_tat: bool = True
     use_op: bool = True
     use_backlog: bool = True
@@ -480,11 +479,10 @@ class ContextualRewardBuilder:
         tat_raw_preclip = (
             cfg.tat_weight * tat_error if cfg.use_tat else 0.0
         )
-        # The one-sided TAT mode deliberately bypasses tat_raw_clip so its
-        # continuous pressure remains active above the termination threshold.
+        # Reward Q preserves 9qokskqq/Reward N's one-sided, unbounded TAT
+        # pressure. tat_raw_clip remains None so pressure continues above the
+        # termination threshold instead of saturating.
         tat_raw_postclip = float(tat_raw_preclip)
-        # Reward N never gates global TAT by completed-command count. Keep the
-        # compatibility diagnostic fields, but they are identity-valued.
         tat_confidence = float(tat_signal_available)
         tat_raw_ramped = tat_raw_postclip
         op_delta = (

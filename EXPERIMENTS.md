@@ -948,3 +948,90 @@ architectural stabilization change is selected.
 - `EXP_META.note=tatonesided_unbounded_grace10k_patience300_terminal20`.
   Reward M checkpoints, replay, and normalizer version state are incompatible;
   start a fresh Reward N run.
+
+## 2026-08-10 - Reward O restores K plus backlog growth
+
+- Reward version: `O`; contract version:
+  `contextual_controlled_reward_v17_k_backlog_growth`.
+- Restored Reward K's symmetric clipped TotalTat term and coefficients:
+  `tat_reference=174.4236`, `tat_weight=18.4`, `tat_raw_clip=1.0`,
+  `op_weight=5.0`, `backlog_weight=0.0005`,
+  `local_predicted_oht_weight=0.10`, `local_reward_scale=2.0`,
+  `rail_tat_weight=50.0`, `rail_tat_clip=1.0`, and smooth weight `0.25`.
+- Added only backlog-growth raw reward
+  `-0.16 * clip(max(0, B_t-B_{t-300})/30, 0, 1)`, where
+  `B_t=Queued_t+Waiting_t`. Global alpha `0.5` bounds its final contribution
+  to `[-0.08, 0]`; episode reset clears the backlog history.
+- Disabled idle-reserve reward (`idle_reserve_weight=0.0`), all TAT early
+  termination, and terminal TAT penalties. The simulator default remains the
+  fixed 45,000-step horizon; queue and protocol fail-safe termination remain.
+- Preserved the Reward K action curriculum, exploration schedule, neutral-2
+  rail reward, SALE/LAP/replay/dispatch defaults, and compact W&B metric schema.
+- `EXP_META.note=k_backloggrowth300`. Reward N and all older checkpoints,
+  replay, and reward-version state are incompatible; start a fresh Reward O
+  run.
+
+## 2026-08-10 - Reward O warmup inference optimization
+
+- Kept the Reward O formula, action schedule, and replay warmup unchanged.
+- Fresh training runs now skip unused actor/encoder inference while
+  `total_steps < warmup_steps`; replay continues to store the baseline-applied
+  transitions, with zero diagnostic `policy_action` during that interval.
+- Actor inference still runs at the warmup boundary, in `actor_inference` mode,
+  and during episode burn-in when a trained checkpoint policy is available.
+- `EXP_META.note=k_backloggrowth300_fastwarmup`.
+
+## 2026-08-11 - Reward P Reward-N pressure ablation
+
+- Reward version: `P`; contract version:
+  `contextual_controlled_reward_v18_n_pressure_ablation`.
+- Preserved the actual `9qokskqq` Reward N function:
+  `-11 * max(0, TotalTat-160) / 165`, no TAT raw clipping, global/local alpha
+  `0.5/0.5`, local divisor `2`, neutral-2 rail attribution, and b_rl smooth
+  weight `0.25`.
+- Preserved the run's actual termination config: 10,000-step episode grace,
+  `TotalTat >= 200` for 300 consecutive steps, and terminal replay broadcast
+  `-20`. This intentionally follows W&B config rather than the stale 170
+  threshold text in that run's description.
+- Ablation coefficients: `tat_weight=11`, `op_weight=4`,
+  `backlog_weight=0.0008`, `backlog_growth_horizon=300`,
+  `backlog_growth_scale=30`, `backlog_growth_weight=0.24`,
+  `idle_reserve_weight=0.20`, `local_predicted_oht_weight=0.10`, and
+  `rail_tat_weight=40` with clip `1`.
+- Preserved the Reward O warmup inference optimization: replay collection
+  continues during fresh-run warmup while unused actor/encoder inference is
+  skipped.
+- `EXP_META.note=n_ablate_backlog08_growth24_pred10_rail40`. Reward O and all
+  older checkpoints, replay, and reward-version state are incompatible; start
+  a fresh Reward P run.
+
+## 2026-08-11 - Reward Q disables idle-reserve pressure
+
+- Reward version: `Q`; contract version:
+  `contextual_controlled_reward_v19_n_pressure_ablation_no_idle`.
+- Preserved Reward P's one-sided unbounded TAT function, OP and backlog
+  pressure, backlog-growth term, predicted-OHT weight `0.10`, rail weight `40`,
+  smoothing, exploration, and actual `9qokskqq` TAT termination contract.
+- Changed only `idle_reserve_weight=0.20 -> 0.0`, so idle-reserve observations
+  remain available for diagnostics but contribute exactly zero reward.
+- `EXP_META.note=n_ablate_backlog08_growth24_pred10_rail40_noidle`. Reward P
+  and all older checkpoints, replay, and reward-version state are incompatible;
+  start a fresh Reward Q run.
+
+## 2026-08-11 - Episode-local parameterDw reset
+
+- Baseline-state version: `parameter_dw_episode_reset_v1`; reward remains `Q`
+  because the reward formula is unchanged.
+- `ClientAlgorithm_contextual.Reset()` now clears `parameterDw`,
+  `parameterPassTimes`, and `parameterC`. The next active snapshot initializes
+  every rail's delay estimator from the common `1.0` prior before incorporating
+  only post-reset pass-time observations.
+- This removes policy-dependent delay estimates carried from episode N into
+  episode N+1. `parameterDw` remains an observation feature and still directly
+  scales the baseline congestion cost within an episode; observation shape,
+  action mapping, reward, learner, and replay schemas are unchanged.
+- The baseline-state version is included in the runtime/checkpoint variant, so
+  carry-over-era checkpoints are incompatible. Start a fresh run without old
+  replay or frozen observation-normalizer state.
+- `EXP_META.note=n_ablate_backlog08_growth24_pred10_rail40_noidle_dwreset`.
+  No simulator or W&B run was launched for this implementation change.

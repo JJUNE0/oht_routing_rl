@@ -26,7 +26,7 @@ EXP_META = {
     "action_range": "b_rl_0.0-1.0",
     "topology": "directed_10in_10out_controlled_centers_v2",
     "observation": "contextual_obs_controlled_v1",
-    "reward_version": "N",
+    "reward_version": "Q",
     "reward_contract_version": REWARD_VERSION,
     "calibration_status": "provisional",
     "reward_global_alpha": 0.5,
@@ -36,19 +36,19 @@ EXP_META = {
     "tat_penalty_start": 160.0,
     "op_reference": 0.80,
     "op_weight": 4.0,
-    "backlog_weight": 0.0004,
+    "backlog_weight": 0.0008,
     "backlog_growth_enabled": True,
     "backlog_growth_horizon": 300,
     "backlog_growth_scale": 30.0,
-    "backlog_growth_weight": 0.16,
+    "backlog_growth_weight": 0.24,
     "idle_reserve_target": 200.0,
     "idle_reserve_scale": 50.0,
-    "idle_reserve_weight": 0.20,
-    "local_predicted_oht_weight": 0.075,
+    "idle_reserve_weight": 0.0,
+    "local_predicted_oht_weight": 0.10,
     "local_reward_scale": 2.0,
     "rail_reward_mode": "free_flow_neutral_2",
     "rail_free_flow_neutral_ratio": 2.0,
-    "rail_tat_weight": 30.0,
+    "rail_tat_weight": 40.0,
     "rail_tat_clip": 1.0,
     "tat_raw_clip": None,
     "tat_confidence_ramp": False,
@@ -61,6 +61,7 @@ EXP_META = {
     "checkpoint_rng_version": "exploration_rng_v2",
     "checkpoint_directory_version": "contextual_checkpoint_dir_slug_v1",
     "episode_burnin_version": "deterministic_policy_burnin_v1",
+    "parameter_dw_state_version": "parameter_dw_episode_reset_v1",
     "send_cost_logging_version": "post_send_v2",
     "protocol_version": "single_end_time_v2",
     "diagnostic_schema_version": (
@@ -76,17 +77,22 @@ EXP_META = {
     ),
     "centering": False,
     "replay_sampling_version": REPLAY_SAMPLING_VERSION,
+    "tat_early_termination": True,
     "tat_termination_grace_steps": 10_000,
-    "early_stop_tat_threshold": 170.0,
+    "early_stop_tat_threshold": 200.0,
     "tat_above_threshold_patience": 300,
     "terminal_tat_penalty": -20.0,
-    "note": "tatonesided_unbounded_grace10k_patience300_terminal20",
+    "note": "n_ablate_backlog08_growth24_pred10_rail40_noidle_dwreset",
     "description": (
-        "Reward N changes only Reward M continuous TAT behavior: global TAT "
-        "is a one-sided linear penalty above 160 with no saturation and no "
-        "tat_raw_clip. The 10,000-step grace, 170 threshold, 300-step "
-        "patience, replayed terminal -20, and all non-TAT Reward M terms are "
-        "unchanged."
+        "Reward Q preserves 9qokskqq/Reward N's one-sided unbounded TAT "
+        "penalty above 160 and its actual 10,000-step grace, TAT 200, "
+        "300-step patience, terminal -20 contract. The ablation changes only "
+        "backlog level 0.0004->0.0008, backlog growth 0.16->0.24, predicted "
+        "OHT 0.075->0.10, rail weight 30->40, and disables idle-reserve "
+        "pressure (0.20->0.0); TAT 11 and OP 4 remain fixed. Episode reset "
+        "clears parameterDw and its baseline-estimator buffers so each "
+        "episode starts from the same estimator prior. "
+        "Fresh-run warmup skips unused inference."
     ),
 }
 
@@ -614,6 +620,7 @@ def runtime_exp_meta(config) -> dict:
     meta["idle_reserve_target"] = float(reward_config.idle_reserve_target)
     meta["idle_reserve_scale"] = float(reward_config.idle_reserve_scale)
     meta["idle_reserve_weight"] = float(reward_config.idle_reserve_weight)
+    meta["tat_early_termination"] = True
     meta["early_stop_tat_threshold"] = float(
         config.early_stop_tat_threshold
     )
@@ -663,7 +670,7 @@ def runtime_exp_meta(config) -> dict:
         f"action_mode={action_mode}, dispatch_mode={config.dispatch_mode}, "
         f"critic_loss={config.critic_loss_mode}, "
         "independently initialized Q1/Q2 heads, "
-        f"reward N ({REWARD_VERSION}, global/local="
+        f"reward Q ({REWARD_VERSION}, global/local="
         f"{reward_config.global_alpha:g}/{reward_config.local_alpha:g}), "
         "reward_normalizer=removed, fixed_scale=on, "
         f"replay_capacity={int(config.replay_capacity_env_steps)}, "

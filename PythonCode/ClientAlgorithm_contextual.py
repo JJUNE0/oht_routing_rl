@@ -69,6 +69,7 @@ from contextual_wandb import ContextualWandbLogger
 
 QUEUED_JOB_STATE = 1
 IDLE_OHT_STATE = 0
+PARAMETER_DW_STATE_VERSION = "parameter_dw_episode_reset_v1"
 
 
 class ContextualTrainingFailure(RuntimeError):
@@ -91,24 +92,24 @@ class ContextualRuntimeConfig:
     smooth_b_rl_weight: float = 0.25
     smooth_exp_residual_weight: float = 0.5
     warmup_steps: int = 10_000
-    episode_burnin_steps: int = 2_000
+    episode_burnin_steps: int = 0
     normalizer_freeze_steps: int = 10_000
     tat_weight: float = 11.0
     op_weight: float = 4.0
-    backlog_weight: float = 0.0004
+    backlog_weight: float = 0.0008
     backlog_growth_enabled: bool = True
     backlog_growth_horizon: int = 300
     backlog_growth_scale: float = 30.0
-    backlog_growth_weight: float = 0.16
+    backlog_growth_weight: float = 0.24
     idle_reserve_target: float = 200.0
     idle_reserve_scale: float = 50.0
-    idle_reserve_weight: float = 0.20
-    local_predicted_oht_weight: float = 0.075
+    idle_reserve_weight: float = 0.0
+    local_predicted_oht_weight: float = 0.10
     local_reward_scale: float = 2.0
     rail_reward_mode: str = RAIL_REWARD_FREE_FLOW_NEUTRAL_2
     rail_free_flow_neutral_ratio: float = 2.0
     rail_baseline_ratio_reference: float | None = None
-    reward_rail_tat_weight: float = 30.0
+    reward_rail_tat_weight: float = 40.0
     reward_rail_tat_clip: float = 1.0
     tat_raw_clip: float | None = None
     reward_diagnostic_dir: str | None = None
@@ -143,7 +144,7 @@ class ContextualRuntimeConfig:
     critic_loss_mode: str = "auto"
     early_stop_queued_threshold: float = 500.0
     tat_termination_grace_steps: int = 10_000
-    early_stop_tat_threshold: float = 170.0
+    early_stop_tat_threshold: float = 200.0
     tat_above_threshold_patience: int = 300
     terminal_tat_penalty: float = -20.0
     max_stale_sim_time_ticks: int = 5
@@ -299,7 +300,9 @@ class ContextualRuntimeConfig:
             not np.isfinite(self.terminal_tat_penalty)
             or self.terminal_tat_penalty > 0.0
         ):
-            raise ValueError("terminal_tat_penalty must be finite and non-positive")
+            raise ValueError(
+                "terminal_tat_penalty must be finite and non-positive"
+            )
         if self.rail_tat_diagnostic_max_step < 0:
             raise ValueError(
                 "rail_tat_diagnostic_max_step must be non-negative"
@@ -419,7 +422,7 @@ class ClientAlgorithm:
     def runtime_variant(self):
         base = (
             f"{ALGORITHM_VERSION}_{self.algorithm_variant}_"
-            f"{self.action_version}"
+            f"{self.action_version}_{PARAMETER_DW_STATE_VERSION}"
         )
         if self.config.replay_sampling_mode == REPLAY_SAMPLING_RAIL:
             return base
@@ -614,6 +617,7 @@ class ClientAlgorithm:
                     "algorithm_version": self.runtime_variant,
                     "action_mode": self.config.action_mode,
                     "action_version": self.action_version,
+                    "parameter_dw_state_version": PARAMETER_DW_STATE_VERSION,
                     "action_scale": self.config.action_scale,
                     "curriculum_end_step": self.config.curriculum_end_step,
                     "curriculum_scale_start": (
@@ -711,6 +715,7 @@ class ClientAlgorithm:
             "critic_loss_mode": self.config.critic_loss_mode,
             "action_mode": self.config.action_mode,
             "action_version": self.action_version,
+            "parameter_dw_state_version": PARAMETER_DW_STATE_VERSION,
             "dispatch_mode": self.config.dispatch_mode,
             "dispatch_selection_version": DISPATCH_SELECTION_VERSION,
             "action_scale": self.config.action_scale,
@@ -919,6 +924,8 @@ class ClientAlgorithm:
     def Reset(self, pclient):
         self.episode_id += 1
         self.episode_steps = 0
+        self.tat_above_threshold_count = 0
+        self._tat_terminal_penalty_applied = False
         self.last_observation = None
         self.last_controlled_action = None
         self.last_policy_action = None
@@ -928,8 +935,11 @@ class ClientAlgorithm:
         self._stale_sim_time_ticks = 0
         self._burnin_last_applied_action = None
         self._burnin_previous_applied_action = None
-        self.tat_above_threshold_count = 0
-        self._tat_terminal_penalty_applied = False
+        # Delay-estimator state is episode-local because it affects both the
+        # actor observation and the baseline congestion cost.
+        self.parameterDw.clear()
+        self.parameterPassTimes.clear()
+        self.parameterC.clear()
         self.latest_dispatch_live_cost_by_rail = {}
         self.latest_dispatch_cost_tick = None
         self.dispatch_cost_ready = False
@@ -1480,7 +1490,13 @@ class ClientAlgorithm:
             self.config.mode == "actor_inference"
             or (
                 self.config.mode == "training"
-                and (not burnin_active or has_trained_policy)
+                and (
+                    (burnin_active and has_trained_policy)
+                    or (
+                        not burnin_active
+                        and self.total_steps >= self.config.warmup_steps
+                    )
+                )
             )
         )
         if use_actor:
