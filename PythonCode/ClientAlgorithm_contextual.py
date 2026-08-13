@@ -56,8 +56,9 @@ from contextual_observation import (
 )
 from contextual_topology import load_cached_contextual_topology
 from contextual_reward import (
-    RAIL_REWARD_FREE_FLOW_NEUTRAL_2,
+    RAIL_REWARD_FIXED_TAT_REFERENCE,
     RAIL_REWARD_MODES,
+    REWARD_CONTRACT_VERSION,
     REWARD_VERSION,
     ContextualRewardBuilder,
     ContextualRewardConfig,
@@ -95,28 +96,37 @@ class ContextualRuntimeConfig:
     curriculum_scale_start: float = 0.05
     curriculum_scale_end: float = 1.0
     curriculum_shape: str = "geometric"
-    smooth_b_rl_weight: float = 0.25
+    smooth_b_rl_weight: float = 0.05
     smooth_exp_residual_weight: float = 0.5
     warmup_steps: int = 10_000
     episode_burnin_steps: int = 0
     normalizer_freeze_steps: int = 10_000
-    tat_weight: float = 5.5
-    op_weight: float = 4.0
-    backlog_weight: float = 0.0048
-    backlog_growth_enabled: bool = True
+    reward_normalizer_freeze_steps: int = 30_000
+    tat_reference: float = 165.0
+    tat_weight: float = 9.2
+    tat_one_sided: bool = False
+    op_weight: float = 0.0
+    use_op: bool = False
+    backlog_weight: float = 0.01
+    backlog_growth_enabled: bool = False
     backlog_growth_horizon: int = 300
     backlog_growth_scale: float = 30.0
-    backlog_growth_weight: float = 0.10
+    backlog_growth_weight: float = 0.0
     idle_reserve_target: float = 200.0
     idle_reserve_scale: float = 50.0
     idle_reserve_weight: float = 0.0
-    local_predicted_oht_weight: float = 0.10
-    local_reward_scale: float = 0.5
-    rail_reward_mode: str = RAIL_REWARD_FREE_FLOW_NEUTRAL_2
+    local_oht_weight: float = 0.3
+    local_predicted_oht_weight: float = 0.2
+    local_stop_weight: float = 0.3
+    local_idle_weight: float = 0.1
+    local_capacity_weight: float = 0.1
+    local_fixed_scale_enabled: bool = False
+    local_reward_scale: float = 1.0
+    rail_reward_mode: str = RAIL_REWARD_FIXED_TAT_REFERENCE
     rail_free_flow_neutral_ratio: float = 2.0
     rail_baseline_ratio_reference: float | None = None
-    reward_rail_tat_weight: float = 85.0
-    reward_rail_tat_clip: float = 1.0
+    reward_rail_tat_weight: float = 1.0
+    reward_rail_tat_clip: float | None = None
     tat_raw_clip: float | None = None
     reward_diagnostic_dir: str | None = None
     reward_diagnostic_windows: str = "0:1000,10000:11000,20000:21000"
@@ -204,6 +214,7 @@ class ContextualRuntimeConfig:
             self.warmup_steps < 0
             or self.episode_burnin_steps < 0
             or self.normalizer_freeze_steps < 0
+            or self.reward_normalizer_freeze_steps < 0
         ):
             raise ValueError("warmup/burn-in/freeze steps must be non-negative")
         if self.mode == "training" and self.action_scale <= 0:
@@ -224,6 +235,7 @@ class ContextualRuntimeConfig:
         if (
             not np.isfinite((
                 self.local_reward_scale,
+                self.tat_reference,
                 self.tat_weight,
                 self.op_weight,
                 self.backlog_weight,
@@ -232,11 +244,15 @@ class ContextualRuntimeConfig:
                 self.idle_reserve_target,
                 self.idle_reserve_scale,
                 self.idle_reserve_weight,
+                self.local_oht_weight,
                 self.local_predicted_oht_weight,
+                self.local_stop_weight,
+                self.local_idle_weight,
+                self.local_capacity_weight,
                 self.reward_rail_tat_weight,
-                self.reward_rail_tat_clip,
             )).all()
             or self.local_reward_scale <= 0
+            or self.tat_reference <= 0
             or self.tat_weight < 0
             or self.op_weight < 0
             or self.backlog_weight < 0
@@ -246,10 +262,18 @@ class ContextualRuntimeConfig:
             or self.idle_reserve_scale <= 0
             or self.idle_reserve_weight < 0
             or self.local_predicted_oht_weight < 0
+            or self.local_oht_weight < 0
+            or self.local_stop_weight < 0
+            or self.local_idle_weight < 0
+            or self.local_capacity_weight < 0
             or self.reward_rail_tat_weight < 0
-            or self.reward_rail_tat_clip <= 0
         ):
             raise ValueError("invalid raw reward scaling configuration")
+        if self.reward_rail_tat_clip is not None and (
+            not np.isfinite(self.reward_rail_tat_clip)
+            or self.reward_rail_tat_clip <= 0
+        ):
+            raise ValueError("reward_rail_tat_clip must be positive or None")
         if self.tat_raw_clip is not None and (
             not np.isfinite(self.tat_raw_clip) or self.tat_raw_clip <= 0
         ):
@@ -475,10 +499,18 @@ class ClientAlgorithm:
                 self.reward_builder = ContextualRewardBuilder(
                     self.topology,
                     ContextualRewardConfig(
-                        freeze_after_env_steps=self.config.normalizer_freeze_steps,
+                        freeze_after_env_steps=(
+                            self.config.reward_normalizer_freeze_steps
+                        ),
                         local_reward_scale=self.config.local_reward_scale,
+                        local_fixed_scale_enabled=(
+                            self.config.local_fixed_scale_enabled
+                        ),
+                        tat_reference=self.config.tat_reference,
                         tat_weight=self.config.tat_weight,
+                        tat_one_sided=self.config.tat_one_sided,
                         op_weight=self.config.op_weight,
+                        use_op=self.config.use_op,
                         backlog_weight=self.config.backlog_weight,
                         backlog_growth_enabled=(
                             self.config.backlog_growth_enabled
@@ -496,6 +528,10 @@ class ClientAlgorithm:
                         local_predicted_oht_weight=(
                             self.config.local_predicted_oht_weight
                         ),
+                        local_oht_weight=self.config.local_oht_weight,
+                        local_stop_weight=self.config.local_stop_weight,
+                        local_idle_weight=self.config.local_idle_weight,
+                        local_capacity_weight=self.config.local_capacity_weight,
                         rail_reward_mode=self.config.rail_reward_mode,
                         rail_free_flow_neutral_ratio=(
                             self.config.rail_free_flow_neutral_ratio
@@ -543,10 +579,16 @@ class ClientAlgorithm:
         self.reward_builder = ContextualRewardBuilder(
             self.topology,
             ContextualRewardConfig(
-                freeze_after_env_steps=self.config.normalizer_freeze_steps,
+                freeze_after_env_steps=(
+                    self.config.reward_normalizer_freeze_steps
+                ),
                 local_reward_scale=self.config.local_reward_scale,
+                local_fixed_scale_enabled=self.config.local_fixed_scale_enabled,
+                tat_reference=self.config.tat_reference,
                 tat_weight=self.config.tat_weight,
+                tat_one_sided=self.config.tat_one_sided,
                 op_weight=self.config.op_weight,
+                use_op=self.config.use_op,
                 backlog_weight=self.config.backlog_weight,
                 backlog_growth_enabled=self.config.backlog_growth_enabled,
                 backlog_growth_horizon=self.config.backlog_growth_horizon,
@@ -558,6 +600,10 @@ class ClientAlgorithm:
                 local_predicted_oht_weight=(
                     self.config.local_predicted_oht_weight
                 ),
+                local_oht_weight=self.config.local_oht_weight,
+                local_stop_weight=self.config.local_stop_weight,
+                local_idle_weight=self.config.local_idle_weight,
+                local_capacity_weight=self.config.local_capacity_weight,
                 rail_reward_mode=self.config.rail_reward_mode,
                 rail_free_flow_neutral_ratio=(
                     self.config.rail_free_flow_neutral_ratio
@@ -1883,8 +1929,12 @@ class ClientAlgorithm:
             self.last_diagnostics.update({
                 # Compatibility aliases used by the per-rail/region dashboards.
                 "reward/step_reward": reward_diagnostics["reward/total_mean"],
-                "reward/global_norm": reward_diagnostics["reward/global_raw"],
-                "reward/local_norm": reward_diagnostics["reward/local_scaled_mean"],
+                "reward/global_norm": reward_diagnostics[
+                    "reward/global/normalized"
+                ],
+                "reward/local_norm": reward_diagnostics[
+                    "reward/local/normalized_mean"
+                ],
                 "reward/rail_tat": reward_diagnostics[
                     "reward/rail_tat_vector_mean"
                 ],
@@ -1895,7 +1945,7 @@ class ClientAlgorithm:
                     "reward/rail_tat_sum"
                 ],
                 "reward/rail_tat_mean": reward_diagnostics[
-                    "reward/rail_tat_vector_mean"
+                    "reward/rail_tat_mean"
                 ],
                 "reward/rail_tat_vector_mean": reward_diagnostics[
                     "reward/rail_tat_vector_mean"
@@ -2160,6 +2210,7 @@ class ClientAlgorithm:
 
         record = {
             "reward_version": REWARD_VERSION,
+            "reward_contract_version": REWARD_CONTRACT_VERSION,
             "global_step": int(global_step),
             "episode_id": int(completed.episode_id),
             "episode_step": int(completed.env_step),
@@ -2188,6 +2239,7 @@ class ClientAlgorithm:
             "idle_reserve_signal": batch.idle_reserve_signal,
             "idle_reserve_raw": batch.idle_reserve_raw,
             "global_raw": batch.global_raw,
+            "global_normalized": batch.global_normalized,
             "global_alpha": self.reward_builder.config.global_alpha,
             "global_component": batch.global_component,
             "global_decomposition_error": abs(
@@ -2197,45 +2249,20 @@ class ClientAlgorithm:
                 - batch.backlog_growth_raw
                 - batch.idle_reserve_raw
             ),
-            "tat_component_final": (
-                self.reward_builder.config.global_alpha
-                * batch.tat_raw_postclip
+            "tat_raw_abs": diagnostics.get(
+                "reward/budget/tat_raw_abs", 0.0
             ),
-            "op_component_final": (
-                self.reward_builder.config.global_alpha * batch.op_raw
+            "backlog_raw_abs": diagnostics.get(
+                "reward/budget/backlog_raw_abs", 0.0
             ),
-            "backlog_level_component_final": (
-                self.reward_builder.config.global_alpha * batch.backlog_raw
+            "global_component_abs": diagnostics.get(
+                "reward/budget/global_abs", 0.0
             ),
-            "backlog_growth_component_final": (
-                self.reward_builder.config.global_alpha
-                * batch.backlog_growth_raw
+            "local_component_abs_mean": diagnostics.get(
+                "reward/budget/local_abs", 0.0
             ),
-            "backlog_flow_component_final": (
-                self.reward_builder.config.global_alpha
-                * (batch.backlog_raw + batch.backlog_growth_raw)
-            ),
-            "idle_reserve_component_final": (
-                self.reward_builder.config.global_alpha
-                * batch.idle_reserve_raw
-            ),
-            "current_oht_component_abs_mean": diagnostics.get(
-                "reward/budget/current_oht_abs", 0.0
-            ),
-            "predicted_oht_component_abs_mean": diagnostics.get(
-                "reward/budget/predicted_oht_abs", 0.0
-            ),
-            "stop_component_abs_mean": diagnostics.get(
-                "reward/budget/stop_abs", 0.0
-            ),
-            "capacity_component_abs_mean": diagnostics.get(
-                "reward/budget/capacity_abs", 0.0
-            ),
-            "rail_active_component_representative": diagnostics.get(
-                "reward/budget/rail_active_abs", 0.0
-            ),
-            "rail_overall_component_abs_mean": diagnostics.get(
-                "reward/budget/rail_overall_abs", 0.0
+            "rail_component_abs_mean": diagnostics.get(
+                "reward/budget/rail_abs", 0.0
             ),
             "smooth_component_abs_mean": diagnostics.get(
                 "reward/budget/smooth_abs", 0.0
@@ -2243,15 +2270,7 @@ class ClientAlgorithm:
             "terminal_penalty": batch.terminal_penalty,
             "reward_budget_shares": {
                 name: diagnostics.get(f"reward/budget/{name}_share", 0.0)
-                for name in (
-                    "tat",
-                    "predicted_oht",
-                    "backlog_flow",
-                    "idle_reserve",
-                    "rail_active",
-                    "op",
-                    "other",
-                )
+                for name in ("global", "local", "rail", "smooth")
             },
             "leading_indicator_snapshot": {
                 key: value
@@ -2389,7 +2408,7 @@ class ClientAlgorithm:
             ("local_predicted_raw", batch.local_predicted_raw),
             ("local_stop_raw", batch.local_stop_raw),
             ("local_capacity_raw", batch.local_capacity_raw),
-            ("local_scaled", batch.local_scaled),
+            ("local_normalized", batch.local_normalized),
             ("local_component", batch.local_component),
             ("rail_tat_raw", rail_raw),
             ("rail_tat_weighted_preclip", rail_weighted),

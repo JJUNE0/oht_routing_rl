@@ -149,16 +149,24 @@ hyperparameters. It changes only `backlog_weight=0.0008 -> 0.008` and
 global alpha `0.5`. Reward Q checkpoints, replay, and reward-normalizer state
 are incompatible; start Reward R fresh.
 
-## Reward S: component rebalance
+## Reward S: Reward-E structure with signed TotalTat
 
-Reward S changes Reward R's `backlog_weight=0.008 -> 0.0048`,
-`backlog_growth_weight=0.16 -> 0.10`, `tat_weight=11 -> 5.5`,
-`local_reward_scale=2.0 -> 0.5`, and `rail_tat_weight=40 -> 85`.
-`local_predicted_oht_weight=0.10`, `rail_tat_clip=1`, `op_weight=4`,
-`idle_reserve_weight=0`, and `smooth_b_rl_weight=0.25` remain unchanged.
-Because the local reward is divided by `local_reward_scale`, the same local raw
-reward contributes four times Reward R's magnitude. Start Reward S with fresh
-checkpoint, replay, and reward-normalizer state.
+Reward S (`contextual_controlled_reward_v21_e_structure_signed_total_tat`)
+restores Reward E's training-wide normalize-before-update global/local reward
+structure. Its raw global reward is
+`9.2*(165-TotalTat)/165 - 0.01*(Waiting+Queued)`; this TAT signal is signed,
+unclipped, and independent of completion-count or previous-TAT state. OP,
+idle-reserve, backlog-growth, and marginal-TAT reward terms are disabled.
+
+The local raw reward is
+`-(0.3*OHT + 0.2*PredictedOHT + 0.3*Stop + 0.1*Idle + 0.1*Capacity)`.
+There is no fixed local divisor. The final per-rail reward is
+`0.5*Norm(global_raw) + 0.5*Norm(local_raw) + rail_reward - smooth_penalty`.
+Rail reward uses Reward E's fixed-TAT, actual-elapsed-time attribution with
+weight `1`, and b_rl smoothing uses weight `0.05`. Reward normalizers freeze
+after 30,000 reward steps and persist across episode reset; observation
+normalizers retain their separate lifecycle. Start with fresh checkpoint,
+replay, and reward-normalizer state.
 
 실행 후 simulator GUI에서 Python 연동을 활성화하고 Run을 시작합니다.
 

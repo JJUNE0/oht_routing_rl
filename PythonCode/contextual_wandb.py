@@ -11,6 +11,7 @@ from cocel_rl.algorithms.contextual_td7 import (
     LAP_VERSION,
     REPLAY_SAMPLING_VERSION,
     SALE_VERSION,
+    STACK_VERSION,
     contextual_algorithm_variant,
 )
 from contextual_action import (
@@ -19,38 +20,58 @@ from contextual_action import (
     action_version,
 )
 from contextual_dispatch import DISPATCH_SELECTION_VERSION
-from contextual_reward import ContextualRewardConfig, REWARD_VERSION
+from contextual_reward import (
+    ContextualRewardConfig,
+    REWARD_CONTRACT_VERSION,
+    REWARD_NORMALIZATION_VERSION,
+    REWARD_TAT_VERSION,
+    REWARD_VERSION,
+)
 
 EXP_META = {
     "cost_structure": "b_rl",
     "action_range": "b_rl_0.0-1.0",
     "topology": "directed_10in_10out_controlled_centers_v2",
-    "observation": "contextual_obs_controlled_v1",
-    "reward_version": "Q",
-    "reward_contract_version": REWARD_VERSION,
-    "calibration_status": "provisional",
+    "observation": "contextual_obs_controlled_stacked_v2",
+    "stack_version": STACK_VERSION,
+    "num_stacks": 1,
+    "stack_interval": 1,
+    "reward_version": REWARD_VERSION,
+    "reward_contract_version": REWARD_CONTRACT_VERSION,
+    "reward_tat_version": REWARD_TAT_VERSION,
+    "reward_normalization_version": REWARD_NORMALIZATION_VERSION,
+    "tat_signal": "signed_total_tat_level",
+    "marginal_tat_enabled": False,
+    "tat_one_sided": False,
+    "calibration_status": "reward_e_structure_restored",
     "reward_global_alpha": 0.5,
     "reward_local_alpha": 0.5,
     "tat_reference": 165.0,
-    "tat_weight": 11.0,
-    "tat_penalty_start": 160.0,
+    "tat_weight": 9.2,
+    "tat_raw_clip": None,
     "op_reference": 0.80,
-    "op_weight": 4.0,
-    "backlog_weight": 0.0008,
-    "backlog_growth_enabled": True,
+    "op_weight": 0.0,
+    "use_op": False,
+    "backlog_weight": 0.01,
+    "backlog_growth_enabled": False,
     "backlog_growth_horizon": 300,
     "backlog_growth_scale": 30.0,
-    "backlog_growth_weight": 0.24,
+    "backlog_growth_weight": 0.0,
     "idle_reserve_target": 200.0,
     "idle_reserve_scale": 50.0,
     "idle_reserve_weight": 0.0,
-    "local_predicted_oht_weight": 0.10,
-    "local_reward_scale": 2.0,
-    "rail_reward_mode": "free_flow_neutral_2",
+    "local_oht_weight": 0.3,
+    "local_predicted_oht_weight": 0.2,
+    "local_stop_weight": 0.3,
+    "local_idle_weight": 0.1,
+    "local_capacity_weight": 0.1,
+    "local_fixed_scale_enabled": False,
+    "local_reward_scale": 1.0,
+    "reward_normalizer_freeze_steps": 30_000,
+    "rail_reward_mode": "fixed_tat_reference",
     "rail_free_flow_neutral_ratio": 2.0,
-    "rail_tat_weight": 40.0,
-    "rail_tat_clip": 1.0,
-    "tat_raw_clip": None,
+    "rail_tat_weight": 1.0,
+    "rail_tat_clip": None,
     "tat_confidence_ramp": False,
     "action_scale": 0.05,
     "exploration_noise_std": 0.10,
@@ -65,10 +86,10 @@ EXP_META = {
     "send_cost_logging_version": "post_send_v2",
     "protocol_version": "single_end_time_v2",
     "diagnostic_schema_version": (
-        "contextual_reward_diagnostic_v16_leading_indicators"
+        "contextual_reward_diagnostic_v17_reward_s_ehybrid"
     ),
-    "wandb_metric_schema_version": "contextual_wandb_compact_v1",
-    "rail_budget_calibration": "median_abs_nonzero_active_postclip",
+    "wandb_metric_schema_version": "contextual_wandb_compact_v2_reward_s",
+    "reward_budget_version": "final_abs_contribution_v1",
     "arrival_tracking_source": "PClient.JOB_DIC.Job.ID_command_id",
     "arrival_tracking_reuse_fail_safe": True,
     "diagnostic_only_leading_indicators": (
@@ -82,17 +103,14 @@ EXP_META = {
     "early_stop_tat_threshold": 200.0,
     "tat_above_threshold_patience": 300,
     "terminal_tat_penalty": -20.0,
-    "note": "n_ablate_backlog08_growth24_pred10_rail40_noidle_dwreset",
+    "note": "rewardS_ehybrid_signedtat165_dwreset",
     "description": (
-        "Reward Q preserves 9qokskqq/Reward N's one-sided unbounded TAT "
-        "penalty above 160 and its actual 10,000-step grace, TAT 200, "
-        "300-step patience, terminal -20 contract. The ablation changes only "
-        "backlog level 0.0004->0.0008, backlog growth 0.16->0.24, predicted "
-        "OHT 0.075->0.10, rail weight 30->40, and disables idle-reserve "
-        "pressure (0.20->0.0); TAT 11 and OP 4 remain fixed. Episode reset "
-        "clears parameterDw and its baseline-estimator buffers so each "
-        "episode starts from the same estimator prior. "
-        "Fresh-run warmup skips unused inference."
+        "Reward S restores Reward E global/local running-normalized reward "
+        "structure while replacing cumulative marginal-TAT reconstruction "
+        "with direct signed TotalTat-level reward "
+        "9.2*(165-TotalTat)/165. Backlog=-0.01*(waiting+queued), "
+        "Reward-E broad local congestion terms are restored, marginal TAT "
+        "is disabled, and the parameterDw episode-reset fix is retained."
     ),
 }
 
@@ -445,23 +463,37 @@ WANDB_METRIC_KEYS = (
     "curriculum/action_scale",
     "b_rl/mean",
     "b_rl/std",
-    # Reward and representative contribution budget.
+    # Reward S signed level, running normalization, and final contribution budget.
     "reward/total_mean",
     "reward/total_std",
     "reward/terminal_penalty",
-    "reward/global/tat_component",
-    "reward/global/op_component",
-    "reward/global/backlog_component",
-    "reward/global/backlog_growth_component",
-    "reward/global/idle_reserve_component",
-    "reward/local/predicted_oht_component_abs_mean",
-    "reward/budget/tat_share",
-    "reward/budget/op_share",
-    "reward/budget/backlog_flow_share",
-    "reward/budget/idle_reserve_share",
-    "reward/budget/predicted_oht_share",
-    "reward/budget/rail_active_share",
-    "reward/budget/other_share",
+    "reward/global/tat_component_raw",
+    "reward/global/backlog_component_raw",
+    "reward/global/raw",
+    "reward/global/normalized",
+    "reward/global/component",
+    "reward/local/raw_mean",
+    "reward/local/raw_std",
+    "reward/local/normalized_mean",
+    "reward/local/normalized_std",
+    "reward/local/component_mean",
+    "reward/local/component_std",
+    "reward/rail_tat_mean",
+    "reward/smooth_penalty_mean",
+    "reward/global_normalizer_mean",
+    "reward/global_normalizer_std",
+    "reward/local_normalizer_mean",
+    "reward/local_normalizer_std",
+    "reward/budget/tat_raw_abs",
+    "reward/budget/backlog_raw_abs",
+    "reward/budget/global_abs",
+    "reward/budget/local_abs",
+    "reward/budget/rail_abs",
+    "reward/budget/smooth_abs",
+    "reward/budget/global_share",
+    "reward/budget/local_share",
+    "reward/budget/rail_share",
+    "reward/budget/smooth_share",
     "reward/budget/share_sum_error",
     "reward/rail/route_ratio_mean",
     "reward/rail/route_ratio_p95",
@@ -537,9 +569,15 @@ def runtime_exp_meta(config) -> dict:
         smooth_exp_residual_weight=config.smooth_exp_residual_weight,
         tat_confidence_n0=config.tat_confidence_n0,
         tat_confidence_ramp=config.tat_confidence_ramp,
+        freeze_after_env_steps=config.reward_normalizer_freeze_steps,
+        reward_normalization_enabled=True,
+        local_fixed_scale_enabled=config.local_fixed_scale_enabled,
         local_reward_scale=config.local_reward_scale,
+        tat_reference=config.tat_reference,
         tat_weight=config.tat_weight,
+        tat_one_sided=config.tat_one_sided,
         op_weight=config.op_weight,
+        use_op=config.use_op,
         backlog_weight=config.backlog_weight,
         backlog_growth_enabled=config.backlog_growth_enabled,
         backlog_growth_horizon=config.backlog_growth_horizon,
@@ -548,7 +586,11 @@ def runtime_exp_meta(config) -> dict:
         idle_reserve_target=config.idle_reserve_target,
         idle_reserve_scale=config.idle_reserve_scale,
         idle_reserve_weight=config.idle_reserve_weight,
+        local_oht_weight=config.local_oht_weight,
         local_predicted_oht_weight=config.local_predicted_oht_weight,
+        local_stop_weight=config.local_stop_weight,
+        local_idle_weight=config.local_idle_weight,
+        local_capacity_weight=config.local_capacity_weight,
         rail_reward_mode=config.rail_reward_mode,
         rail_free_flow_neutral_ratio=config.rail_free_flow_neutral_ratio,
         rail_baseline_ratio_reference=config.rail_baseline_ratio_reference,
@@ -571,7 +613,9 @@ def runtime_exp_meta(config) -> dict:
     meta["dispatch_mode"] = str(config.dispatch_mode)
     meta["dispatch_selection_version"] = DISPATCH_SELECTION_VERSION
     meta["note"] = (
-        f"{meta['note']}_dispatch_{str(config.dispatch_mode).replace('-', '_')}"
+        f"{meta['note']}_s{int(config.num_stacks)}i"
+        f"{int(config.stack_interval)}_dispatch_"
+        f"{str(config.dispatch_mode).replace('-', '_')}"
     )
     meta["sale"] = sale
     meta["lap"] = lap
@@ -579,16 +623,36 @@ def runtime_exp_meta(config) -> dict:
     meta["lap_version"] = LAP_VERSION
     meta["replay_sampling_version"] = REPLAY_SAMPLING_VERSION
     meta["replay_sampling_mode"] = config.replay_sampling_mode
+    meta["stack_version"] = STACK_VERSION
+    meta["num_stacks"] = int(config.num_stacks)
+    meta["stack_interval"] = int(config.stack_interval)
     meta["critic_loss_mode"] = config.critic_loss_mode
     meta["action_scale"] = float(config.action_scale)
     meta["reward_global_alpha"] = float(reward_config.global_alpha)
     meta["reward_local_alpha"] = float(reward_config.local_alpha)
+    meta["reward_normalizer_freeze_steps"] = int(
+        reward_config.freeze_after_env_steps
+    )
+    meta["reward_normalization_enabled"] = bool(
+        reward_config.reward_normalization_enabled
+    )
+    meta["local_fixed_scale_enabled"] = bool(
+        reward_config.local_fixed_scale_enabled
+    )
     meta["local_reward_scale"] = float(reward_config.local_reward_scale)
     meta["local_predicted_oht_weight"] = float(
         reward_config.local_predicted_oht_weight
     )
+    meta["local_oht_weight"] = float(reward_config.local_oht_weight)
+    meta["local_stop_weight"] = float(reward_config.local_stop_weight)
+    meta["local_idle_weight"] = float(reward_config.local_idle_weight)
+    meta["local_capacity_weight"] = float(reward_config.local_capacity_weight)
     meta["rail_tat_weight"] = float(reward_config.rail_tat_weight)
-    meta["rail_tat_clip"] = float(reward_config.rail_tat_clip)
+    meta["rail_tat_clip"] = (
+        None
+        if reward_config.rail_tat_clip is None
+        else float(reward_config.rail_tat_clip)
+    )
     meta["rail_reward_mode"] = reward_config.rail_reward_mode
     meta["rail_free_flow_neutral_ratio"] = float(
         reward_config.rail_free_flow_neutral_ratio
@@ -602,6 +666,7 @@ def runtime_exp_meta(config) -> dict:
     meta["tat_confidence_ramp"] = bool(reward_config.tat_confidence_ramp)
     meta["tat_reference"] = float(reward_config.tat_reference)
     meta["tat_weight"] = float(reward_config.tat_weight)
+    meta["tat_one_sided"] = bool(reward_config.tat_one_sided)
     meta["op_reference"] = float(reward_config.op_reference)
     meta["op_weight"] = float(reward_config.op_weight)
     meta["backlog_weight"] = float(reward_config.backlog_weight)
@@ -667,12 +732,14 @@ def runtime_exp_meta(config) -> dict:
         f"{EXP_META['description']} Directional contextual TD7 with "
         f"SALE={'on' if sale else 'off'}, LAP={'on' if lap else 'off'}, "
         f"replay_sampling={config.replay_sampling_mode}, "
+        f"stack={int(config.num_stacks)}x{int(config.stack_interval)}, "
         f"action_mode={action_mode}, dispatch_mode={config.dispatch_mode}, "
         f"critic_loss={config.critic_loss_mode}, "
         "independently initialized Q1/Q2 heads, "
-        f"reward Q ({REWARD_VERSION}, global/local="
+        f"reward {REWARD_VERSION} ({REWARD_CONTRACT_VERSION}, global/local="
         f"{reward_config.global_alpha:g}/{reward_config.local_alpha:g}), "
-        "reward_normalizer=removed, fixed_scale=on, "
+        "reward_normalizer=running_global_local_normalize_before_update, "
+        "fixed_scale=off, marginal_tat=off, "
         f"replay_capacity={int(config.replay_capacity_env_steps)}, "
         f"curriculum_end_step={int(config.curriculum_end_step)}, "
         f"exploration={float(config.exploration_noise_std):g}->"

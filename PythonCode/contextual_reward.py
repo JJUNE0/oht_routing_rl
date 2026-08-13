@@ -16,8 +16,13 @@ from contextual_observation import RunningFeatureNormalizer
 from contextual_reward_diagnostic import RewardDiagnosticWriter
 from contextual_topology import ContextualTopology
 
-REWARD_VERSION = (
-    "contextual_controlled_reward_v19_n_pressure_ablation_no_idle"
+REWARD_VERSION = "S"
+REWARD_CONTRACT_VERSION = (
+    "contextual_controlled_reward_v21_e_structure_signed_total_tat"
+)
+REWARD_TAT_VERSION = "signed_total_tat_level_ref165_v1"
+REWARD_NORMALIZATION_VERSION = (
+    "reward_e_running_global_local_normalizer_v1"
 )
 TAT_PENALTY_START = 160.0
 
@@ -50,35 +55,42 @@ class ContextualRewardError(RuntimeError):
 class ContextualRewardConfig:
     global_alpha: float = 0.5
     local_alpha: float = 0.5
-    rail_tat_weight: float = 40.0
-    rail_reward_mode: str = RAIL_REWARD_FREE_FLOW_NEUTRAL_2
+    rail_tat_weight: float = 1.0
+    rail_reward_mode: str = RAIL_REWARD_FIXED_TAT_REFERENCE
     rail_free_flow_neutral_ratio: float = 2.0
     rail_baseline_ratio_reference: float | None = None
     action_mode: str = REGION_B_RL
-    smooth_b_rl_weight: float = 0.25
+    smooth_b_rl_weight: float = 0.05
     smooth_exp_residual_weight: float = 0.5
-    tat_weight: float = 11.0
-    op_weight: float = 4.0
-    backlog_weight: float = 0.0008
-    backlog_growth_enabled: bool = True
+    tat_weight: float = 9.2
+    op_weight: float = 0.0
+    backlog_weight: float = 0.01
+    backlog_growth_enabled: bool = False
     backlog_growth_horizon: int = 300
     backlog_growth_scale: float = 30.0
-    backlog_growth_weight: float = 0.24
+    backlog_growth_weight: float = 0.0
     idle_reserve_target: float = 200.0
     idle_reserve_scale: float = 50.0
     idle_reserve_weight: float = 0.0
-    local_predicted_oht_weight: float = 0.10
+    local_oht_weight: float = 0.3
+    local_predicted_oht_weight: float = 0.2
+    local_stop_weight: float = 0.3
+    local_idle_weight: float = 0.1
+    local_capacity_weight: float = 0.1
     use_tat: bool = True
-    use_op: bool = True
+    use_op: bool = False
     use_backlog: bool = True
     tat_reference: float = 165.0
+    tat_one_sided: bool = False
     op_reference: float = 0.80
     tat_confidence_n0: float = 50.0
     tat_confidence_ramp: bool = False
     freeze_after_env_steps: int = 30_000
-    local_reward_scale: float = 2.0
+    reward_normalization_enabled: bool = True
+    local_fixed_scale_enabled: bool = False
+    local_reward_scale: float = 1.0
     tat_raw_clip: float | None = None
-    rail_tat_clip: float | None = 1.0
+    rail_tat_clip: float | None = None
     normalizer_epsilon: float = 1e-6
     global_clip: float | None = 5.0
     local_clip: float | None = None
@@ -93,7 +105,9 @@ class ContextualRewardConfig:
             self.idle_reserve_target, self.idle_reserve_scale,
             self.idle_reserve_weight,
             self.tat_confidence_n0, self.normalizer_epsilon,
-            self.local_reward_scale, self.local_predicted_oht_weight,
+            self.local_reward_scale, self.local_oht_weight,
+            self.local_predicted_oht_weight, self.local_stop_weight,
+            self.local_idle_weight, self.local_capacity_weight,
         )
         if not np.isfinite(numeric).all():
             raise ValueError("reward config contains NaN or Inf")
@@ -119,10 +133,14 @@ class ContextualRewardConfig:
             raise ValueError("idle_reserve_scale must be positive")
         if self.idle_reserve_target < 0 or self.idle_reserve_weight < 0:
             raise ValueError("idle reserve target/weight must be non-negative")
-        if self.local_predicted_oht_weight < 0:
-            raise ValueError(
-                "local_predicted_oht_weight must be non-negative"
-            )
+        if min(
+            self.local_oht_weight,
+            self.local_predicted_oht_weight,
+            self.local_stop_weight,
+            self.local_idle_weight,
+            self.local_capacity_weight,
+        ) < 0:
+            raise ValueError("local reward weights must be non-negative")
         if self.rail_tat_weight < 0:
             raise ValueError("rail_tat_weight must be non-negative")
         if self.rail_reward_mode not in RAIL_REWARD_MODES:
@@ -172,9 +190,10 @@ class ContextualRewardConfig:
 class ControlledRewardBatch:
     total: np.ndarray
     global_raw: float
+    global_normalized: float
     global_component: float
     local_raw: np.ndarray
-    local_scaled: np.ndarray
+    local_normalized: np.ndarray
     local_component: np.ndarray
     rail_reward_raw: np.ndarray
     rail_reward_weighted_preclip: np.ndarray
@@ -218,14 +237,9 @@ class ControlledRewardBatch:
     terminal_penalty: float = 0.0
 
     @property
-    def global_normalized(self):
-        """Deprecated compatibility alias; Reward J is never normalized."""
-        return self.global_raw
-
-    @property
-    def local_normalized(self):
-        """Deprecated compatibility alias for the fixed local scale."""
-        return self.local_scaled
+    def local_scaled(self):
+        """Compatibility alias for pre-Reward-S fixed-scale consumers."""
+        return self.local_normalized
 
     @property
     def tat_raw_unramped(self):
@@ -470,18 +484,19 @@ class ContextualRewardBuilder:
         self._total_completed_jobs += completed_delta
         completed = self._total_completed_jobs
 
-        # TotalTat is already the simulator's cumulative mean TAT level.
-        # Never difference it to recover a marginal value: its 0.1-second
-        # transport quantization is amplified by the cumulative job count.
-        tat_signal_available = cur_tat > 0.0
-        tat_excess = max(0.0, cur_tat - TAT_PENALTY_START)
-        tat_error = -tat_excess / cfg.tat_reference
+        # Reward S consumes the simulator's TotalTat level directly. Completion
+        # counts remain diagnostic-only and never reconstruct a marginal TAT.
+        tat_signal_available = True
+        tat_error = (
+            -max(0.0, cur_tat - TAT_PENALTY_START) / cfg.tat_reference
+            if cfg.tat_one_sided
+            else (cfg.tat_reference - cur_tat) / cfg.tat_reference
+        )
         tat_raw_preclip = (
             cfg.tat_weight * tat_error if cfg.use_tat else 0.0
         )
-        # Reward Q preserves 9qokskqq/Reward N's one-sided, unbounded TAT
-        # pressure. tat_raw_clip remains None so pressure continues above the
-        # termination threshold instead of saturating.
+        # The Reward-S contract is signed and unbounded (tat_raw_clip=None).
+        # The legacy one-sided branch also remains unbounded for R/Q replay.
         tat_raw_postclip = float(tat_raw_preclip)
         tat_confidence = float(tat_signal_available)
         tat_raw_ramped = tat_raw_postclip
@@ -591,15 +606,19 @@ class ContextualRewardBuilder:
             oht_count = len(getattr(rail, "OhtList"))
             capacity = oht_count / max(1, int(getattr(rail, "PortCount")) + 1)
             result[row] = 0.0
-            local_values["oht"][row] = -0.3 * oht_count
+            local_values["oht"][row] = -self.config.local_oht_weight * oht_count
             local_values["predicted"][row] = (
                 -self.config.local_predicted_oht_weight
                 * float(getattr(rail, "PredictedOHTCount"))
             )
-            local_values["stop"][row] = -0.3 * avg_stop
+            local_values["stop"][row] = -self.config.local_stop_weight * avg_stop
             idle_observation[row] = float(getattr(rail, "IdleOHTCount"))
-            local_values["idle"][row] = 0.0
-            local_values["capacity"][row] = -0.1 * capacity
+            local_values["idle"][row] = (
+                -self.config.local_idle_weight * idle_observation[row]
+            )
+            local_values["capacity"][row] = (
+                -self.config.local_capacity_weight * capacity
+            )
             result[row] = sum(values[row] for values in local_values.values())
         if not np.isfinite(result).all():
             raise ContextualRewardError("local reward input contains NaN or Inf")
@@ -1889,6 +1908,9 @@ class ContextualRewardBuilder:
         tolerance = 1e-12
         record = {
             "reward_version": REWARD_VERSION,
+            "reward_contract_version": REWARD_CONTRACT_VERSION,
+            "reward_tat_version": REWARD_TAT_VERSION,
+            "reward_normalization_version": REWARD_NORMALIZATION_VERSION,
             "global_step": global_step,
             "episode_id": int(episode_id),
             "episode_step": int(env_step),
@@ -2098,11 +2120,38 @@ class ContextualRewardBuilder:
 
         global_raw = self._global_raw(pclient)
         local_raw = self._local_raw(pclient)
+        if self.config.reward_normalization_enabled:
+            # Reward E's normalize-before-update contract: the current sample
+            # sees only statistics accumulated by earlier reward steps.
+            global_normalized = float(self.global_normalizer.normalize(
+                [[global_raw]], name="global_reward"
+            )[0, 0])
+            local_normalized = self.local_normalizer.normalize(
+                local_raw[:, None], name="local_reward"
+            )[:, 0]
+            self.global_normalizer.update(
+                [[global_raw]], name="global_reward"
+            )
+            self.local_normalizer.update(
+                local_raw[:, None], name="local_reward"
+            )
+        else:
+            global_normalized = float(global_raw)
+            local_normalized = (
+                local_raw / self.config.local_reward_scale
+                if self.config.local_fixed_scale_enabled
+                else local_raw.copy()
+            )
         self.reward_steps += 1
+        if (
+            self.config.reward_normalization_enabled
+            and self.reward_steps >= self.config.freeze_after_env_steps
+        ):
+            self.global_normalizer.freeze()
+            self.local_normalizer.freeze()
 
-        global_component = self.config.global_alpha * global_raw
-        local_scaled = local_raw / self.config.local_reward_scale
-        local_component = self.config.local_alpha * local_scaled
+        global_component = self.config.global_alpha * global_normalized
+        local_component = self.config.local_alpha * local_normalized
         rail_reward_raw = self._rail_reward_raw(
             pclient,
             env_step=env_step,
@@ -2126,7 +2175,8 @@ class ContextualRewardBuilder:
         )
         arrays = {
             "total": total, "local_raw": local_raw,
-            "local_scaled": local_scaled, "local_component": local_component,
+            "local_normalized": local_normalized,
+            "local_component": local_component,
             "rail_reward_raw": rail_reward_raw,
             "rail_reward_weighted_preclip": rail_reward_weighted_preclip,
             "rail_reward_postclip": rail_reward_postclip,
@@ -2151,6 +2201,7 @@ class ContextualRewardBuilder:
             **frozen_arrays,
             rail_tat_event_count=int(self._last_rail_tat_event_count),
             global_raw=float(global_raw),
+            global_normalized=float(global_normalized),
             global_component=float(global_component),
             total_tat_level=float(self._last_global_terms["total_tat"]),
             tat_signal_available=float(
@@ -2257,74 +2308,35 @@ class ContextualRewardBuilder:
             float(np.mean(np.abs(positive_scales - scale_mean)) / scale_mean)
             if scale_mean > 0.0 else 0.0
         )
-        local_multiplier = (
-            self.config.local_alpha / self.config.local_reward_scale
-        )
+        # TAT/backlog share one global normalizer, so their raw magnitudes are
+        # reported separately and are never presented as normalized shares.
+        # Shares below use only terms that actually enter the final reward.
         budget_abs = {
-            "tat": abs(self.config.global_alpha * batch.tat_raw_postclip),
-            "op": abs(self.config.global_alpha * batch.op_raw),
-            "backlog_level": abs(
-                self.config.global_alpha * batch.backlog_raw
-            ),
-            "backlog_growth": abs(
-                self.config.global_alpha * batch.backlog_growth_raw
-            ),
-            "idle_reserve": abs(
-                self.config.global_alpha * batch.idle_reserve_raw
-            ),
-            "current_oht": float(np.mean(np.abs(
-                local_multiplier * batch.local_oht_raw
-            ))),
-            "predicted_oht": float(np.mean(np.abs(
-                local_multiplier * batch.local_predicted_raw
-            ))),
-            "stop": float(np.mean(np.abs(
-                local_multiplier * batch.local_stop_raw
-            ))),
-            "capacity": float(np.mean(np.abs(
-                local_multiplier * batch.local_capacity_raw
-            ))),
-            "rail_active": rail_active_representative,
-            "rail_overall": float(np.mean(np.abs(
-                batch.rail_reward_postclip
-            ))),
+            "tat_raw": abs(batch.tat_raw_postclip),
+            "backlog_raw": abs(batch.backlog_raw),
+            "global": float(abs(batch.global_component)),
+            "local": float(np.mean(np.abs(batch.local_component))),
+            "rail": float(np.mean(np.abs(batch.rail_reward_postclip))),
             "smooth": float(np.mean(np.abs(batch.smooth_penalty))),
         }
-        budget_abs["backlog_flow"] = (
-            budget_abs["backlog_level"] + budget_abs["backlog_growth"]
-        )
-        representative = {
-            "tat": budget_abs["tat"],
-            "predicted_oht": budget_abs["predicted_oht"],
-            "backlog_flow": budget_abs["backlog_flow"],
-            "idle_reserve": budget_abs["idle_reserve"],
-            # Calibration intentionally uses the median nonzero active rail,
-            # not the diluted mean over every controlled rail.
-            "rail_active": budget_abs["rail_active"],
-            "op": budget_abs["op"],
-            "other": (
-                budget_abs["current_oht"]
-                + budget_abs["stop"]
-                + budget_abs["capacity"]
-                + budget_abs["smooth"]
-            ),
+        final_budget = {
+            name: budget_abs[name]
+            for name in ("global", "local", "rail", "smooth")
         }
-        budget_total = sum(representative.values())
+        budget_total = sum(final_budget.values())
         budget_shares = {
             name: value / budget_total if budget_total > 0.0 else 0.0
-            for name, value in representative.items()
+            for name, value in final_budget.items()
         }
-        target_bands = {
-            "tat": (0.25, 0.30),
-            "predicted_oht": (0.175, 0.225),
-            "backlog_flow": (0.125, 0.175),
-            "idle_reserve": (0.075, 0.125),
-            "rail_active": (0.15, 0.20),
-            "op": (0.05, 0.10),
-        }
-        band_violation_count = sum(
-            not (low <= budget_shares[name] <= high)
-            for name, (low, high) in target_bands.items()
+        global_normalizer_variance = (
+            float(self.global_normalizer.m2[0])
+            / float(self.global_normalizer.count)
+            if self.global_normalizer.count else 0.0
+        )
+        local_normalizer_variance = (
+            float(self.local_normalizer.m2[0])
+            / float(self.local_normalizer.count)
+            if self.local_normalizer.count else 0.0
         )
         result = {
             "reward/global_raw": batch.global_raw,
@@ -2341,9 +2353,8 @@ class ContextualRewardBuilder:
             "reward/global/tat_confidence_n0": self.config.tat_confidence_n0,
             "reward/global/tat_raw_ramped": batch.tat_raw_ramped,
             "reward/global/tat_raw": batch.tat_raw_ramped,
-            "reward/global/tat_component": (
-                self.config.global_alpha * batch.tat_raw_ramped
-            ),
+            "reward/global/tat_component": batch.tat_raw_ramped,
+            "reward/global/tat_component_raw": batch.tat_raw_ramped,
             "reward/global/completed_episode": batch.completed_episode,
             "reward/global/completed_delta": batch.completed_delta,
             "reward/global/op_rate": batch.op_rate,
@@ -2355,6 +2366,7 @@ class ContextualRewardBuilder:
             "reward/global/backlog": batch.backlog,
             "reward/global/backlog_weight": self.config.backlog_weight,
             "reward/global/backlog_raw": batch.backlog_raw,
+            "reward/global/backlog_component_raw": batch.backlog_raw,
             "reward/global/backlog_growth_enabled": float(
                 self.config.backlog_growth_enabled
             ),
@@ -2389,13 +2401,12 @@ class ContextualRewardBuilder:
             "reward/global/idle_reserve_component": (
                 self.config.global_alpha * batch.idle_reserve_raw
             ),
-            "reward/global/backlog_component": (
-                self.config.global_alpha * batch.backlog_raw
-            ),
-            "reward/global/op_component": (
-                self.config.global_alpha * batch.op_raw
-            ),
+            "reward/global/backlog_component": batch.backlog_raw,
+            "reward/global/op_component": batch.op_raw,
             "reward/global/global_component": batch.global_component,
+            "reward/global/raw": batch.global_raw,
+            "reward/global/normalized": batch.global_normalized,
+            "reward/global/component": batch.global_component,
             "reward/global/raw_sum": batch.global_raw,
             "reward/global/raw_decomposition_error": abs(
                 batch.global_raw
@@ -2409,17 +2420,28 @@ class ContextualRewardBuilder:
             "reward/total_tat_level": batch.total_tat_level,
             "reward/local_raw_mean": float(batch.local_raw.mean()),
             "reward/local_raw_std": float(batch.local_raw.std()),
-            "reward/local_scaled_mean": float(batch.local_scaled.mean()),
-            "reward/local_scaled_std": float(batch.local_scaled.std()),
+            "reward/local_scaled_mean": float(batch.local_normalized.mean()),
+            "reward/local_scaled_std": float(batch.local_normalized.std()),
             "reward/local_component_mean": float(batch.local_component.mean()),
             "reward/local_component_std": float(batch.local_component.std()),
+            "reward/local/raw_mean": float(batch.local_raw.mean()),
+            "reward/local/raw_std": float(batch.local_raw.std()),
+            "reward/local/normalized_mean": float(
+                batch.local_normalized.mean()
+            ),
+            "reward/local/normalized_std": float(
+                batch.local_normalized.std()
+            ),
+            "reward/local/component_mean": float(batch.local_component.mean()),
+            "reward/local/component_std": float(batch.local_component.std()),
             "reward/local/predicted_oht_weight": (
                 self.config.local_predicted_oht_weight
             ),
             "reward/local/predicted_oht_component_abs_mean": float(
-                self.config.local_alpha
-                * np.mean(np.abs(batch.local_predicted_raw))
-                / self.config.local_reward_scale
+                np.mean(np.abs(batch.local_predicted_raw))
+            ),
+            "reward/local/predicted_raw_abs_mean": float(
+                np.mean(np.abs(batch.local_predicted_raw))
             ),
             "reward/local/local_reward_scale": self.config.local_reward_scale,
             "reward/local/local_component_abs_mean": local_representative,
@@ -2428,6 +2450,7 @@ class ContextualRewardBuilder:
                 batch.rail_tat_weighted_preclip.mean()
             ),
             "reward/rail_tat_penalty_mean": rail_tat_vector_mean,
+            "reward/rail_tat_mean": float(batch.rail_reward_postclip.mean()),
             "reward/rail_tat_penalty_max": float(batch.rail_tat_penalty.max()),
             "reward/rail_tat_event_count": float(
                 batch.rail_tat_event_count
@@ -2458,6 +2481,28 @@ class ContextualRewardBuilder:
             "reward/total_max": float(batch.total.max()),
             "reward/terminal_penalty": float(batch.terminal_penalty),
             "reward/finite_ratio": float(np.isfinite(batch.total).mean()),
+            "reward/global_normalizer_mean": float(
+                self.global_normalizer.mean[0]
+            ),
+            "reward/global_normalizer_std": float(np.sqrt(max(
+                global_normalizer_variance, 0.0
+            ))),
+            "reward/local_normalizer_mean": float(
+                self.local_normalizer.mean[0]
+            ),
+            "reward/local_normalizer_std": float(np.sqrt(max(
+                local_normalizer_variance, 0.0
+            ))),
+            "reward/global_normalizer_count": float(
+                self.global_normalizer.count
+            ),
+            "reward/local_normalizer_count": float(
+                self.local_normalizer.count
+            ),
+            "reward/normalizers_frozen": float(
+                self.global_normalizer.frozen
+                and self.local_normalizer.frozen
+            ),
             "reward/local/raw_decomposition_error_max": float(np.max(np.abs(
                 batch.local_raw
                 - batch.local_oht_raw
@@ -2536,6 +2581,12 @@ class ContextualRewardBuilder:
             "reward/config/global_alpha": self.config.global_alpha,
             "reward/config/local_alpha": self.config.local_alpha,
             "reward/config/local_reward_scale": self.config.local_reward_scale,
+            "reward/config/local_fixed_scale_enabled": float(
+                self.config.local_fixed_scale_enabled
+            ),
+            "reward/config/running_normalization_enabled": float(
+                self.config.reward_normalization_enabled
+            ),
             "reward/config/rail_tat_weight": self.config.rail_tat_weight,
             "reward/config/rail_tat_clip": float(
                 self.config.rail_tat_clip
@@ -2548,40 +2599,19 @@ class ContextualRewardBuilder:
             "reward/config/smooth_weight_effective": (
                 batch.smooth_weight_effective
             ),
-            "reward/budget/tat_abs": budget_abs["tat"],
-            "reward/budget/op_abs": budget_abs["op"],
-            "reward/budget/backlog_level_abs": budget_abs["backlog_level"],
-            "reward/budget/backlog_growth_abs": budget_abs["backlog_growth"],
-            "reward/budget/backlog_flow_abs": budget_abs["backlog_flow"],
-            "reward/budget/idle_reserve_abs": budget_abs["idle_reserve"],
-            "reward/budget/current_oht_abs": budget_abs["current_oht"],
-            "reward/budget/predicted_oht_abs": budget_abs["predicted_oht"],
-            "reward/budget/stop_abs": budget_abs["stop"],
-            "reward/budget/capacity_abs": budget_abs["capacity"],
-            "reward/budget/rail_active_abs": budget_abs["rail_active"],
-            "reward/budget/rail_overall_abs": budget_abs["rail_overall"],
+            "reward/budget/tat_raw_abs": budget_abs["tat_raw"],
+            "reward/budget/backlog_raw_abs": budget_abs["backlog_raw"],
+            "reward/budget/global_abs": budget_abs["global"],
+            "reward/budget/local_abs": budget_abs["local"],
+            "reward/budget/rail_abs": budget_abs["rail"],
             "reward/budget/smooth_abs": budget_abs["smooth"],
-            "reward/budget/tat_share": budget_shares["tat"],
-            "reward/budget/predicted_oht_share": (
-                budget_shares["predicted_oht"]
-            ),
-            "reward/budget/backlog_flow_share": (
-                budget_shares["backlog_flow"]
-            ),
-            "reward/budget/idle_reserve_share": (
-                budget_shares["idle_reserve"]
-            ),
-            "reward/budget/rail_active_share": (
-                budget_shares["rail_active"]
-            ),
-            "reward/budget/op_share": budget_shares["op"],
-            "reward/budget/other_share": budget_shares["other"],
+            "reward/budget/global_share": budget_shares["global"],
+            "reward/budget/local_share": budget_shares["local"],
+            "reward/budget/rail_share": budget_shares["rail"],
+            "reward/budget/smooth_share": budget_shares["smooth"],
             "reward/budget/share_sum_error": abs(
                 1.0 - sum(budget_shares.values())
             ) if budget_total > 0.0 else 0.0,
-            "reward/budget/target_band_violation_count": float(
-                band_violation_count
-            ),
         }
         for name, values in (
             ("oht", batch.local_oht_raw),
@@ -2597,7 +2627,7 @@ class ContextualRewardBuilder:
             )
         local_term_abs = {
             name: result[f"reward/local/{name}_raw_abs_mean"]
-            for name in ("oht", "predicted", "stop", "capacity")
+            for name in ("oht", "predicted", "stop", "idle", "capacity")
         }
         local_term_denominator = (
             sum(local_term_abs.values()) + np.finfo(np.float64).eps
@@ -2606,6 +2636,7 @@ class ContextualRewardBuilder:
             ("predicted", "predicted_abs_share"),
             ("oht", "oht_abs_share"),
             ("stop", "stop_abs_share"),
+            ("idle", "idle_abs_share"),
             ("capacity", "capacity_abs_share"),
         ):
             result[f"reward/local/{output}"] = (
@@ -2625,6 +2656,11 @@ class ContextualRewardBuilder:
         np.savez_compressed(
             target,
             reward_version=np.asarray(REWARD_VERSION),
+            reward_contract_version=np.asarray(REWARD_CONTRACT_VERSION),
+            reward_tat_version=np.asarray(REWARD_TAT_VERSION),
+            reward_normalization_version=np.asarray(
+                REWARD_NORMALIZATION_VERSION
+            ),
             topology_hash=np.asarray(self.topology.topology_hash),
             mapping_hash=np.asarray(self.topology.mapping_hash),
             reward_steps=np.asarray(self.reward_steps),
@@ -2645,11 +2681,20 @@ class ContextualRewardBuilder:
                 str(saved["reward_version"].item())
                 if "reward_version" in saved.files else None
             )
-            if saved_reward_version != REWARD_VERSION:
+            saved_reward_contract = (
+                str(saved["reward_contract_version"].item())
+                if "reward_contract_version" in saved.files else None
+            )
+            if (
+                saved_reward_version != REWARD_VERSION
+                or saved_reward_contract != REWARD_CONTRACT_VERSION
+            ):
                 raise ContextualRewardError(
                     "reward normalizer version mismatch: "
-                    f"saved={saved_reward_version!r}, "
-                    f"runtime={REWARD_VERSION!r}. A fresh normalizer is "
+                    f"saved={saved_reward_version!r}/"
+                    f"{saved_reward_contract!r}, "
+                    f"runtime={REWARD_VERSION!r}/"
+                    f"{REWARD_CONTRACT_VERSION!r}. A fresh normalizer is "
                     "required because statistics from another reward contract "
                     "are incompatible."
                 )

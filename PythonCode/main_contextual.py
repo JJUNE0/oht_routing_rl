@@ -31,7 +31,7 @@ from cocel_rl.algorithms.contextual_td7 import (
 )
 from contextual_action import ACTION_MODES, REGION_B_RL
 from contextual_reward import (
-    RAIL_REWARD_FREE_FLOW_NEUTRAL_2,
+    RAIL_REWARD_FIXED_TAT_REFERENCE,
     RAIL_REWARD_MODES,
 )
 
@@ -153,7 +153,7 @@ def parse_args():
         choices=("geometric", "linear"),
         default="geometric",
     )
-    parser.add_argument("--smooth-b-rl-weight", type=float, default=0.25)
+    parser.add_argument("--smooth-b-rl-weight", type=float, default=0.05)
     parser.add_argument(
         "--smooth-exp-residual-weight", type=float, default=0.5
     )
@@ -180,9 +180,16 @@ def parse_args():
     parser.add_argument("--episode-burnin-steps", type=int, default=0)
     parser.add_argument("--normalizer-freeze-steps", type=int, default=10_000)
     parser.add_argument(
+        "--reward-normalizer-freeze-steps", type=int, default=30_000,
+        help=(
+            "Reward-only running-normalizer freeze step; observation "
+            "normalization remains controlled by --normalizer-freeze-steps."
+        ),
+    )
+    parser.add_argument(
         "--rail-reward-mode",
         choices=RAIL_REWARD_MODES,
-        default=RAIL_REWARD_FREE_FLOW_NEUTRAL_2,
+        default=RAIL_REWARD_FIXED_TAT_REFERENCE,
     )
     parser.add_argument(
         "--rail-free-flow-neutral-ratio",
@@ -505,6 +512,9 @@ def main():
         "warmup_steps": args.warmup_steps,
         "episode_burnin_steps": args.episode_burnin_steps,
         "normalizer_freeze_steps": args.normalizer_freeze_steps,
+        "reward_normalizer_freeze_steps": (
+            args.reward_normalizer_freeze_steps
+        ),
         "rail_reward_mode": args.rail_reward_mode,
         "rail_free_flow_neutral_ratio": args.rail_free_flow_neutral_ratio,
         "reward_diagnostic_dir": args.reward_diagnostic_dir,
@@ -569,6 +579,8 @@ def main():
         f"stack_interval={client.config.stack_interval}, "
         f"warmup_steps={client.config.warmup_steps}, "
         f"episode_burnin_steps={client.config.episode_burnin_steps}, "
+        "reward_normalizer_freeze_steps="
+        f"{client.config.reward_normalizer_freeze_steps}, "
         f"reward_diagnostic_dir={client.config.reward_diagnostic_dir}, "
         f"rail_reward_mode={client.config.rail_reward_mode}, "
         "rail_free_flow_neutral_ratio="

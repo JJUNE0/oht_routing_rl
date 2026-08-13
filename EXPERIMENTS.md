@@ -1085,3 +1085,36 @@ architectural stabilization change is selected.
 - `EXP_META.note=rewardrebalance`. Reward R and older checkpoints, replay, and
   reward-normalizer state are incompatible; start a fresh Reward S run. No
   simulator or W&B run was launched for this change.
+
+## 2026-08-13 - Reward S Reward-E hybrid with signed TotalTat
+
+- Active reward version: `S`; contract version:
+  `contextual_controlled_reward_v21_e_structure_signed_total_tat`. The prior
+  2026-08-12 component-rebalance entry is retained as the historical contract
+  used by its run and is not a compatible checkpoint/replay contract.
+- Restored Reward E's training-wide global/local running normalizers with
+  normalize-before-update ordering and reward-step freeze at 30,000. Reward
+  normalizer statistics persist across episode reset and are independent of
+  the observation normalizer lifecycle.
+- Global raw reward is exactly
+  `9.2*(165-TotalTat)/165 - 0.01*(Waiting+Queued)`. It is signed, has no
+  one-sided gate or raw clip, and never reads marginal-TAT reconstruction,
+  previous completion count, or previous TotalTat state. OP, idle-reserve, and
+  backlog-growth reward terms are disabled.
+- Local raw reward is exactly
+  `-(0.3*OHT + 0.2*PredictedOHT + 0.3*Stop + 0.1*Idle + 0.1*Capacity)` and uses
+  running normalization rather than a fixed divisor. Final global/local weights
+  remain `0.5/0.5`.
+- Restored Reward E's fixed-TAT actual-elapsed-time rail attribution with
+  `rail_tat_weight=1`, no rail clip, and `smooth_b_rl_weight=0.05`. Free-flow
+  neutral-2 and fixed-scale branches remain available only as legacy-compatible
+  explicit configuration paths.
+- W&B schema `contextual_wandb_compact_v2_reward_s` logs raw global subterms,
+  normalized global/local terms, normalizer statistics, final reward scale, and
+  contribution shares computed only from terms that enter the final reward.
+  No pseudo-share splits are inferred inside the shared global normalizer.
+- `EXP_META.note=rewardS_ehybrid_signedtat165_dwreset`. Actor/critic structure,
+  shared directional encoder, SALE, TD7 updates, batch/replay/sampling, target
+  updates, exploration/curriculum, action mapping/range, first-match dispatch,
+  termination/checkpoint/observation/topology contracts, and the episode-local
+  `parameterDw`/`parameterPassTimes`/`parameterC` reset fix are unchanged.
