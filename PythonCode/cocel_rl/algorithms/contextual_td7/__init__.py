@@ -52,6 +52,17 @@ from .sale import (
     SALEStateEncoder,
     avg_l1_norm,
 )
+from .stacking import (
+    STACK_VERSION,
+    ContextualObservationHistory,
+    encode_observation_stack,
+    flatten_action_stack,
+    flatten_state_stack,
+    interleave_state_action,
+    replace_current_action,
+    stack_offsets,
+    validate_stack_config,
+)
 
 __all__ = [
     "ActorOutput",
@@ -97,4 +108,13 @@ __all__ = [
     "SALEStateActionEncoder",
     "SALEStateEncoder",
     "avg_l1_norm",
+    "STACK_VERSION",
+    "ContextualObservationHistory",
+    "encode_observation_stack",
+    "flatten_action_stack",
+    "flatten_state_stack",
+    "interleave_state_action",
+    "replace_current_action",
+    "stack_offsets",
+    "validate_stack_config",
 ]

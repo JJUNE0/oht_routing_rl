@@ -133,6 +133,18 @@ def parse_args():
         default=0.05,
         help="Fixed applied-action scale for exp_residual mode only.",
     )
+    parser.add_argument(
+        "--num-stacks",
+        type=int,
+        default=1,
+        help="Total observation frames including the current frame.",
+    )
+    parser.add_argument(
+        "--stack-interval",
+        type=int,
+        default=1,
+        help="Environment-step spacing between stacked frames.",
+    )
     parser.add_argument("--curriculum-end-step", type=int, default=20_000)
     parser.add_argument("--curriculum-scale-start", type=float, default=0.05)
     parser.add_argument("--curriculum-scale-end", type=float, default=1.0)
@@ -482,6 +494,8 @@ def main():
         "action_mode": args.action_mode,
         "dispatch_mode": args.dispatch_mode,
         "action_scale": args.action_scale,
+        "num_stacks": args.num_stacks,
+        "stack_interval": args.stack_interval,
         "curriculum_end_step": args.curriculum_end_step,
         "curriculum_scale_start": args.curriculum_scale_start,
         "curriculum_scale_end": args.curriculum_scale_end,
@@ -551,6 +565,8 @@ def main():
         f"action_mode={args.action_mode}, "
         f"dispatch_mode={client.config.dispatch_mode}, "
         f"action_scale={client._action_scale()}, "
+        f"num_stacks={client.config.num_stacks}, "
+        f"stack_interval={client.config.stack_interval}, "
         f"warmup_steps={client.config.warmup_steps}, "
         f"episode_burnin_steps={client.config.episode_burnin_steps}, "
         f"reward_diagnostic_dir={client.config.reward_diagnostic_dir}, "

@@ -20,6 +20,7 @@ from cocel_rl.algorithms.contextual_td7 import (
     ContextualActor,
     ContextualLearnerConfig,
     ContextualNetworkConfig,
+    ContextualObservationHistory,
     ContextualStepReplayBuffer,
     ContextualTD7Learner,
     DirectionalContextEncoder,
@@ -28,7 +29,10 @@ from cocel_rl.algorithms.contextual_td7 import (
     REPLAY_SAMPLING_RAIL,
     REPLAY_SAMPLING_SNAPSHOT,
     REPLAY_SAMPLING_VERSION,
+    STACK_VERSION,
     contextual_algorithm_variant,
+    encode_observation_stack,
+    flatten_state_stack,
     load_contextual_checkpoint,
     save_contextual_checkpoint,
 )
@@ -85,6 +89,8 @@ class ContextualRuntimeConfig:
     action_enabled: bool = False
     action_mode: str = REGION_B_RL
     action_scale: float = 0.05
+    num_stacks: int = 1
+    stack_interval: int = 1
     curriculum_end_step: int = 20_000
     curriculum_scale_start: float = 0.05
     curriculum_scale_end: float = 1.0
@@ -94,22 +100,22 @@ class ContextualRuntimeConfig:
     warmup_steps: int = 10_000
     episode_burnin_steps: int = 0
     normalizer_freeze_steps: int = 10_000
-    tat_weight: float = 11.0
+    tat_weight: float = 5.5
     op_weight: float = 4.0
-    backlog_weight: float = 0.0008
+    backlog_weight: float = 0.0048
     backlog_growth_enabled: bool = True
     backlog_growth_horizon: int = 300
     backlog_growth_scale: float = 30.0
-    backlog_growth_weight: float = 0.24
+    backlog_growth_weight: float = 0.10
     idle_reserve_target: float = 200.0
     idle_reserve_scale: float = 50.0
     idle_reserve_weight: float = 0.0
     local_predicted_oht_weight: float = 0.10
-    local_reward_scale: float = 2.0
+    local_reward_scale: float = 0.5
     rail_reward_mode: str = RAIL_REWARD_FREE_FLOW_NEUTRAL_2
     rail_free_flow_neutral_ratio: float = 2.0
     rail_baseline_ratio_reference: float | None = None
-    reward_rail_tat_weight: float = 40.0
+    reward_rail_tat_weight: float = 85.0
     reward_rail_tat_clip: float = 1.0
     tat_raw_clip: float | None = None
     reward_diagnostic_dir: str | None = None
@@ -158,6 +164,12 @@ class ContextualRuntimeConfig:
             )
         if self.mode == "training" and not self.action_enabled:
             raise ValueError("training mode requires explicit action_enabled")
+        for name in ("num_stacks", "stack_interval"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, Integral):
+                raise ValueError(f"{name} must be an integer")
+            if int(value) <= 0:
+                raise ValueError(f"{name} must be positive")
         if self.action_mode not in ACTION_MODES:
             raise ValueError(f"action_mode must be one of {ACTION_MODES}")
         if self.replay_sampling_mode not in REPLAY_SAMPLING_MODES:
@@ -325,7 +337,10 @@ class ClientAlgorithm:
             devices=[self.device] if self.device.type == "cuda" else []
         ):
             torch.manual_seed(self.config.seed)
-            network_config = ContextualNetworkConfig()
+            network_config = ContextualNetworkConfig(
+                num_stacks=self.config.num_stacks,
+                stack_interval=self.config.stack_interval,
+            )
             self.encoder = DirectionalContextEncoder(network_config).to(self.device)
             self.actor = ContextualActor(network_config).to(self.device)
         self.encoder.eval()
@@ -350,6 +365,9 @@ class ClientAlgorithm:
         self.tat_above_threshold_count = 0
         self._tat_terminal_penalty_applied = False
         self.last_observation = None
+        self.observation_history = ContextualObservationHistory(
+            self.config.num_stacks, self.config.stack_interval
+        )
         self.last_controlled_action = None
         self.last_policy_action = None
         self.last_exploratory_action = None
@@ -422,7 +440,9 @@ class ClientAlgorithm:
     def runtime_variant(self):
         base = (
             f"{ALGORITHM_VERSION}_{self.algorithm_variant}_"
-            f"{self.action_version}_{PARAMETER_DW_STATE_VERSION}"
+            f"{self.action_version}_{PARAMETER_DW_STATE_VERSION}_"
+            f"{STACK_VERSION}_s{self.config.num_stacks}_"
+            f"i{self.config.stack_interval}"
         )
         if self.config.replay_sampling_mode == REPLAY_SAMPLING_RAIL:
             return base
@@ -440,6 +460,7 @@ class ClientAlgorithm:
         return (
             f"ctx_td7_s{int(self.config.sale_enabled)}_"
             f"l{int(self.config.lap_enabled)}_"
+            f"k{self.config.num_stacks}_i{self.config.stack_interval}_"
             f"{self.config.action_mode}_"
             f"{self.config.replay_sampling_mode}_{digest}"
         )
@@ -580,6 +601,8 @@ class ClientAlgorithm:
             lap_enabled=self.config.lap_enabled,
             action_version=self.action_version,
             sampling_mode=self.config.replay_sampling_mode,
+            num_stacks=self.config.num_stacks,
+            stack_interval=self.config.stack_interval,
         )
         learner_config = ContextualLearnerConfig(
             action_mode=self.config.action_mode,
@@ -594,9 +617,13 @@ class ClientAlgorithm:
             lap_enabled=self.config.lap_enabled,
             critic_loss_mode=self.config.critic_loss_mode,
         )
+        network_config = ContextualNetworkConfig(
+            num_stacks=self.config.num_stacks,
+            stack_interval=self.config.stack_interval,
+        )
         self.learner = ContextualTD7Learner(
             self.replay_buffer,
-            network_config=ContextualNetworkConfig(),
+            network_config=network_config,
             config=learner_config,
             device=self.device,
             seed=self.config.seed,
@@ -618,6 +645,7 @@ class ClientAlgorithm:
                     "action_mode": self.config.action_mode,
                     "action_version": self.action_version,
                     "parameter_dw_state_version": PARAMETER_DW_STATE_VERSION,
+                    "stack_version": STACK_VERSION,
                     "action_scale": self.config.action_scale,
                     "curriculum_end_step": self.config.curriculum_end_step,
                     "curriculum_scale_start": (
@@ -627,6 +655,8 @@ class ClientAlgorithm:
                     "curriculum_shape": self.config.curriculum_shape,
                     "exploration_noise_std": self.config.exploration_noise_std,
                     "episode_burnin_steps": self.config.episode_burnin_steps,
+                    "num_stacks": self.config.num_stacks,
+                    "stack_interval": self.config.stack_interval,
                 },
                 exploration_rng=self.exploration_rng,
                 exploration_seed=self.config.seed,
@@ -716,6 +746,9 @@ class ClientAlgorithm:
             "action_mode": self.config.action_mode,
             "action_version": self.action_version,
             "parameter_dw_state_version": PARAMETER_DW_STATE_VERSION,
+            "stack_version": STACK_VERSION,
+            "num_stacks": self.config.num_stacks,
+            "stack_interval": self.config.stack_interval,
             "dispatch_mode": self.config.dispatch_mode,
             "dispatch_selection_version": DISPATCH_SELECTION_VERSION,
             "action_scale": self.config.action_scale,
@@ -795,6 +828,8 @@ class ClientAlgorithm:
                 "contextual training failed; operator restart required"
             )
         self.last_observation = None
+        if hasattr(self, "observation_history"):
+            self.observation_history.clear()
         self.last_controlled_action = None
         self.last_policy_action = None
         self.last_exploratory_action = None
@@ -814,6 +849,8 @@ class ClientAlgorithm:
     def _clear_training_temporal_state(self) -> None:
         """Idempotently remove state that could create a post-failure transition."""
         self.last_observation = None
+        if hasattr(self, "observation_history"):
+            self.observation_history.clear()
         self.last_controlled_action = None
         self.last_policy_action = None
         self.last_exploratory_action = None
@@ -927,6 +964,8 @@ class ClientAlgorithm:
         self.tat_above_threshold_count = 0
         self._tat_terminal_penalty_applied = False
         self.last_observation = None
+        if hasattr(self, "observation_history"):
+            self.observation_history.clear()
         self.last_controlled_action = None
         self.last_policy_action = None
         self.last_exploratory_action = None
@@ -1290,14 +1329,41 @@ class ClientAlgorithm:
 
     @staticmethod
     def _cpu_tensors(observation):
-        return (
-            torch.from_numpy(observation.center_local),
-            torch.from_numpy(observation.incoming_local),
-            torch.from_numpy(observation.outgoing_local),
-            torch.from_numpy(observation.incoming_relation),
-            torch.from_numpy(observation.outgoing_relation),
-            torch.from_numpy(observation.global_state),
+        frames = (
+            tuple(observation)
+            if isinstance(observation, (tuple, list))
+            else (observation,)
         )
+        if len(frames) == 1:
+            frame = frames[0]
+            return (
+                torch.from_numpy(frame.center_local),
+                torch.from_numpy(frame.incoming_local),
+                torch.from_numpy(frame.outgoing_local),
+                torch.from_numpy(frame.incoming_relation),
+                torch.from_numpy(frame.outgoing_relation),
+                torch.from_numpy(frame.global_state),
+            )
+        batch = int(frames[0].center_local.shape[0])
+        values = tuple(
+            torch.from_numpy(np.ascontiguousarray(np.stack([
+                getattr(frame, name) for frame in frames
+            ], axis=1)))
+            for name in (
+                "center_local",
+                "incoming_local",
+                "outgoing_local",
+                "incoming_relation",
+                "outgoing_relation",
+            )
+        )
+        global_stack = np.stack(
+            [frame.global_state for frame in frames], axis=0
+        )
+        global_batch = np.broadcast_to(
+            global_stack[None], (batch, *global_stack.shape)
+        )
+        return (*values, torch.from_numpy(np.ascontiguousarray(global_batch)))
 
     def _actor_inference(self, observation, *, attention_diagnostics=False):
         t0 = time.perf_counter()
@@ -1309,18 +1375,24 @@ class ClientAlgorithm:
             tensor.to(self.device, non_blocking=False) for tensor in cpu_tensors
         )
         batch = device_tensors[0].shape[0]
-        global_batch = device_tensors[-1].unsqueeze(0).expand(batch, -1)
+        if device_tensors[0].ndim == 2:
+            global_batch = device_tensors[-1].unsqueeze(0).expand(batch, -1)
+            structured_batch = (*device_tensors[:-1], global_batch)
+        else:
+            structured_batch = device_tensors
         self._synchronize()
         host_to_device_ms = (time.perf_counter() - t0) * 1000.0
 
         t0 = time.perf_counter()
         with torch.inference_mode():
-            encoding = self.encoder(
-                *device_tensors[:-1],
-                global_batch,
+            encoded_stack = encode_observation_stack(
+                self.encoder,
+                structured_batch,
                 return_attention=attention_diagnostics,
             )
-            structured_batch = (*device_tensors[:-1], global_batch)
+            actor_state = flatten_state_stack(
+                encoded_stack.state, self.config.num_stacks
+            )
             sale_state = (
                 self.learner.sale_fixed.state(structured_batch)
                 if self.learner is not None
@@ -1331,9 +1403,9 @@ class ClientAlgorithm:
                 else None
             )
             actor_output = (
-                self.actor(encoding.state, sale_state)
+                self.actor(actor_state, sale_state)
                 if sale_state is not None
-                else self.actor(encoding.state)
+                else self.actor(actor_state)
             )
         self._synchronize()
         encoder_actor_ms = (time.perf_counter() - t0) * 1000.0
@@ -1352,9 +1424,18 @@ class ClientAlgorithm:
         }
         if attention_diagnostics:
             for direction, weights in (
-                ("incoming", encoding.incoming_attention),
-                ("outgoing", encoding.outgoing_attention),
+                (
+                    "incoming",
+                    encoded_stack.flat_encoding.incoming_attention,
+                ),
+                (
+                    "outgoing",
+                    encoded_stack.flat_encoding.outgoing_attention,
+                ),
             ):
+                weights = weights.reshape(
+                    batch, self.config.num_stacks, *weights.shape[1:]
+                )[:, 0]
                 probabilities = weights.clamp_min(1e-12)
                 diagnostics[f"attention/{direction}_entropy"] = float(
                     (-(probabilities * probabilities.log()).sum(-1))
@@ -1442,6 +1523,21 @@ class ClientAlgorithm:
         observation_build_ms = (time.perf_counter() - t0) * 1000.0
         self.last_observation = observation
 
+        if (
+            self.config.mode == "training"
+            and self.config.episode_burnin_steps > 0
+            and self.episode_steps == self.config.episode_burnin_steps
+        ):
+            # Burn-in transitions are intentionally absent from replay. Start
+            # the policy stack at the same boundary so online and replay
+            # padding contracts remain identical.
+            self.observation_history.clear()
+        self.observation_history.append(
+            observation,
+            env_step=self.episode_steps,
+            episode_id=self.episode_id,
+        )
+
         burnin_active = self._burnin_active()
         has_trained_policy = self._has_trained_policy()
         self._advance_burnin_reward_history(pclient)
@@ -1501,7 +1597,7 @@ class ClientAlgorithm:
         )
         if use_actor:
             deterministic_policy, inference_timing = self._actor_inference(
-                observation,
+                self.observation_history.frames(),
                 attention_diagnostics=(
                     self.config.mode == "training"
                     and self.total_steps % self.config.wandb_log_interval == 0
@@ -1664,6 +1760,9 @@ class ClientAlgorithm:
                 np.size(action_result.final_cost)
                 - np.isfinite(action_result.final_cost).sum()
             ),
+            "stack/num_stacks": float(self.config.num_stacks),
+            "stack/interval": float(self.config.stack_interval),
+            "stack/history_size": float(self.observation_history.size),
             "runtime/cost_apply_ms": cost_apply_ms,
             "runtime/observation_ms": observation_build_ms,
             "runtime/actor_inference_ms": (

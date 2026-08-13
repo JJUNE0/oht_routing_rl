@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import time
-from dataclasses import fields
 
 import numpy as np
 import torch
@@ -23,13 +22,14 @@ from .replay_types import (
     ContextualStepSnapshot,
     ReplaySampleKey,
 )
+from .stacking import stack_offsets, validate_stack_config
 
 
 class ContextualReplayError(RuntimeError):
     pass
 
 
-REPLAY_VERSION = "contextual_step_snapshot_uniform_v1"
+REPLAY_VERSION = "contextual_step_snapshot_stacked_window_v3"
 REPLAY_SAMPLING_VERSION = "contextual_replay_sampling_modes_v2"
 REPLAY_SAMPLING_RAIL = "rail"
 REPLAY_SAMPLING_SNAPSHOT = "snapshot"
@@ -119,6 +119,8 @@ class ContextualStepReplayBuffer:
         lap_min_priority: float = 1.0,
         action_version: str = ACTION_VERSION,
         sampling_mode: str = REPLAY_SAMPLING_RAIL,
+        num_stacks: int = 1,
+        stack_interval: int = 1,
     ):
         if int(capacity_env_steps) <= 0:
             raise ValueError("capacity_env_steps must be positive")
@@ -148,6 +150,12 @@ class ContextualStepReplayBuffer:
         self.lap_min_priority = float(lap_min_priority)
         self.action_version = str(action_version)
         self.sampling_mode = str(sampling_mode)
+        self.num_stacks, self.stack_interval = validate_stack_config(
+            num_stacks, stack_interval
+        )
+        self._stack_offsets = stack_offsets(
+            self.num_stacks, self.stack_interval
+        )
         self._priority = (
             np.zeros((self.capacity, self.controlled_count), np.float32)
             if self.lap_enabled else None
@@ -200,6 +208,11 @@ class ContextualStepReplayBuffer:
         self._next_state_gen_ref = np.empty(self.capacity, np.int64)
         self._transition_generation = np.zeros(self.capacity, np.int64)
         self._transition_valid = np.zeros(self.capacity, bool)
+        self._transition_keys: list[tuple[int, int] | None] = [
+            None
+        ] * self.capacity
+        self._key_to_transition: dict[tuple[int, int], tuple[int, int]] = {}
+        self._episode_first_step: dict[int, int] = {}
         self._transition_cursor = 0
 
         id_to_physical = {
@@ -290,6 +303,44 @@ class ContextualStepReplayBuffer:
         self._key_to_state[key] = (slot, generation)
         return slot, generation
 
+    def _state_reference(self, episode: int, step: int) -> tuple[int, int] | None:
+        origin = self._episode_first_step.get(int(episode))
+        if origin is None:
+            return None
+        requested = max(int(step), int(origin))
+        reference = self._key_to_state.get((int(episode), requested))
+        if reference is None:
+            return None
+        slot, generation = reference
+        if not (
+            self._state_valid[slot]
+            and self._state_generation[slot] == generation
+        ):
+            return None
+        return int(slot), int(generation)
+
+    def _transition_reference(
+        self, episode: int, step: int, *, pad_episode_start: bool = False
+    ) -> tuple[int, int] | None:
+        origin = self._episode_first_step.get(int(episode))
+        if origin is None:
+            return None
+        requested = int(step)
+        if requested < int(origin):
+            if not pad_episode_start:
+                return None
+            requested = int(origin)
+        reference = self._key_to_transition.get((int(episode), requested))
+        if reference is None:
+            return None
+        slot, generation = reference
+        if not (
+            self._transition_valid[slot]
+            and self._transition_generation[slot] == generation
+        ):
+            return None
+        return int(slot), int(generation)
+
     def push(self, snapshot: ContextualStepSnapshot) -> ReplaySampleKey:
         self._validate_snapshot(snapshot)
         state_key = (int(snapshot.episode_id), int(snapshot.env_step))
@@ -297,6 +348,7 @@ class ContextualStepReplayBuffer:
         if state_key[0] != next_key[0]:
             self.episode_crossing_count += 1
             raise ContextualReplayError("episode-crossing snapshot")
+        self._episode_first_step.setdefault(state_key[0], state_key[1])
         state_slot, state_gen = self._store_state(
             state_key, snapshot.physical_local_state, snapshot.global_state
         )
@@ -309,6 +361,11 @@ class ContextualStepReplayBuffer:
         self._transition_cursor = (slot + 1) % self.capacity
         if self._transition_valid[slot]:
             self.overwrite_count += 1
+            old_key = self._transition_keys[slot]
+            if old_key is not None:
+                current = self._key_to_transition.get(old_key)
+                if current is not None and current[0] == slot:
+                    self._key_to_transition.pop(old_key, None)
         generation = int(self._transition_generation[slot]) + 1
         self._policy_action[slot] = snapshot.policy_action[:, 0]
         self._applied_action[slot] = snapshot.applied_action[:, 0]
@@ -321,6 +378,8 @@ class ContextualStepReplayBuffer:
         self._next_state_gen_ref[slot] = next_gen
         self._transition_generation[slot] = generation
         self._transition_valid[slot] = True
+        self._transition_keys[slot] = state_key
+        self._key_to_transition[state_key] = (slot, generation)
         if self.lap_enabled:
             self._priority[slot].fill(self.max_priority)
             self._priority_sum[slot] = (
@@ -357,7 +416,33 @@ class ContextualStepReplayBuffer:
             & (self._state_generation[self._next_state_slot[candidates]]
                == self._next_state_gen_ref[candidates])
         )
-        return candidates[state_ok & next_ok]
+        candidates = candidates[state_ok & next_ok]
+        if self.num_stacks == 1 or candidates.size == 0:
+            return candidates
+
+        # A retained episode origin may be duplicated for its initial stack.
+        # If that origin has already fallen out of the circular buffer, only
+        # sample steps at least one complete history horizon after the oldest
+        # retained transition for that episode.
+        eligible = np.zeros(candidates.size, dtype=bool)
+        episodes = self._episode_id[candidates]
+        steps = self._env_step[candidates]
+        history_horizon = self._stack_offsets[-1]
+        for episode in np.unique(episodes):
+            positions = np.flatnonzero(episodes == episode)
+            episode_steps = steps[positions]
+            origin = self._episode_first_step.get(int(episode))
+            origin_retained = bool(
+                origin is not None and np.any(episode_steps == int(origin))
+            )
+            if origin_retained:
+                eligible[positions] = True
+            else:
+                oldest_retained = int(episode_steps.min())
+                eligible[positions] = (
+                    episode_steps >= oldest_retained + history_horizon
+                )
+        return candidates[eligible]
 
     def validate_sample_keys(self, keys) -> None:
         keys = tuple(keys)
@@ -389,6 +474,10 @@ class ContextualStepReplayBuffer:
                     == generations[bounded]
                 )
             )
+        bounded = np.flatnonzero(valid)
+        if bounded.size and self.num_stacks > 1:
+            valid_slots = self._valid_transition_slots()
+            valid[bounded] &= np.isin(slots[bounded], valid_slots)
         bounded = np.flatnonzero(valid)
         if bounded.size:
             checked_slots = slots[bounded]
@@ -469,6 +558,64 @@ class ContextualStepReplayBuffer:
     def _readonly_normalize(normalizer, values, name):
         # normalize() is read-only; update() is intentionally never called.
         return normalizer.normalize(values, name=name)
+
+    def _history_slot_arrays(self, transition_slots: np.ndarray):
+        unique_slots, inverse = np.unique(
+            np.asarray(transition_slots, dtype=np.int64), return_inverse=True
+        )
+        shape = (unique_slots.size, self.num_stacks)
+        state_history = np.empty(shape, np.int64)
+        next_state_history = np.empty(shape, np.int64)
+        action_history = np.full(shape, -1, np.int64)
+        next_action_history = np.full(shape, -1, np.int64)
+        for row, transition_slot in enumerate(unique_slots):
+            episode = int(self._episode_id[transition_slot])
+            step = int(self._env_step[transition_slot])
+            origin = self._episode_first_step.get(episode)
+            if origin is None:
+                raise ContextualReplayError("sampled episode has no stack origin")
+            for index, offset in enumerate(self._stack_offsets):
+                state_reference = self._state_reference(
+                    episode, step - offset
+                )
+                next_state_reference = self._state_reference(
+                    episode, step + 1 - offset
+                )
+                if state_reference is None or next_state_reference is None:
+                    raise ContextualReplayError(
+                        "sampled transition lost required state history"
+                    )
+                state_history[row, index] = state_reference[0]
+                next_state_history[row, index] = next_state_reference[0]
+
+                action_step = step - offset
+                action_reference = self._transition_reference(
+                    episode, action_step, pad_episode_start=True
+                )
+                if action_reference is None:
+                    raise ContextualReplayError(
+                        "sampled transition lost required action history"
+                    )
+                action_history[row, index] = action_reference[0]
+
+                if index > 0:
+                    next_action_step = step + 1 - offset
+                    next_action_reference = self._transition_reference(
+                        episode,
+                        next_action_step,
+                        pad_episode_start=True,
+                    )
+                    if next_action_reference is None:
+                        raise ContextualReplayError(
+                            "sampled transition lost required next-action history"
+                        )
+                    next_action_history[row, index] = next_action_reference[0]
+        return (
+            state_history[inverse],
+            next_state_history[inverse],
+            action_history[inverse],
+            next_action_history[inverse],
+        )
 
     def sample(
         self, batch_size: int, *, device: str | torch.device = "cpu"
@@ -575,39 +722,50 @@ class ContextualStepReplayBuffer:
                 1.0 / (len(valid_slots) * self.controlled_count),
                 np.float64,
             )
-        state_slots = self._state_slot[transition_slots]
-        next_slots = self._next_state_slot[transition_slots]
+        (
+            state_slots,
+            next_slots,
+            action_slots,
+            next_action_slots,
+        ) = self._history_slot_arrays(transition_slots)
+        batch_count = int(transition_slots.size)
         state_global_raw = self._global[state_slots]
         next_global_raw = self._global[next_slots]
         global_norm = self._readonly_normalize(
             self.observation_builder.global_normalizer,
-            state_global_raw, "replay_state_global"
-        )
+            state_global_raw.reshape(-1, GLOBAL_DIM), "replay_state_global"
+        ).reshape(batch_count, self.num_stacks, GLOBAL_DIM)
         next_global_norm = self._readonly_normalize(
             self.observation_builder.global_normalizer,
-            next_global_raw, "replay_next_global"
-        )
+            next_global_raw.reshape(-1, GLOBAL_DIM), "replay_next_global"
+        ).reshape(batch_count, self.num_stacks, GLOBAL_DIM)
         center_rows = self._center_rows[controlled_rows]
         incoming_rows = self._incoming_rows[controlled_rows]
         outgoing_rows = self._outgoing_rows[controlled_rows]
-        current_center_raw = self._physical[state_slots, center_rows]
+        current_center_raw = self._physical[
+            state_slots, center_rows[:, None]
+        ]
         current_incoming_raw = self._physical[
-            state_slots[:, None], incoming_rows
+            state_slots[:, :, None], incoming_rows[:, None, :]
         ]
         current_outgoing_raw = self._physical[
-            state_slots[:, None], outgoing_rows
+            state_slots[:, :, None], outgoing_rows[:, None, :]
         ]
-        next_center_raw = self._physical[next_slots, center_rows]
+        next_center_raw = self._physical[
+            next_slots, center_rows[:, None]
+        ]
         next_incoming_raw = self._physical[
-            next_slots[:, None], incoming_rows
+            next_slots[:, :, None], incoming_rows[:, None, :]
         ]
         next_outgoing_raw = self._physical[
-            next_slots[:, None], outgoing_rows
+            next_slots[:, :, None], outgoing_rows[:, None, :]
         ]
         local_normalizer = self.observation_builder.local_normalizer
         center = self._readonly_normalize(
-            local_normalizer, current_center_raw, "replay_center_local"
-        )
+            local_normalizer,
+            current_center_raw.reshape(-1, LOCAL_DIM),
+            "replay_center_local",
+        ).reshape(batch_count, self.num_stacks, LOCAL_DIM)
         incoming = self._readonly_normalize(
             local_normalizer,
             current_incoming_raw.reshape(-1, LOCAL_DIM),
@@ -619,8 +777,10 @@ class ContextualStepReplayBuffer:
             "replay_outgoing_local",
         ).reshape(current_outgoing_raw.shape)
         next_center = self._readonly_normalize(
-            local_normalizer, next_center_raw, "replay_next_center_local"
-        )
+            local_normalizer,
+            next_center_raw.reshape(-1, LOCAL_DIM),
+            "replay_next_center_local",
+        ).reshape(batch_count, self.num_stacks, LOCAL_DIM)
         next_incoming = self._readonly_normalize(
             local_normalizer,
             next_incoming_raw.reshape(-1, LOCAL_DIM),
@@ -632,34 +792,73 @@ class ContextualStepReplayBuffer:
             "replay_next_outgoing_local",
         ).reshape(next_outgoing_raw.shape)
 
+        relation_shape = (
+            batch_count,
+            self.num_stacks,
+            self._incoming_rows.shape[1],
+            self.observation_builder._incoming_relation.shape[-1],
+        )
+        incoming_relation = np.broadcast_to(
+            self.observation_builder._incoming_relation[controlled_rows, None],
+            relation_shape,
+        )
+        outgoing_relation = np.broadcast_to(
+            self.observation_builder._outgoing_relation[controlled_rows, None],
+            relation_shape,
+        )
+
+        safe_action_slots = np.maximum(action_slots, 0)
+        safe_next_action_slots = np.maximum(next_action_slots, 0)
+        action_rows = controlled_rows[:, None]
+        policy_action = self._policy_action[
+            safe_action_slots, action_rows
+        ].astype(np.float32, copy=True)
+        applied_action = self._applied_action[
+            safe_action_slots, action_rows
+        ].astype(np.float32, copy=True)
+        next_applied_action = self._applied_action[
+            safe_next_action_slots, action_rows
+        ].astype(np.float32, copy=True)
+        policy_action[action_slots < 0] = 0.0
+        applied_action[action_slots < 0] = 0.0
+        next_applied_action[next_action_slots < 0] = 0.0
+
+        if self.num_stacks == 1:
+            center = center[:, 0]
+            incoming = incoming[:, 0]
+            outgoing = outgoing[:, 0]
+            incoming_relation = incoming_relation[:, 0]
+            outgoing_relation = outgoing_relation[:, 0]
+            global_norm = global_norm[:, 0]
+            next_center = next_center[:, 0]
+            next_incoming = next_incoming[:, 0]
+            next_outgoing = next_outgoing[:, 0]
+            next_global_norm = next_global_norm[:, 0]
+            policy_action = policy_action[:, 0, None]
+            applied_action = applied_action[:, 0, None]
+            next_applied_action = next_applied_action[:, 0, None]
+        else:
+            policy_action = policy_action[:, :, None]
+            applied_action = applied_action[:, :, None]
+            next_applied_action = next_applied_action[:, :, None]
+
         arrays = {
             "center_local": center,
             "incoming_local": incoming,
             "outgoing_local": outgoing,
-            "incoming_relation": self.observation_builder._incoming_relation[
-                controlled_rows
-            ],
-            "outgoing_relation": self.observation_builder._outgoing_relation[
-                controlled_rows
-            ],
+            "incoming_relation": incoming_relation,
+            "outgoing_relation": outgoing_relation,
             "global_state": global_norm,
-            "policy_action": self._policy_action[
-                transition_slots, controlled_rows
-            ][:, None],
-            "applied_action": self._applied_action[
-                transition_slots, controlled_rows
-            ][:, None],
+            "policy_action": policy_action,
+            "applied_action": applied_action,
             "reward": self._reward[transition_slots, controlled_rows][:, None],
             "next_center_local": next_center,
             "next_incoming_local": next_incoming,
             "next_outgoing_local": next_outgoing,
-            "next_incoming_relation": self.observation_builder._incoming_relation[
-                controlled_rows
-            ],
-            "next_outgoing_relation": self.observation_builder._outgoing_relation[
-                controlled_rows
-            ],
+            "next_incoming_relation": incoming_relation,
+            "next_outgoing_relation": outgoing_relation,
             "next_global_state": next_global_norm,
+            "next_applied_action": next_applied_action,
             "done": self._done[transition_slots][:, None],
             "controlled_rail_id": self.topology.controlled_rail_ids[
                 controlled_rows
@@ -673,9 +872,13 @@ class ContextualStepReplayBuffer:
         tensors = {}
         for name, values in arrays.items():
             if name in {"controlled_rail_id", "env_step", "episode_id"}:
-                array = np.ascontiguousarray(values, dtype=np.int64)
+                array = np.array(
+                    values, dtype=np.int64, order="C", copy=True
+                )
             else:
-                array = np.ascontiguousarray(values, dtype=np.float32)
+                array = np.array(
+                    values, dtype=np.float32, order="C", copy=True
+                )
             tensors[name] = torch.from_numpy(array).to(target)
         host_to_device_ms = (time.perf_counter() - host_started) * 1000
         keys = tuple(
@@ -695,6 +898,8 @@ class ContextualStepReplayBuffer:
             "replay/sample_applied_action_std": float(
                 arrays["applied_action"].std()
             ),
+            "stack/num_stacks": float(self.num_stacks),
+            "stack/interval": float(self.stack_interval),
             "replay/sample_materialize_ms": materialize_ms,
             "replay/host_to_device_ms": host_to_device_ms,
             "lap/sample_probability_max": float(
@@ -757,6 +962,10 @@ class ContextualStepReplayBuffer:
             "replay/boundary_transition_count": 0.0,
             "replay/episode_crossing_count": float(self.episode_crossing_count),
             "replay/hash_mismatch_count": float(self.hash_mismatch_count),
+            "replay/stack_boundary_excluded_env_steps": float(
+                np.count_nonzero(self._transition_valid)
+                - self.size_env_steps
+            ),
             "replay/storage_bytes": float(self.storage_bytes),
             "replay/estimated_capacity_bytes": float(
                 self.estimate_capacity_bytes(
@@ -769,6 +978,11 @@ class ContextualStepReplayBuffer:
                 self.stale_key_reject_count
             ),
             "lap/new_transition_max_priority": float(self.max_priority),
+            "stack/num_stacks": float(self.num_stacks),
+            "stack/interval": float(self.stack_interval),
+            "stack/history_horizon": float(
+                (self.num_stacks - 1) * self.stack_interval
+            ),
         }
         if self.lap_enabled:
             slots = self._valid_transition_slots()

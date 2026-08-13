@@ -52,6 +52,7 @@ class ContextualReplayBatch:
     next_incoming_relation: torch.Tensor
     next_outgoing_relation: torch.Tensor
     next_global_state: torch.Tensor
+    next_applied_action: torch.Tensor
     done: torch.Tensor
     controlled_rail_id: torch.Tensor
     env_step: torch.Tensor

@@ -139,6 +139,27 @@ actual `9qokskqq` termination configuration: 10,000-step episode grace,
 penalty of `-20`. Reward Q requires fresh critic, target critic, replay, and
 reward-version state.
 
+## Reward R: backlog pressure rebalance
+
+Reward R keeps Reward Q's actor, critic, SALE, replay, TAT/OP terms,
+termination contract, parameterDw episode reset, and all learner
+hyperparameters. It changes only `backlog_weight=0.0008 -> 0.008` and
+`backlog_growth_weight=0.24 -> 0.16`. Its global raw backlog terms are therefore
+`-0.008*B_t - 0.16*clip(max(0, B_t-B_{t-300})/30, 0, 1)` before the unchanged
+global alpha `0.5`. Reward Q checkpoints, replay, and reward-normalizer state
+are incompatible; start Reward R fresh.
+
+## Reward S: component rebalance
+
+Reward S changes Reward R's `backlog_weight=0.008 -> 0.0048`,
+`backlog_growth_weight=0.16 -> 0.10`, `tat_weight=11 -> 5.5`,
+`local_reward_scale=2.0 -> 0.5`, and `rail_tat_weight=40 -> 85`.
+`local_predicted_oht_weight=0.10`, `rail_tat_clip=1`, `op_weight=4`,
+`idle_reserve_weight=0`, and `smooth_b_rl_weight=0.25` remain unchanged.
+Because the local reward is divided by `local_reward_scale`, the same local raw
+reward contributes four times Reward R's magnitude. Start Reward S with fresh
+checkpoint, replay, and reward-normalizer state.
+
 실행 후 simulator GUI에서 Python 연동을 활성화하고 Run을 시작합니다.
 
 ## Command 6 dispatch mode

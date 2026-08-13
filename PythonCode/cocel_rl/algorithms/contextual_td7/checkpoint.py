@@ -17,9 +17,10 @@ from .learner import LEARNER_VERSION
 from .replay_buffer import REPLAY_VERSION
 from .replay_buffer import LAP_VERSION
 from .sale import SALE_VERSION
+from .stacking import STACK_VERSION
 
 
-CHECKPOINT_VERSION = "contextual_td7_checkpoint_v4_full_runtime_config"
+CHECKPOINT_VERSION = "contextual_td7_checkpoint_v5_stacked_runtime_config"
 LEGACY_CHECKPOINT_VERSIONS = {
     "contextual_td7_checkpoint_v3_independent_twin_critic",
 }
@@ -149,6 +150,7 @@ def save_contextual_checkpoint(
         "reward_version": REWARD_VERSION,
         "action_version": action_version(learner.config.action_mode),
         "replay_version": REPLAY_VERSION,
+        "stack_version": STACK_VERSION,
         "topology_hash": learner.replay.topology.topology_hash,
         "mapping_hash": learner.replay.topology.mapping_hash,
         "network_config": asdict(learner.network_config),
@@ -267,6 +269,7 @@ def load_contextual_checkpoint(
         "observation_version": OBSERVATION_VERSION,
         "action_version": action_version(learner.config.action_mode),
         "replay_version": REPLAY_VERSION,
+        "stack_version": STACK_VERSION,
         "topology_hash": learner.replay.topology.topology_hash,
         "mapping_hash": learner.replay.topology.mapping_hash,
         "network_config": asdict(learner.network_config),

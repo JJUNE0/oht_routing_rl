@@ -2,9 +2,11 @@ from dataclasses import dataclass
 
 from contextual_action import ACTION_MODES, REGION_B_RL
 
+from .stacking import validate_stack_config
+
 
 ALGORITHM_VERSION = (
-    "contextual_directional_td7_independent_twin_critic_v1"
+    "contextual_directional_td7_stacked_independent_twin_critic_v2"
 )
 
 
@@ -31,6 +33,8 @@ class ContextualNetworkConfig:
     hidden_dim: int = 256
     action_dim: int = 1
     dropout: float = 0.0
+    num_stacks: int = 1
+    stack_interval: int = 1
 
     def __post_init__(self):
         positive = (
@@ -55,6 +59,7 @@ class ContextualNetworkConfig:
             raise ValueError("contextual network v1 requires attention_layers=1")
         if not 0.0 <= float(self.dropout) < 1.0:
             raise ValueError("dropout must be in [0, 1)")
+        validate_stack_config(self.num_stacks, self.stack_interval)
 
     @property
     def neighbor_token_dim(self) -> int:
@@ -63,6 +68,18 @@ class ContextualNetworkConfig:
     @property
     def fusion_input_dim(self) -> int:
         return self.d_model * 3 + self.global_emb_dim
+
+    @property
+    def stacked_context_dim(self) -> int:
+        return self.context_dim * self.num_stacks
+
+    @property
+    def stacked_action_dim(self) -> int:
+        return self.action_dim * self.num_stacks
+
+    @property
+    def critic_input_dim(self) -> int:
+        return (self.context_dim + self.action_dim) * self.num_stacks
 
 
 @dataclass(frozen=True)

@@ -1035,3 +1035,53 @@ architectural stabilization change is selected.
   replay or frozen observation-normalizer state.
 - `EXP_META.note=n_ablate_backlog08_growth24_pred10_rail40_noidle_dwreset`.
   No simulator or W&B run was launched for this implementation change.
+
+## 2026-08-11 - Reward R backlog pressure rebalance
+
+- Reward version: `R`; contract version:
+  `contextual_controlled_reward_v20_backlog_pressure_rebalance`.
+- Changed only `backlog_weight=0.0008 -> 0.008` and
+  `backlog_growth_weight=0.24 -> 0.16`.
+- Preserved Reward Q's one-sided unbounded TAT term, OP term, predicted-OHT
+  weight `0.10`, rail weight `40`, disabled idle-reserve term, smoothing,
+  termination contract, parameterDw episode reset, actor/critic architecture,
+  SALE, replay, and every learner hyperparameter.
+- `EXP_META.note=backlog8e3_growth16_dwreset`. Reward Q and all older
+  checkpoints, replay, and reward-normalizer state are incompatible; start a
+  fresh Reward R run. No simulator or W&B run was launched for this change.
+
+## 2026-08-11 - Contextual latent observation/action stacking
+
+- Added configurable `num_stacks` and `stack_interval` runtime/CLI settings;
+  both default to `1`, preserving the former one-frame input contract.
+- Each structured observation frame is processed by the shared directional
+  contextual encoder before latent concatenation. The actor receives
+  `[z_t, z_t-I, ...]`; the critic receives frame-interleaved
+  `[z_t, applied_a_t, z_t-I, applied_a_t-I, ...]`.
+- Replay continues to store one raw state snapshot per environment step and
+  materializes current/next histories at sample time. If an episode's first
+  transition is retained, its initial history repeats both that transition's
+  observation and applied action. If the circular buffer has already discarded
+  the episode origin, sampling begins at `oldest_retained + history_horizon`
+  (`history_horizon=(num_stacks-1)*stack_interval`) instead of maintaining
+  per-transition overwrite-invalid flags. Ring indices never wrap into
+  unrelated history or another episode.
+- SALE online/fixed/target representations, online actor inference, checkpoint
+  metadata, and W&B experiment metadata use the same stack contract. Versions
+  were bumped for the algorithm, learner, replay, SALE, and checkpoint schemas;
+  Reward remains `R` because its formula is unchanged.
+- `EXP_META.note=stack`. No simulator or W&B run was launched for this
+  implementation change. Stacked runs require a fresh checkpoint/replay.
+
+## 2026-08-12 - Reward S component rebalance
+
+- Reward version: `S`; contract version:
+  `contextual_controlled_reward_v21_component_rebalance`.
+- Changed `backlog_weight=0.008 -> 0.0048`,
+  `backlog_growth_weight=0.16 -> 0.10`, `tat_weight=11 -> 5.5`,
+  `local_reward_scale=2.0 -> 0.5`, and `rail_tat_weight=40 -> 85`; preserved
+  `local_predicted_oht_weight=0.10`, `rail_tat_clip=1`, `op_weight=4`,
+  `idle_reserve_weight=0`, and `smooth_b_rl_weight=0.25`.
+- `EXP_META.note=rewardrebalance`. Reward R and older checkpoints, replay, and
+  reward-normalizer state are incompatible; start a fresh Reward S run. No
+  simulator or W&B run was launched for this change.

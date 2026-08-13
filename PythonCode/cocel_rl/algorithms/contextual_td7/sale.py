@@ -10,9 +10,10 @@ from torch import nn
 
 from .config import ContextualNetworkConfig
 from .networks import DirectionalContextEncoder
+from .stacking import encode_observation_stack, flatten_state_stack
 
 
-SALE_VERSION = "contextual_sale_avg_l1_v1"
+SALE_VERSION = "contextual_sale_stacked_avg_l1_v2"
 
 
 def avg_l1_norm(value: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -29,10 +30,17 @@ class SALEStateEncoder(nn.Module):
         self.context = DirectionalContextEncoder(
             network_config or ContextualNetworkConfig()
         )
-        self.projection = nn.Linear(self.context.config.context_dim, embedding_dim)
+        self.projection = nn.Linear(
+            self.context.config.stacked_context_dim, embedding_dim
+        )
 
     def forward(self, *observation):
-        context = self.context(*observation, return_attention=False).state
+        encoded = encode_observation_stack(
+            self.context, observation, return_attention=False
+        )
+        context = flatten_state_stack(
+            encoded.state, self.context.config.num_stacks
+        )
         return avg_l1_norm(self.projection(context))
 
 
@@ -55,8 +63,11 @@ class SALEStateActionEncoder(nn.Module):
 class SALEOnline(nn.Module):
     def __init__(self, network_config=None, embedding_dim=256):
         super().__init__()
-        self.state_encoder = SALEStateEncoder(network_config, embedding_dim)
-        self.state_action_encoder = SALEStateActionEncoder(embedding_dim)
+        config = network_config or ContextualNetworkConfig()
+        self.state_encoder = SALEStateEncoder(config, embedding_dim)
+        self.state_action_encoder = SALEStateActionEncoder(
+            embedding_dim, config.stacked_action_dim
+        )
 
     def state(self, observation):
         return self.state_encoder(*observation)

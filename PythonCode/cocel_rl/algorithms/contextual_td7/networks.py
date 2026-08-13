@@ -5,6 +5,7 @@ from torch import nn
 
 from .attention import DirectionalCrossAttention
 from .config import ContextualNetworkConfig
+from .stacking import interleave_state_action
 
 
 class ContextualNetworkError(FloatingPointError):
@@ -199,12 +200,12 @@ class ContextualActor(nn.Module):
         cfg = self.config
         self.sale_enabled = sale_embedding_dim > 0
         self.task_projection = (
-            nn.Linear(cfg.context_dim, sale_feature_dim)
+            nn.Linear(cfg.stacked_context_dim, sale_feature_dim)
             if self.sale_enabled else None
         )
         input_dim = (
             sale_feature_dim + sale_embedding_dim
-            if self.sale_enabled else cfg.context_dim
+            if self.sale_enabled else cfg.stacked_context_dim
         )
         self.network = nn.Sequential(
             nn.Linear(input_dim, cfg.hidden_dim),
@@ -220,7 +221,7 @@ class ContextualActor(nn.Module):
     def forward(
         self, state: torch.Tensor, sale_state: torch.Tensor | None = None
     ) -> ActorOutput:
-        _require_tensor("state", state, (self.config.context_dim,))
+        _require_tensor("state", state, (self.config.stacked_context_dim,))
         if self.sale_enabled:
             from .sale import avg_l1_norm
             if sale_state is None:
@@ -241,7 +242,7 @@ class ContextualActor(nn.Module):
 class CriticHead(nn.Module):
     def __init__(self, config: ContextualNetworkConfig):
         super().__init__()
-        input_dim = config.context_dim + config.action_dim
+        input_dim = config.critic_input_dim
         self.network = nn.Sequential(
             nn.Linear(input_dim, config.hidden_dim),
             nn.LayerNorm(config.hidden_dim),
@@ -288,7 +289,7 @@ class ContextualTwinCritic(nn.Module):
         if self.sale_enabled:
             from .sale import avg_l1_norm
             self.task_sa_projection = nn.Linear(
-                self.config.context_dim + self.config.action_dim,
+                self.config.critic_input_dim,
                 sale_feature_dim,
             )
             input_dim = sale_feature_dim + 2 * sale_embedding_dim
@@ -308,11 +309,17 @@ class ContextualTwinCritic(nn.Module):
         sale_state: torch.Tensor | None = None,
         sale_state_action: torch.Tensor | None = None,
     ) -> TwinCriticOutput:
-        _require_tensor("state", state, (self.config.context_dim,))
-        _require_tensor("action", action, (self.config.action_dim,))
+        _require_tensor("state", state, (self.config.stacked_context_dim,))
+        _require_tensor("action", action, (self.config.stacked_action_dim,))
         if state.shape[0] != action.shape[0]:
             raise ValueError("state/action batch sizes differ")
-        state_action = torch.cat((state, action), dim=-1)
+        state_action = interleave_state_action(
+            state,
+            action,
+            num_stacks=self.config.num_stacks,
+            context_dim=self.config.context_dim,
+            action_dim=self.config.action_dim,
+        )
         if self.sale_enabled:
             from .sale import avg_l1_norm
             if sale_state is None or sale_state_action is None:

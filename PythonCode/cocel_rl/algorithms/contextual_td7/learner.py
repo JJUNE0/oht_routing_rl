@@ -18,9 +18,15 @@ from .networks import (
 )
 from .targets import bellman_target, scale_policy_action, target_applied_action
 from .sale import SALEOnline, frozen_sale_copy
+from .stacking import (
+    encode_observation_stack,
+    flatten_action_stack,
+    flatten_state_stack,
+    replace_current_action,
+)
 
 
-LEARNER_VERSION = "contextual_td7_independent_twin_critic_v4"
+LEARNER_VERSION = "contextual_td7_stacked_independent_twin_critic_v5"
 LEARNER_PERFORMANCE_VERSION = "contextual_td7_sparse_diagnostics_v1"
 DIAGNOSTICS_INTERVAL = 10
 
@@ -112,6 +118,15 @@ class ContextualTD7Learner:
         self.network_config = network_config or ContextualNetworkConfig()
         self.config = config or ContextualLearnerConfig()
         self.device = torch.device(device)
+        if (
+            int(getattr(replay, "num_stacks", 1))
+            != self.network_config.num_stacks
+            or int(getattr(replay, "stack_interval", 1))
+            != self.network_config.stack_interval
+        ):
+            raise ValueError(
+                "replay and network stack configurations must match"
+            )
         torch.manual_seed(int(seed))
         if self.device.type == "cuda":
             torch.cuda.manual_seed_all(int(seed))
@@ -308,8 +323,18 @@ class ContextualTD7Learner:
         step = self.learner_update_count
 
         encoder_start = time.perf_counter()
-        online_encoding = self.encoder(
-            *_observation_args(batch), return_attention=False
+        online_encoding = encode_observation_stack(
+            self.encoder,
+            _observation_args(batch),
+            return_attention=False,
+        )
+        online_state = flatten_state_stack(
+            online_encoding.state, self.network_config.num_stacks
+        )
+        replay_applied = flatten_action_stack(
+            batch.applied_action,
+            num_stacks=self.network_config.num_stacks,
+            action_dim=self.network_config.action_dim,
         )
         self._sync()
         encoder_forward_ms = (time.perf_counter() - encoder_start) * 1000
@@ -323,7 +348,7 @@ class ContextualTD7Learner:
             sale_started = time.perf_counter()
             sale_zs = self.sale_online.state(_observation_args(batch))
             sale_zsa = self.sale_online.state_action(
-                sale_zs, batch.applied_action
+                sale_zs, replay_applied
             )
             with torch.no_grad():
                 sale_next = self.sale_online.state(
@@ -345,9 +370,13 @@ class ContextualTD7Learner:
             sale_loss_value = float(sale_loss.detach().cpu())
 
         with torch.no_grad():
-            next_encoding = self.target_encoder(
-                *_observation_args(batch, next_state=True),
+            next_encoding = encode_observation_stack(
+                self.target_encoder,
+                _observation_args(batch, next_state=True),
                 return_attention=False,
+            )
+            next_state = flatten_state_stack(
+                next_encoding.state, self.network_config.num_stacks
             )
             target_sale_zs = target_sale_zsa = None
             if self.config.sale_enabled:
@@ -355,22 +384,28 @@ class ContextualTD7Learner:
                     _observation_args(batch, next_state=True)
                 )
                 next_policy = self.target_actor(
-                    next_encoding.state, target_sale_zs
+                    next_state, target_sale_zs
                 ).action
             else:
-                next_policy = self.target_actor(next_encoding.state).action
-            next_applied = target_applied_action(
+                next_policy = self.target_actor(next_state).action
+            next_current_applied = target_applied_action(
                 next_policy,
                 action_scale=self.applied_action_scale,
                 noise_std=self.config.target_noise,
                 noise_clip=self.config.target_noise_clip,
+            )
+            next_applied = replace_current_action(
+                batch.next_applied_action,
+                next_current_applied,
+                num_stacks=self.network_config.num_stacks,
+                action_dim=self.network_config.action_dim,
             )
             if self.config.sale_enabled:
                 target_sale_zsa = self.sale_target_fixed.state_action(
                     target_sale_zs, next_applied
                 )
             target_q_pair = self.target_critic(
-                next_encoding.state, next_applied,
+                next_state, next_applied,
                 target_sale_zs, target_sale_zsa,
             )
             tq1, tq2 = target_q_pair.q1, target_q_pair.q2
@@ -404,14 +439,14 @@ class ContextualTD7Learner:
             if self.config.sale_enabled:
                 fixed_zs = self.sale_fixed.state(_observation_args(batch))
                 fixed_zsa = self.sale_fixed.state_action(
-                    fixed_zs, batch.applied_action
+                    fixed_zs, replay_applied
                 )
 
         critic_start = time.perf_counter()
         # Contract: replay policy_action is diagnostics only. Critic supervision
         # consumes the residual that was actually applied to the simulator.
         q_pair = self.critic(
-            online_encoding.state, batch.applied_action, fixed_zs, fixed_zsa
+            online_state, replay_applied, fixed_zs, fixed_zsa
         )
         loss_function = (
             F.smooth_l1_loss
@@ -455,13 +490,24 @@ class ContextualTD7Learner:
             # The encoder is owned by the critic representation update only.
             # Actor optimization uses a detached post-critic encoding.
             with torch.no_grad():
-                actor_state = self.encoder(
-                    *_observation_args(batch), return_attention=False
-                ).state
+                actor_encoding = encode_observation_stack(
+                    self.encoder,
+                    _observation_args(batch),
+                    return_attention=False,
+                )
+                actor_state = flatten_state_stack(
+                    actor_encoding.state, self.network_config.num_stacks
+                )
                 actor_sale_zs = fixed_zs
             policy_output = self.actor(actor_state, actor_sale_zs)
-            actor_applied = scale_policy_action(
+            actor_current_applied = scale_policy_action(
                 policy_output.action, self.applied_action_scale
+            )
+            actor_applied = replace_current_action(
+                batch.applied_action,
+                actor_current_applied,
+                num_stacks=self.network_config.num_stacks,
+                action_dim=self.network_config.action_dim,
             )
             critic_flags = [p.requires_grad for p in self.critic.parameters()]
             for parameter in self.critic.parameters():
@@ -493,8 +539,8 @@ class ContextualTD7Learner:
             self.last_actor_update_step = step
             policy_mean = float(policy_output.action.detach().mean().cpu())
             policy_std = float(policy_output.action.detach().std().cpu())
-            applied_mean = float(actor_applied.detach().mean().cpu())
-            applied_std = float(actor_applied.detach().std().cpu())
+            applied_mean = float(actor_current_applied.detach().mean().cpu())
+            applied_std = float(actor_current_applied.detach().std().cpu())
             self._sync()
             actor_update_ms = (time.perf_counter() - actor_start) * 1000
 
