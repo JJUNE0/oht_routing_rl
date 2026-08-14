@@ -1169,3 +1169,23 @@ architectural stabilization change is selected.
   after completion. The completion tick forces one W&B log so the default
   10-tick interval cannot miss it. W&B/export schema is
   `contextual_wandb_compact_v6_reward_u_command_trace`; no run was launched.
+
+## 2026-08-14 - Previous applied action for actor and critic
+
+- Observation/learner contract change; Reward U formula and version are
+  unchanged. At decision step `t`, the actor receives
+  `(observation_t, applied_action_(t-1))` and the critic receives
+  `(observation_t, applied_action_(t-1), candidate_action_t)`. The previous
+  action is a separate bounded controller-memory input and is not included in
+  the physical observation running normalizer. Each stacked observation frame
+  is paired with the action immediately preceding that frame; the next state
+  is explicitly checked against the transition's executed action. Versions:
+  observation `physical_raw_contextual_previous_applied_action_v2`, algorithm
+  `contextual_directional_td7_previous_applied_action_v3`, stack
+  `contextual_latent_obs_previous_current_applied_action_stack_v3`, replay
+  `contextual_step_snapshot_previous_applied_action_v4`, learner
+  `contextual_td7_previous_applied_action_actor_critic_v6`, checkpoint
+  `contextual_td7_checkpoint_v6_previous_applied_action_actor_critic`; runtime
+  variants use the `v3_prevact` suffix to isolate checkpoint directories.
+  `EXP_META.note=prevact`; start from fresh replay/checkpoint state. No run was
+  launched.
