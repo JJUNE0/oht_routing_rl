@@ -16,15 +16,22 @@ from contextual_observation import RunningFeatureNormalizer
 from contextual_reward_diagnostic import RewardDiagnosticWriter
 from contextual_topology import ContextualTopology
 
-REWARD_VERSION = "S"
+REWARD_VERSION = "U"
 REWARD_CONTRACT_VERSION = (
-    "contextual_controlled_reward_v21_e_structure_signed_total_tat"
+    "contextual_controlled_reward_v23_completion_tat_global_raw_local_running_norm"
 )
-REWARD_TAT_VERSION = "signed_total_tat_level_ref165_v1"
+REWARD_TAT_VERSION = "actual_new_completion_cmd_tat_ref165_v1"
 REWARD_NORMALIZATION_VERSION = (
-    "reward_e_running_global_local_normalizer_v1"
+    "reward_u_global_raw_local_running_normalizer_v1"
 )
 TAT_PENALTY_START = 160.0
+
+TAT_SIGNAL_COMPLETION_EVENT = "completion_event"
+TAT_SIGNAL_TOTAL_TAT_LEVEL = "total_tat_level"
+TAT_SIGNAL_MODES = (
+    TAT_SIGNAL_COMPLETION_EVENT,
+    TAT_SIGNAL_TOTAL_TAT_LEVEL,
+)
 
 RAIL_REWARD_FIXED_TAT_REFERENCE = "fixed_tat_reference"
 RAIL_REWARD_BASELINE_RATIO = "baseline_ratio"
@@ -62,9 +69,9 @@ class ContextualRewardConfig:
     action_mode: str = REGION_B_RL
     smooth_b_rl_weight: float = 0.05
     smooth_exp_residual_weight: float = 0.5
-    tat_weight: float = 9.2
+    tat_weight: float = 2.3
     op_weight: float = 0.0
-    backlog_weight: float = 0.01
+    backlog_weight: float = 0.0025
     backlog_growth_enabled: bool = False
     backlog_growth_horizon: int = 300
     backlog_growth_scale: float = 30.0
@@ -82,11 +89,13 @@ class ContextualRewardConfig:
     use_backlog: bool = True
     tat_reference: float = 165.0
     tat_one_sided: bool = False
+    tat_signal_mode: str = TAT_SIGNAL_COMPLETION_EVENT
     op_reference: float = 0.80
     tat_confidence_n0: float = 50.0
     tat_confidence_ramp: bool = False
     freeze_after_env_steps: int = 30_000
-    reward_normalization_enabled: bool = True
+    global_normalization_enabled: bool = False
+    local_normalization_enabled: bool = True
     local_fixed_scale_enabled: bool = False
     local_reward_scale: float = 1.0
     tat_raw_clip: float | None = None
@@ -115,6 +124,8 @@ class ContextualRewardConfig:
             raise ValueError("tat_reference and normalizer_epsilon must be positive")
         if self.tat_weight < 0:
             raise ValueError("tat_weight must be non-negative")
+        if self.tat_signal_mode not in TAT_SIGNAL_MODES:
+            raise ValueError(f"tat_signal_mode must be one of {TAT_SIGNAL_MODES}")
         if self.local_reward_scale <= 0:
             raise ValueError("local_reward_scale must be positive")
         if self.backlog_weight < 0:
@@ -211,6 +222,16 @@ class ControlledRewardBatch:
     tat_raw_ramped: float
     completed_episode: float
     completed_delta: float
+    completion_count: int
+    completion_valid_count: int
+    completion_invalid_count: int
+    completion_duplicate_count: int
+    completion_tat_mean: float
+    completion_tat_std: float
+    completion_tat_min: float
+    completion_tat_max: float
+    completion_tat_raw: float
+    completion_tat_weighted_raw: float
     op_rate: float
     op_reference: float
     op_error: float
@@ -280,6 +301,8 @@ class OHTCycleTracker:
     tat_segment_count: int = 0
     cycle_tat_valid: bool = True
     last_valid_cmd_tat: float | None = None
+    current_segment_last_state5_cmd_tat: float | None = None
+    current_segment_last_state5_command_id: int | None = None
     last_tat_skip_reason: str | None = None
     rail_time_by_id: dict[int, float] = field(default_factory=dict)
     route_count: int = 0
@@ -308,6 +331,8 @@ class OHTCycleTracker:
         self.tat_segment_count = 0
         self.cycle_tat_valid = True
         self.last_valid_cmd_tat = None
+        self.current_segment_last_state5_cmd_tat = None
+        self.current_segment_last_state5_command_id = None
         self.last_tat_skip_reason = None
         self.rail_time_by_id.clear()
         self.route_count = 0
@@ -442,6 +467,20 @@ class ContextualRewardBuilder:
         self._last_rail_tat_cycle_count = 0
         self._last_rail_tat_controlled_assignment_count = 0
         self._last_rail_tat_uncontrolled_assignment_count = 0
+        self._seen_completed_command_ids: set[int] = set()
+        self._completion_current_job_ids: set[int] = set()
+        self._completion_retired_job_ids: set[int] = set()
+        self._completion_job_tracking_bootstrapped = False
+        self._completion_command_id_reuse_count = 0
+        self._last_new_completion_command_ids: set[int] = set()
+        self._trace_command_id: int | None = None
+        self._trace_command_lifetime = 0
+        self._trace_command_finished = False
+        self._trace_last_cmd_tat = 0.0
+        self._trace_last_oht_tat = 0.0
+        self._trace_last_oht_id = 0
+        self._trace_last_oht_state = int(OHTState.NULL)
+        self._last_command_trace_metrics: dict[str, float] = {}
         self._oht_cycle_trackers.clear()
         self._rail_pass_trackers.clear()
 
@@ -469,6 +508,167 @@ class ContextualRewardBuilder:
         queued = float(getattr(pclient, "QueuedCommandCount", 0) or 0)
         return waiting, queued
 
+    @staticmethod
+    def _active_command_ids(pclient) -> set[int]:
+        command_ids = set()
+        for key, job in getattr(pclient, "JOB_DIC", {}).items():
+            value = getattr(job, "ID", key)
+            try:
+                value = int(value)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if value > 0:
+                command_ids.add(value)
+        return command_ids
+
+    def _refresh_completion_id_lifetimes(self, pclient) -> None:
+        """Allow a retired simulator command ID to represent a new lifetime."""
+        current = self._active_command_ids(pclient)
+        if not self._completion_job_tracking_bootstrapped:
+            self._completion_current_job_ids = current
+            self._completion_job_tracking_bootstrapped = True
+            return
+        reused = current.intersection(self._completion_retired_job_ids)
+        if reused:
+            self._completion_command_id_reuse_count += len(reused)
+            self._seen_completed_command_ids.difference_update(reused)
+            self._completion_retired_job_ids.difference_update(reused)
+        self._completion_retired_job_ids.update(
+            self._completion_current_job_ids.difference(current)
+        )
+        self._completion_current_job_ids = current
+
+    def _new_completion_cmd_tats(self, pclient) -> tuple[list[float], dict]:
+        """Consume each newly completed command exactly once for Reward U."""
+        self._refresh_completion_id_lifetimes(pclient)
+        self._last_new_completion_command_ids = set()
+        values = []
+        candidate_count = 0
+        invalid_count = 0
+        duplicate_count = 0
+        completion_states = {
+            int(OHTState.IDLE),
+            int(OHTState.MOVE_TO_LOAD),
+            int(OHTState.LOADING),
+        }
+        for oht_id, oht in getattr(pclient, "OHT_DIC", {}).items():
+            try:
+                tracker = self._oht_cycle_trackers.get(int(oht_id))
+                current_state = int(getattr(oht, "State", OHTState.NULL))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if (
+                tracker is None
+                or tracker.current_state != int(OHTState.UNLOADING)
+                or current_state not in completion_states
+            ):
+                continue
+            candidate_count += 1
+            command_id = tracker.current_segment_last_state5_command_id
+            cmd_tat = tracker.current_segment_last_state5_cmd_tat
+            trace_command_id = command_id
+            if trace_command_id is None:
+                trace_command_id = tracker.current_segment_job_id
+            if trace_command_id is not None and trace_command_id > 0:
+                self._last_new_completion_command_ids.add(
+                    int(trace_command_id)
+                )
+            if (
+                command_id is None
+                or command_id <= 0
+                or cmd_tat is None
+                or not np.isfinite(cmd_tat)
+                or cmd_tat <= 0.0
+            ):
+                invalid_count += 1
+                continue
+            if command_id in self._seen_completed_command_ids:
+                duplicate_count += 1
+                continue
+            self._seen_completed_command_ids.add(command_id)
+            values.append(float(cmd_tat))
+        return values, {
+            "count": candidate_count,
+            "valid_count": len(values),
+            "invalid_count": invalid_count,
+            "duplicate_count": duplicate_count,
+        }
+
+    def _update_command_trace(self, pclient) -> None:
+        """Trace one deterministic command from first sight through completion."""
+        self._last_command_trace_metrics = {}
+        if self._trace_command_finished:
+            return
+
+        observations = []
+        for raw_oht_id, oht in getattr(pclient, "OHT_DIC", {}).items():
+            try:
+                oht_id = int(raw_oht_id)
+                oht_state = int(getattr(oht, "State", OHTState.NULL))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            active_ids = set()
+            for raw_command_id in (
+                getattr(oht, "JobID", 0),
+                getattr(oht, "DispatchedCommand", 0),
+            ):
+                try:
+                    command_id = int(raw_command_id or 0)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if command_id > 0:
+                    active_ids.add(command_id)
+            for command_id, value in self._oht_tat_entries(oht).items():
+                cmd_tat = self._finite_positive_attr(value, "CmdTat")
+                oht_tat = self._finite_nonnegative_attr(value, "OHTTat")
+                if command_id <= 0 or cmd_tat is None or oht_tat is None:
+                    continue
+                observations.append((
+                    0 if command_id in active_ids else 1,
+                    oht_id,
+                    int(command_id),
+                    float(cmd_tat),
+                    float(oht_tat),
+                    oht_state,
+                ))
+        observations.sort(key=lambda item: (item[0], item[1], item[2]))
+
+        if self._trace_command_id is None and observations:
+            selected = observations[0]
+            self._trace_command_id = int(selected[2])
+            self._trace_command_lifetime += 1
+
+        selected = next(
+            (
+                item for item in observations
+                if item[2] == self._trace_command_id
+            ),
+            None,
+        )
+        if selected is not None:
+            self._trace_last_oht_id = int(selected[1])
+            self._trace_last_cmd_tat = float(selected[3])
+            self._trace_last_oht_tat = float(selected[4])
+            self._trace_last_oht_state = int(selected[5])
+
+        if self._trace_command_id is None:
+            return
+        completed = (
+            self._trace_command_id in self._last_new_completion_command_ids
+        )
+        self._last_command_trace_metrics = {
+            "trace/command/id": float(self._trace_command_id),
+            "trace/command/lifetime": float(self._trace_command_lifetime),
+            "trace/command/available": float(selected is not None),
+            "trace/command/cmd_tat": self._trace_last_cmd_tat,
+            "trace/command/oht_tat": self._trace_last_oht_tat,
+            "trace/command/oht_id": float(self._trace_last_oht_id),
+            "trace/command/oht_state": float(self._trace_last_oht_state),
+            "trace/command/completed": float(completed),
+        }
+        if completed:
+            self._trace_command_finished = True
+
     def _global_raw(self, pclient) -> float:
         cfg = self.config
         cur_tat = float(getattr(pclient, "TotalTat"))
@@ -484,19 +684,42 @@ class ContextualRewardBuilder:
         self._total_completed_jobs += completed_delta
         completed = self._total_completed_jobs
 
-        # Reward S consumes the simulator's TotalTat level directly. Completion
-        # counts remain diagnostic-only and never reconstruct a marginal TAT.
-        tat_signal_available = True
-        tat_error = (
-            -max(0.0, cur_tat - TAT_PENALTY_START) / cfg.tat_reference
-            if cfg.tat_one_sided
-            else (cfg.tat_reference - cur_tat) / cfg.tat_reference
-        )
+        completion_tats = []
+        completion_counts = {
+            "count": 0,
+            "valid_count": 0,
+            "invalid_count": 0,
+            "duplicate_count": 0,
+        }
+        if cfg.tat_signal_mode == TAT_SIGNAL_COMPLETION_EVENT:
+            completion_tats, completion_counts = self._new_completion_cmd_tats(
+                pclient
+            )
+            tat_signal_available = bool(completion_tats)
+            tat_error = float(np.mean([
+                (cfg.tat_reference - cmd_tat) / cfg.tat_reference
+                for cmd_tat in completion_tats
+            ])) if completion_tats else 0.0
+        else:
+            self._last_new_completion_command_ids = set()
+            # Compatibility-only Reward T / legacy branch. Runtime Reward U
+            # selects completion_event and never uses TotalTat in its reward.
+            tat_signal_available = cur_tat > 0.0
+            if tat_signal_available:
+                tat_error = (
+                    -max(0.0, cur_tat - TAT_PENALTY_START)
+                    / cfg.tat_reference
+                    if cfg.tat_one_sided
+                    else (cfg.tat_reference - cur_tat) / cfg.tat_reference
+                )
+            else:
+                tat_error = 0.0
+        self._update_command_trace(pclient)
         tat_raw_preclip = (
             cfg.tat_weight * tat_error if cfg.use_tat else 0.0
         )
-        # The Reward-S contract is signed and unbounded (tat_raw_clip=None).
-        # The legacy one-sided branch also remains unbounded for R/Q replay.
+        # Reward U is signed and unbounded (tat_raw_clip=None). The preserved
+        # Reward-T/legacy compatibility branch is likewise left unbounded.
         tat_raw_postclip = float(tat_raw_preclip)
         tat_confidence = float(tat_signal_available)
         tat_raw_ramped = tat_raw_postclip
@@ -551,6 +774,27 @@ class ContextualRewardBuilder:
             + backlog_growth_raw
             + idle_reserve_raw
         )
+        completion_array = np.asarray(completion_tats, dtype=np.float64)
+        completion_mean = (
+            float(completion_array.mean()) if completion_array.size else 0.0
+        )
+        completion_std = (
+            float(completion_array.std()) if completion_array.size else 0.0
+        )
+        completion_min = (
+            float(completion_array.min()) if completion_array.size else 0.0
+        )
+        completion_max = (
+            float(completion_array.max()) if completion_array.size else 0.0
+        )
+        completion_reward_raw = (
+            tat_error
+            if cfg.tat_signal_mode == TAT_SIGNAL_COMPLETION_EVENT else 0.0
+        )
+        completion_weighted_raw = (
+            tat_raw_ramped
+            if cfg.tat_signal_mode == TAT_SIGNAL_COMPLETION_EVENT else 0.0
+        )
         self._last_global_terms = {
             "tat_error": tat_error,
             "tat_raw_preclip": tat_raw_preclip,
@@ -560,6 +804,16 @@ class ContextualRewardBuilder:
             "total_tat": cur_tat,
             "completed_episode": completed,
             "completed_delta": completed_delta,
+            "completion_count": completion_counts["count"],
+            "completion_valid_count": completion_counts["valid_count"],
+            "completion_invalid_count": completion_counts["invalid_count"],
+            "completion_duplicate_count": completion_counts["duplicate_count"],
+            "completion_tat_mean": completion_mean,
+            "completion_tat_std": completion_std,
+            "completion_tat_min": completion_min,
+            "completion_tat_max": completion_max,
+            "completion_tat_raw": completion_reward_raw,
+            "completion_tat_weighted_raw": completion_weighted_raw,
             "op_rate": cur_op,
             "op_reference": cfg.op_reference,
             "op_error": op_error,
@@ -665,6 +919,7 @@ class ContextualRewardBuilder:
             selected, selection_reason = self._select_oht_tat_entry(oht, entries)
             current_oht_tat = self._finite_positive_attr(selected, "OHTTat")
             current_cmd_tat = self._finite_positive_attr(selected, "CmdTat")
+            current_cmd_id = self._positive_command_id(selected)
             tracker = self._oht_cycle_trackers.get(oht_id)
 
             if tracker is None:
@@ -698,6 +953,7 @@ class ContextualRewardBuilder:
                         current_state,
                         current_oht_tat,
                         current_cmd_tat,
+                        current_cmd_id,
                         selection_reason,
                     )
                     self._write_cycle_diagnostic(
@@ -849,6 +1105,7 @@ class ContextualRewardBuilder:
                         current_state,
                         current_oht_tat,
                         current_cmd_tat,
+                        current_cmd_id,
                         selection_reason,
                     )
                 else:
@@ -918,6 +1175,7 @@ class ContextualRewardBuilder:
                         current_state,
                         current_oht_tat,
                         current_cmd_tat,
+                        current_cmd_id,
                         selection_reason,
                     )
                     if unexplained_reset:
@@ -1049,6 +1307,7 @@ class ContextualRewardBuilder:
                     current_state,
                     current_oht_tat,
                     current_cmd_tat,
+                    current_cmd_id,
                     selection_reason,
                 )
                 self._write_cycle_diagnostic(
@@ -1088,6 +1347,7 @@ class ContextualRewardBuilder:
                     current_state,
                     current_oht_tat,
                     current_cmd_tat,
+                    current_cmd_id,
                     selection_reason,
                 )
                 self._write_cycle_diagnostic(
@@ -1170,25 +1430,38 @@ class ContextualRewardBuilder:
     @staticmethod
     def _oht_tat_entries(oht) -> dict[int, object]:
         values = getattr(oht, "CmdCompleteTat", None)
-        if hasattr(values, "items"):
-            return {int(key): value for key, value in values.items()}
-        return {
-            int(getattr(value, "CmdID", 0) or 0): value
-            for value in (values or [])
-        }
+        pairs = (
+            values.items()
+            if hasattr(values, "items")
+            else (
+                (getattr(value, "CmdID", 0), value)
+                for value in (values or [])
+            )
+        )
+        entries = {}
+        for key, value in pairs:
+            try:
+                command_id = int(key or 0)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            entries[command_id] = value
+        return entries
 
     @staticmethod
     def _select_oht_tat_entry(oht, entries):
         if not entries:
             return None, "missing_tat_entry"
-        candidates = {
-            int(candidate)
-            for candidate in (
-                getattr(oht, "JobID", 0),
-                getattr(oht, "DispatchedCommand", 0),
-            )
-            if int(candidate or 0) in entries
-        }
+        candidates = set()
+        for candidate in (
+            getattr(oht, "JobID", 0),
+            getattr(oht, "DispatchedCommand", 0),
+        ):
+            try:
+                candidate = int(candidate or 0)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if candidate in entries:
+                candidates.add(candidate)
         if len(candidates) == 1:
             return entries[next(iter(candidates))], None
         if len(candidates) > 1:
@@ -1201,8 +1474,31 @@ class ContextualRewardBuilder:
     def _finite_positive_attr(value, name) -> float | None:
         if value is None:
             return None
-        result = float(getattr(value, name, 0) or 0)
+        try:
+            result = float(getattr(value, name, 0) or 0)
+        except (TypeError, ValueError, OverflowError):
+            return None
         return result if np.isfinite(result) and result > 0 else None
+
+    @staticmethod
+    def _finite_nonnegative_attr(value, name) -> float | None:
+        if value is None:
+            return None
+        try:
+            result = float(getattr(value, name, 0) or 0)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return result if np.isfinite(result) and result >= 0 else None
+
+    @staticmethod
+    def _positive_command_id(value) -> int | None:
+        if value is None:
+            return None
+        try:
+            result = int(getattr(value, "CmdID", 0) or 0)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return result if result > 0 else None
 
     def _start_oht_cycle(
         self,
@@ -1230,6 +1526,8 @@ class ContextualRewardBuilder:
         tracker.current_segment_job_id = int(job_id)
         tracker.current_segment_last_valid_oht_tat = None
         tracker.current_segment_last_state5_oht_tat = None
+        tracker.current_segment_last_state5_cmd_tat = None
+        tracker.current_segment_last_state5_command_id = None
         if increment:
             tracker.tat_segment_count += 1
 
@@ -1518,6 +1816,7 @@ class ContextualRewardBuilder:
         state,
         oht_tat,
         cmd_tat,
+        cmd_id,
         selection_reason,
     ) -> bool:
         unexplained_reset = False
@@ -1536,6 +1835,15 @@ class ContextualRewardBuilder:
             tracker.last_tat_skip_reason = str(selection_reason)
         if cmd_tat is not None:
             tracker.last_valid_cmd_tat = float(cmd_tat)
+        if int(state) == int(OHTState.UNLOADING):
+            if cmd_tat is not None and cmd_id is not None:
+                tracker.current_segment_last_state5_cmd_tat = float(cmd_tat)
+                tracker.current_segment_last_state5_command_id = int(cmd_id)
+            else:
+                # Do not fall back to an earlier lifecycle sample: Reward U
+                # requires the actual state-5 completion record.
+                tracker.current_segment_last_state5_cmd_tat = None
+                tracker.current_segment_last_state5_command_id = None
         return unexplained_reset
 
     def _finalize_oht_cycle(self, tracker, credit) -> CycleRewardOutcome:
@@ -2120,23 +2428,26 @@ class ContextualRewardBuilder:
 
         global_raw = self._global_raw(pclient)
         local_raw = self._local_raw(pclient)
-        if self.config.reward_normalization_enabled:
-            # Reward E's normalize-before-update contract: the current sample
-            # sees only statistics accumulated by earlier reward steps.
+        if self.config.global_normalization_enabled:
             global_normalized = float(self.global_normalizer.normalize(
                 [[global_raw]], name="global_reward"
             )[0, 0])
-            local_normalized = self.local_normalizer.normalize(
-                local_raw[:, None], name="local_reward"
-            )[:, 0]
             self.global_normalizer.update(
                 [[global_raw]], name="global_reward"
             )
+        else:
+            global_normalized = float(global_raw)
+
+        if self.config.local_normalization_enabled:
+            # Reward E's normalize-before-update contract: the current local
+            # sample sees only statistics accumulated by earlier reward steps.
+            local_normalized = self.local_normalizer.normalize(
+                local_raw[:, None], name="local_reward"
+            )[:, 0]
             self.local_normalizer.update(
                 local_raw[:, None], name="local_reward"
             )
         else:
-            global_normalized = float(global_raw)
             local_normalized = (
                 local_raw / self.config.local_reward_scale
                 if self.config.local_fixed_scale_enabled
@@ -2144,11 +2455,12 @@ class ContextualRewardBuilder:
             )
         self.reward_steps += 1
         if (
-            self.config.reward_normalization_enabled
-            and self.reward_steps >= self.config.freeze_after_env_steps
+            self.reward_steps >= self.config.freeze_after_env_steps
         ):
-            self.global_normalizer.freeze()
-            self.local_normalizer.freeze()
+            if self.config.global_normalization_enabled:
+                self.global_normalizer.freeze()
+            if self.config.local_normalization_enabled:
+                self.local_normalizer.freeze()
 
         global_component = self.config.global_alpha * global_normalized
         local_component = self.config.local_alpha * local_normalized
@@ -2205,7 +2517,7 @@ class ContextualRewardBuilder:
             global_component=float(global_component),
             total_tat_level=float(self._last_global_terms["total_tat"]),
             tat_signal_available=float(
-                self._last_global_terms["total_tat"] > 0.0
+                self._last_global_terms["tat_confidence"]
             ),
             tat_error=float(self._last_global_terms["tat_error"]),
             tat_raw_preclip=float(self._last_global_terms["tat_raw_preclip"]),
@@ -2216,6 +2528,36 @@ class ContextualRewardBuilder:
                 self._last_global_terms["completed_episode"]
             ),
             completed_delta=float(self._last_global_terms["completed_delta"]),
+            completion_count=int(
+                self._last_global_terms["completion_count"]
+            ),
+            completion_valid_count=int(
+                self._last_global_terms["completion_valid_count"]
+            ),
+            completion_invalid_count=int(
+                self._last_global_terms["completion_invalid_count"]
+            ),
+            completion_duplicate_count=int(
+                self._last_global_terms["completion_duplicate_count"]
+            ),
+            completion_tat_mean=float(
+                self._last_global_terms["completion_tat_mean"]
+            ),
+            completion_tat_std=float(
+                self._last_global_terms["completion_tat_std"]
+            ),
+            completion_tat_min=float(
+                self._last_global_terms["completion_tat_min"]
+            ),
+            completion_tat_max=float(
+                self._last_global_terms["completion_tat_max"]
+            ),
+            completion_tat_raw=float(
+                self._last_global_terms["completion_tat_raw"]
+            ),
+            completion_tat_weighted_raw=float(
+                self._last_global_terms["completion_tat_weighted_raw"]
+            ),
             op_rate=float(self._last_global_terms["op_rate"]),
             op_reference=float(self._last_global_terms["op_reference"]),
             op_error=float(self._last_global_terms["op_error"]),
@@ -2308,12 +2650,19 @@ class ContextualRewardBuilder:
             float(np.mean(np.abs(positive_scales - scale_mean)) / scale_mean)
             if scale_mean > 0.0 else 0.0
         )
-        # TAT/backlog share one global normalizer, so their raw magnitudes are
-        # reported separately and are never presented as normalized shares.
-        # Shares below use only terms that actually enter the final reward.
+        # Reward U has no global normalizer, so completion TAT and backlog can
+        # be mapped exactly to their final-reward contributions.
+        completion_tat_contribution = (
+            self.config.global_alpha * batch.tat_raw_ramped
+        )
+        backlog_contribution = (
+            self.config.global_alpha * batch.backlog_raw
+        )
         budget_abs = {
-            "tat_raw": abs(batch.tat_raw_postclip),
+            "completion_tat_raw": abs(batch.tat_raw_postclip),
             "backlog_raw": abs(batch.backlog_raw),
+            "completion_tat": abs(completion_tat_contribution),
+            "backlog": abs(backlog_contribution),
             "global": float(abs(batch.global_component)),
             "local": float(np.mean(np.abs(batch.local_component))),
             "rail": float(np.mean(np.abs(batch.rail_reward_postclip))),
@@ -2321,7 +2670,9 @@ class ContextualRewardBuilder:
         }
         final_budget = {
             name: budget_abs[name]
-            for name in ("global", "local", "rail", "smooth")
+            for name in (
+                "completion_tat", "backlog", "local", "rail", "smooth"
+            )
         }
         budget_total = sum(final_budget.values())
         budget_shares = {
@@ -2357,6 +2708,27 @@ class ContextualRewardBuilder:
             "reward/global/tat_component_raw": batch.tat_raw_ramped,
             "reward/global/completed_episode": batch.completed_episode,
             "reward/global/completed_delta": batch.completed_delta,
+            "reward/completion/count": float(batch.completion_count),
+            "reward/completion/valid_count": float(
+                batch.completion_valid_count
+            ),
+            "reward/completion/invalid_count": float(
+                batch.completion_invalid_count
+            ),
+            "reward/completion/duplicate_count": float(
+                batch.completion_duplicate_count
+            ),
+            "reward/completion/command_id_reuse_count": float(
+                self._completion_command_id_reuse_count
+            ),
+            "reward/completion/tat_mean": batch.completion_tat_mean,
+            "reward/completion/tat_std": batch.completion_tat_std,
+            "reward/completion/tat_min": batch.completion_tat_min,
+            "reward/completion/tat_max": batch.completion_tat_max,
+            "reward/completion/raw": batch.completion_tat_raw,
+            "reward/completion/weighted_raw": (
+                batch.completion_tat_weighted_raw
+            ),
             "reward/global/op_rate": batch.op_rate,
             "reward/global/op_reference": batch.op_reference,
             "reward/global/op_error": batch.op_error,
@@ -2500,8 +2872,14 @@ class ContextualRewardBuilder:
                 self.local_normalizer.count
             ),
             "reward/normalizers_frozen": float(
-                self.global_normalizer.frozen
-                and self.local_normalizer.frozen
+                (
+                    not self.config.global_normalization_enabled
+                    or self.global_normalizer.frozen
+                )
+                and (
+                    not self.config.local_normalization_enabled
+                    or self.local_normalizer.frozen
+                )
             ),
             "reward/local/raw_decomposition_error_max": float(np.max(np.abs(
                 batch.local_raw
@@ -2514,6 +2892,12 @@ class ContextualRewardBuilder:
             "reward/contribution/global_mean": float(
                 global_contribution.mean()
             ),
+            "reward/contribution/completion_tat_abs": budget_abs[
+                "completion_tat"
+            ],
+            "reward/contribution/tat_abs": budget_abs["completion_tat"],
+            "reward/contribution/backlog_abs": budget_abs["backlog"],
+            "reward/contribution/local_abs": budget_abs["local"],
             "reward/contribution/local_mean": float(
                 batch.local_component.mean()
             ),
@@ -2584,8 +2968,14 @@ class ContextualRewardBuilder:
             "reward/config/local_fixed_scale_enabled": float(
                 self.config.local_fixed_scale_enabled
             ),
+            "reward/config/global_normalization_enabled": float(
+                self.config.global_normalization_enabled
+            ),
+            "reward/config/local_normalization_enabled": float(
+                self.config.local_normalization_enabled
+            ),
             "reward/config/running_normalization_enabled": float(
-                self.config.reward_normalization_enabled
+                self.config.local_normalization_enabled
             ),
             "reward/config/rail_tat_weight": self.config.rail_tat_weight,
             "reward/config/rail_tat_clip": float(
@@ -2599,13 +2989,25 @@ class ContextualRewardBuilder:
             "reward/config/smooth_weight_effective": (
                 batch.smooth_weight_effective
             ),
-            "reward/budget/tat_raw_abs": budget_abs["tat_raw"],
+            "reward/budget/completion_tat_raw_abs": budget_abs[
+                "completion_tat_raw"
+            ],
+            "reward/budget/tat_raw_abs": budget_abs["completion_tat_raw"],
             "reward/budget/backlog_raw_abs": budget_abs["backlog_raw"],
+            "reward/budget/completion_tat_abs": budget_abs[
+                "completion_tat"
+            ],
+            "reward/budget/tat_abs": budget_abs["completion_tat"],
+            "reward/budget/backlog_abs": budget_abs["backlog"],
             "reward/budget/global_abs": budget_abs["global"],
             "reward/budget/local_abs": budget_abs["local"],
             "reward/budget/rail_abs": budget_abs["rail"],
             "reward/budget/smooth_abs": budget_abs["smooth"],
-            "reward/budget/global_share": budget_shares["global"],
+            "reward/budget/completion_tat_share": budget_shares[
+                "completion_tat"
+            ],
+            "reward/budget/tat_share": budget_shares["completion_tat"],
+            "reward/budget/backlog_share": budget_shares["backlog"],
             "reward/budget/local_share": budget_shares["local"],
             "reward/budget/rail_share": budget_shares["rail"],
             "reward/budget/smooth_share": budget_shares["smooth"],
@@ -2625,6 +3027,13 @@ class ContextualRewardBuilder:
             result[f"reward/local/{name}_raw_abs_mean"] = float(
                 np.abs(values).mean()
             )
+            # Reward T/U compact ablation metrics use coefficient-applied
+            # subterms, not the unweighted input features.
+            compact_name = "pred" if name == "predicted" else name
+            result[f"local/{compact_name}_abs_mean"] = float(
+                np.abs(values).mean()
+            )
+            result[f"local/{compact_name}_std"] = float(values.std())
         local_term_abs = {
             name: result[f"reward/local/{name}_raw_abs_mean"]
             for name in ("oht", "predicted", "stop", "idle", "capacity")
@@ -2642,6 +3051,7 @@ class ContextualRewardBuilder:
             result[f"reward/local/{output}"] = (
                 local_term_abs[name] / local_term_denominator
             )
+        result.update(self._last_command_trace_metrics)
         if not np.isfinite(tuple(result.values())).all():
             raise ContextualRewardError("reward diagnostics contain NaN or Inf")
         return result

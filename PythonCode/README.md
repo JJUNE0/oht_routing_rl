@@ -168,6 +168,52 @@ after 30,000 reward steps and persist across episode reset; observation
 normalizers retain their separate lifecycle. Start with fresh checkpoint,
 replay, and reward-normalizer state.
 
+## Reward T: global-normalization ablation
+
+Reward T (`contextual_controlled_reward_v22_global_raw_local_running_norm`)
+removes the global running normalizer while retaining Reward S's local,
+rail-reward, and smoothing paths. The final global component is exactly
+`0.5*(2.3*(165-TotalTat)/165 - 0.0025*(Waiting+Queued))`. When
+`TotalTat <= 0`, the TAT subterm is zero and only the backlog subterm remains.
+
+The local raw reward remains
+`-(0.3*OHT + 0.2*PredictedOHT + 0.3*Stop + 0.1*Idle + 0.1*Capacity)` and still
+uses normalize-before-update running statistics with the 30,000-step freeze.
+W&B records coefficient-applied rail-wise subterm magnitude and dispersion as
+`local/{oht,pred,stop,idle,capacity}_{abs_mean,std}`. Reward T requires a fresh
+checkpoint, replay, and reward-normalizer state.
+
+Reward T's W&B budget applies `global_alpha` before comparing terms. It logs
+`reward/contribution/{tat,backlog,local}_abs` and computes
+`reward/budget/{tat,backlog,local,rail,smooth}_share` from the five magnitudes
+that enter the final reward. Variance/covariance shares are intentionally not
+included in this schema.
+
+## Reward U: actual completion-CmdTat ablation
+
+Reward U (`contextual_controlled_reward_v23_completion_tat_global_raw_local_running_norm`)
+changes only Reward T's TAT signal. On each reward tick it consumes each newly
+completed command once and computes
+`completion_raw = mean((165-CmdTat)/165)`, or zero when no command completed.
+The global component is
+`0.5*(2.3*completion_raw - 0.0025*(Waiting+Queued))`. `TotalTat` remains an
+environment/termination diagnostic and is not used to calculate this reward.
+
+Completion is detected at the existing OHT `UNLOADING -> IDLE/new-cycle`
+boundary. Its value comes from `PClient.OHT_DIC[*].CmdCompleteTat[*].CmdTat`;
+`OHTTat` is never substituted. Episode-local command-ID deduplication is reset
+between episodes, while the local running normalizer retains Reward T's
+training-wide normalize-before-update and 30,000-step freeze contract. Global
+normalization remains off, and local, rail, smooth, learner, replay, action,
+dispatch, and termination behavior are unchanged.
+
+For W&B inspection, each episode automatically selects the first valid command
+found in `CmdCompleteTat` and keeps that command ID fixed until completion.
+`trace/command/{cmd_tat,oht_tat,oht_id,oht_state,available,completed}` follows
+the command even if it moves to another OHT. The completion tick retains the
+last valid TAT values with `completed=1`; later ticks omit the trace until the
+next episode selects a new command.
+
 실행 후 simulator GUI에서 Python 연동을 활성화하고 Run을 시작합니다.
 
 ## Command 6 dispatch mode

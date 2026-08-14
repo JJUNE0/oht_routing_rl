@@ -102,12 +102,14 @@ class ContextualRuntimeConfig:
     episode_burnin_steps: int = 0
     normalizer_freeze_steps: int = 10_000
     reward_normalizer_freeze_steps: int = 30_000
+    global_normalization_enabled: bool = False
+    local_normalization_enabled: bool = True
     tat_reference: float = 165.0
-    tat_weight: float = 9.2
+    tat_weight: float = 2.3
     tat_one_sided: bool = False
     op_weight: float = 0.0
     use_op: bool = False
-    backlog_weight: float = 0.01
+    backlog_weight: float = 0.0025
     backlog_growth_enabled: bool = False
     backlog_growth_horizon: int = 300
     backlog_growth_scale: float = 30.0
@@ -502,6 +504,12 @@ class ClientAlgorithm:
                         freeze_after_env_steps=(
                             self.config.reward_normalizer_freeze_steps
                         ),
+                        global_normalization_enabled=(
+                            self.config.global_normalization_enabled
+                        ),
+                        local_normalization_enabled=(
+                            self.config.local_normalization_enabled
+                        ),
                         local_reward_scale=self.config.local_reward_scale,
                         local_fixed_scale_enabled=(
                             self.config.local_fixed_scale_enabled
@@ -581,6 +589,12 @@ class ClientAlgorithm:
             ContextualRewardConfig(
                 freeze_after_env_steps=(
                     self.config.reward_normalizer_freeze_steps
+                ),
+                global_normalization_enabled=(
+                    self.config.global_normalization_enabled
+                ),
+                local_normalization_enabled=(
+                    self.config.local_normalization_enabled
                 ),
                 local_reward_scale=self.config.local_reward_scale,
                 local_fixed_scale_enabled=self.config.local_fixed_scale_enabled,
@@ -2219,6 +2233,16 @@ class ClientAlgorithm:
             "tat_reference": self.reward_builder.config.tat_reference,
             "tat_weight": self.reward_builder.config.tat_weight,
             "tat_signal_available": bool(batch.tat_signal_available),
+            "completion_count": batch.completion_count,
+            "completion_valid_count": batch.completion_valid_count,
+            "completion_invalid_count": batch.completion_invalid_count,
+            "completion_duplicate_count": batch.completion_duplicate_count,
+            "completion_tat_mean": batch.completion_tat_mean,
+            "completion_tat_std": batch.completion_tat_std,
+            "completion_tat_min": batch.completion_tat_min,
+            "completion_tat_max": batch.completion_tat_max,
+            "completion_tat_raw": batch.completion_tat_raw,
+            "completion_tat_weighted_raw": batch.completion_tat_weighted_raw,
             "tat_raw_preclip": batch.tat_raw_preclip,
             "tat_raw_postclip": batch.tat_raw_postclip,
             "tat_clip_applied": not np.isclose(
@@ -2240,6 +2264,9 @@ class ClientAlgorithm:
             "idle_reserve_raw": batch.idle_reserve_raw,
             "global_raw": batch.global_raw,
             "global_normalized": batch.global_normalized,
+            "global_normalization_enabled": (
+                self.reward_builder.config.global_normalization_enabled
+            ),
             "global_alpha": self.reward_builder.config.global_alpha,
             "global_component": batch.global_component,
             "global_decomposition_error": abs(
@@ -2249,11 +2276,17 @@ class ClientAlgorithm:
                 - batch.backlog_growth_raw
                 - batch.idle_reserve_raw
             ),
-            "tat_raw_abs": diagnostics.get(
-                "reward/budget/tat_raw_abs", 0.0
+            "completion_tat_raw_abs": diagnostics.get(
+                "reward/budget/completion_tat_raw_abs", 0.0
             ),
             "backlog_raw_abs": diagnostics.get(
                 "reward/budget/backlog_raw_abs", 0.0
+            ),
+            "completion_tat_contribution_abs": diagnostics.get(
+                "reward/contribution/completion_tat_abs", 0.0
+            ),
+            "backlog_contribution_abs": diagnostics.get(
+                "reward/contribution/backlog_abs", 0.0
             ),
             "global_component_abs": diagnostics.get(
                 "reward/budget/global_abs", 0.0
@@ -2270,7 +2303,9 @@ class ClientAlgorithm:
             "terminal_penalty": batch.terminal_penalty,
             "reward_budget_shares": {
                 name: diagnostics.get(f"reward/budget/{name}_share", 0.0)
-                for name in ("global", "local", "rail", "smooth")
+                for name in (
+                    "completion_tat", "backlog", "local", "rail", "smooth"
+                )
             },
             "leading_indicator_snapshot": {
                 key: value
@@ -2286,6 +2321,9 @@ class ClientAlgorithm:
             "local_idle_reward_mean": float(batch.local_idle_raw.mean()),
             "local_idle_reward_max": float(batch.local_idle_raw.max()),
             "local_reward_scale": self.reward_builder.config.local_reward_scale,
+            "local_normalization_enabled": (
+                self.reward_builder.config.local_normalization_enabled
+            ),
             "local_predicted_oht_weight": (
                 self.reward_builder.config.local_predicted_oht_weight
             ),
@@ -2455,10 +2493,17 @@ class ClientAlgorithm:
         )
 
     def log_wandb_tick(self):
+        trace_command_completed = (
+            float(self.last_diagnostics.get("trace/command/completed", 0.0))
+            == 1.0
+        )
         if (
             self.config.mode == "training"
             and not self.training_failed
-            and self.total_steps % self.config.wandb_log_interval == 0
+            and (
+                self.total_steps % self.config.wandb_log_interval == 0
+                or trace_command_completed
+            )
         ):
             self.wandb_logger.log(self.last_diagnostics, self.total_steps)
 

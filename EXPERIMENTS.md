@@ -1118,3 +1118,54 @@ architectural stabilization change is selected.
   updates, exploration/curriculum, action mapping/range, first-match dispatch,
   termination/checkpoint/observation/topology contracts, and the episode-local
   `parameterDw`/`parameterPassTimes`/`parameterC` reset fix are unchanged.
+
+## 2026-08-13 - Reward T global-normalization clean ablation
+
+- Reward version: `T`; contract version:
+  `contextual_controlled_reward_v22_global_raw_local_running_norm`.
+- Removed global reward running normalization. The global component is now
+  exactly `0.5*(2.3*(165-TotalTat)/165 -
+  0.0025*(Waiting+Queued))`; its TAT subterm is exactly zero when
+  `TotalTat <= 0`.
+- Preserved Reward S/Reward E local raw terms and the local
+  normalize-before-update running normalizer, including the 30,000-step
+  freeze. Fixed-TAT rail attribution (`rail_tat_weight=1`, no clip),
+  `smooth_b_rl_weight=0.05`, reward signs, and final local weight `0.5` are
+  unchanged.
+- Added coefficient-applied rail-wise local subterm metrics
+  `local/{oht,pred,stop,idle,capacity}_{abs_mean,std}` to W&B and the export
+  schema. These measure reward subterms such as `-0.2*PredictedOHT`, not raw
+  input features.
+- W&B schema `contextual_wandb_compact_v4_reward_t` applies `global_alpha` to
+  the logged TAT/backlog magnitudes and reports
+  `reward/contribution/{tat,backlog,local}_abs`. Reward budget shares are now
+  computed over the five final-reward magnitudes TAT, backlog, local, rail,
+  and smooth; raw TAT/backlog magnitudes remain diagnostic-only and cannot be
+  mistaken for final contributions. Variance/covariance shares are not part
+  of this schema.
+- `EXP_META.note=noglobalnorm`. Reward S and older checkpoints, replay, and
+  reward-normalizer state are incompatible; start a fresh Reward T run. No
+  simulator or W&B run was launched for this change.
+
+## 2026-08-14 - Reward U actual completion-CmdTat ablation
+
+- Reward version `U` replaces only Reward T's direct TotalTat reward with
+  `2.3*mean((165-CmdTat)/165)` over commands newly completed in the current
+  tick (zero without a completion); completion is detected by the existing OHT
+  state-5 boundary and deduplicated episode-locally with JOB_DIC-aware ID-reuse
+  handling. Global normalization stays off, the local running normalizer and
+  all backlog/rail/smooth/learner/runtime contracts stay unchanged, and W&B
+  schema `contextual_wandb_compact_v5_reward_u` adds completion statistics and
+  final-contribution budget shares. `EXP_META.note=completiontat`; start with
+  fresh replay/checkpoint/reward-normalizer state. No run was launched.
+
+## 2026-08-14 - Reward U fixed-command W&B trace
+
+- Logging-only addition; Reward U formula/version and simulator/learner
+  behavior are unchanged. Each episode deterministically selects the first
+  valid `CmdCompleteTat` command and logs its fixed command ID, lifetime,
+  availability, `CmdTat`, `OHTTat`, OHT ID/state, and one completion tick under
+  `trace/command/*`. Reassignment is followed across OHTs and tracing stops
+  after completion. The completion tick forces one W&B log so the default
+  10-tick interval cannot miss it. W&B/export schema is
+  `contextual_wandb_compact_v6_reward_u_command_trace`; no run was launched.

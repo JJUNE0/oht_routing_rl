@@ -40,19 +40,19 @@ EXP_META = {
     "reward_contract_version": REWARD_CONTRACT_VERSION,
     "reward_tat_version": REWARD_TAT_VERSION,
     "reward_normalization_version": REWARD_NORMALIZATION_VERSION,
-    "tat_signal": "signed_total_tat_level",
+    "tat_signal": "actual_new_completion_cmd_tat_event",
     "marginal_tat_enabled": False,
     "tat_one_sided": False,
-    "calibration_status": "reward_e_structure_restored",
+    "calibration_status": "reward_t_completion_tat_ablation",
     "reward_global_alpha": 0.5,
     "reward_local_alpha": 0.5,
     "tat_reference": 165.0,
-    "tat_weight": 9.2,
+    "tat_weight": 2.3,
     "tat_raw_clip": None,
     "op_reference": 0.80,
     "op_weight": 0.0,
     "use_op": False,
-    "backlog_weight": 0.01,
+    "backlog_weight": 0.0025,
     "backlog_growth_enabled": False,
     "backlog_growth_horizon": 300,
     "backlog_growth_scale": 30.0,
@@ -68,6 +68,8 @@ EXP_META = {
     "local_fixed_scale_enabled": False,
     "local_reward_scale": 1.0,
     "reward_normalizer_freeze_steps": 30_000,
+    "global_normalization_enabled": False,
+    "local_normalization_enabled": True,
     "rail_reward_mode": "fixed_tat_reference",
     "rail_free_flow_neutral_ratio": 2.0,
     "rail_tat_weight": 1.0,
@@ -86,10 +88,23 @@ EXP_META = {
     "send_cost_logging_version": "post_send_v2",
     "protocol_version": "single_end_time_v2",
     "diagnostic_schema_version": (
-        "contextual_reward_diagnostic_v17_reward_s_ehybrid"
+        "contextual_reward_diagnostic_v21_reward_u_command_trace"
     ),
-    "wandb_metric_schema_version": "contextual_wandb_compact_v2_reward_s",
-    "reward_budget_version": "final_abs_contribution_v1",
+    "wandb_metric_schema_version": (
+        "contextual_wandb_compact_v6_reward_u_command_trace"
+    ),
+    "reward_budget_version": (
+        "completion_tat_backlog_final_abs_contribution_v1"
+    ),
+    "completion_tracking_source": "PClient.OHT_DIC.CmdCompleteTat.CmdTat",
+    "completion_tracking_boundary": "OHT_state_5_to_0_2_3",
+    "completion_tracking_deduplication": (
+        "episode_local_command_id_with_JOB_DIC_reuse_lifetimes"
+    ),
+    "command_trace_selection": (
+        "first_valid_CmdCompleteTat_command_per_episode"
+    ),
+    "command_trace_end": "first_selected_command_completion",
     "arrival_tracking_source": "PClient.JOB_DIC.Job.ID_command_id",
     "arrival_tracking_reuse_fail_safe": True,
     "diagnostic_only_leading_indicators": (
@@ -103,14 +118,15 @@ EXP_META = {
     "early_stop_tat_threshold": 200.0,
     "tat_above_threshold_patience": 300,
     "terminal_tat_penalty": -20.0,
-    "note": "rewardS_ehybrid_signedtat165_dwreset",
+    "note": "completiontat",
     "description": (
-        "Reward S restores Reward E global/local running-normalized reward "
-        "structure while replacing cumulative marginal-TAT reconstruction "
-        "with direct signed TotalTat-level reward "
-        "9.2*(165-TotalTat)/165. Backlog=-0.01*(waiting+queued), "
-        "Reward-E broad local congestion terms are restored, marginal TAT "
-        "is disabled, and the parameterDw episode-reset fix is retained."
+        "Reward U is a clean Reward-T ablation that replaces only the direct "
+        "TotalTat-level signal with the mean signed quality of actual CmdTat "
+        "records for commands newly completed in the current reward tick. "
+        "Global normalization remains off; Reward-E local normalize-before-"
+        "update, backlog, rail reward, smoothing, and all other runtime/"
+        "learner contracts are retained. W&B traces the first valid command "
+        "seen in each episode through its completion."
     ),
 }
 
@@ -463,7 +479,7 @@ WANDB_METRIC_KEYS = (
     "curriculum/action_scale",
     "b_rl/mean",
     "b_rl/std",
-    # Reward S signed level, running normalization, and final contribution budget.
+    # Reward U completion-event/global-raw/local-normalized reward and budget.
     "reward/total_mean",
     "reward/total_std",
     "reward/terminal_penalty",
@@ -472,29 +488,58 @@ WANDB_METRIC_KEYS = (
     "reward/global/raw",
     "reward/global/normalized",
     "reward/global/component",
+    "reward/completion/count",
+    "reward/completion/valid_count",
+    "reward/completion/invalid_count",
+    "reward/completion/tat_mean",
+    "reward/completion/tat_std",
+    "reward/completion/tat_min",
+    "reward/completion/tat_max",
+    "reward/completion/raw",
+    "reward/completion/weighted_raw",
     "reward/local/raw_mean",
     "reward/local/raw_std",
     "reward/local/normalized_mean",
     "reward/local/normalized_std",
     "reward/local/component_mean",
     "reward/local/component_std",
+    "local/oht_abs_mean",
+    "local/oht_std",
+    "local/pred_abs_mean",
+    "local/pred_std",
+    "local/stop_abs_mean",
+    "local/stop_std",
+    "local/idle_abs_mean",
+    "local/idle_std",
+    "local/capacity_abs_mean",
+    "local/capacity_std",
     "reward/rail_tat_mean",
     "reward/smooth_penalty_mean",
     "reward/global_normalizer_mean",
     "reward/global_normalizer_std",
     "reward/local_normalizer_mean",
     "reward/local_normalizer_std",
-    "reward/budget/tat_raw_abs",
-    "reward/budget/backlog_raw_abs",
-    "reward/budget/global_abs",
-    "reward/budget/local_abs",
+    "reward/contribution/completion_tat_abs",
+    "reward/contribution/tat_abs",
+    "reward/contribution/backlog_abs",
+    "reward/contribution/local_abs",
     "reward/budget/rail_abs",
     "reward/budget/smooth_abs",
-    "reward/budget/global_share",
+    "reward/budget/completion_tat_share",
+    "reward/budget/tat_share",
+    "reward/budget/backlog_share",
     "reward/budget/local_share",
     "reward/budget/rail_share",
     "reward/budget/smooth_share",
     "reward/budget/share_sum_error",
+    "trace/command/id",
+    "trace/command/lifetime",
+    "trace/command/available",
+    "trace/command/cmd_tat",
+    "trace/command/oht_tat",
+    "trace/command/oht_id",
+    "trace/command/oht_state",
+    "trace/command/completed",
     "reward/rail/route_ratio_mean",
     "reward/rail/route_ratio_p95",
     "reward/rail/positive_cycle_ratio",
@@ -570,7 +615,8 @@ def runtime_exp_meta(config) -> dict:
         tat_confidence_n0=config.tat_confidence_n0,
         tat_confidence_ramp=config.tat_confidence_ramp,
         freeze_after_env_steps=config.reward_normalizer_freeze_steps,
-        reward_normalization_enabled=True,
+        global_normalization_enabled=config.global_normalization_enabled,
+        local_normalization_enabled=config.local_normalization_enabled,
         local_fixed_scale_enabled=config.local_fixed_scale_enabled,
         local_reward_scale=config.local_reward_scale,
         tat_reference=config.tat_reference,
@@ -633,8 +679,11 @@ def runtime_exp_meta(config) -> dict:
     meta["reward_normalizer_freeze_steps"] = int(
         reward_config.freeze_after_env_steps
     )
-    meta["reward_normalization_enabled"] = bool(
-        reward_config.reward_normalization_enabled
+    meta["global_normalization_enabled"] = bool(
+        reward_config.global_normalization_enabled
+    )
+    meta["local_normalization_enabled"] = bool(
+        reward_config.local_normalization_enabled
     )
     meta["local_fixed_scale_enabled"] = bool(
         reward_config.local_fixed_scale_enabled
@@ -667,6 +716,7 @@ def runtime_exp_meta(config) -> dict:
     meta["tat_reference"] = float(reward_config.tat_reference)
     meta["tat_weight"] = float(reward_config.tat_weight)
     meta["tat_one_sided"] = bool(reward_config.tat_one_sided)
+    meta["tat_signal_mode"] = str(reward_config.tat_signal_mode)
     meta["op_reference"] = float(reward_config.op_reference)
     meta["op_weight"] = float(reward_config.op_weight)
     meta["backlog_weight"] = float(reward_config.backlog_weight)
@@ -738,8 +788,9 @@ def runtime_exp_meta(config) -> dict:
         "independently initialized Q1/Q2 heads, "
         f"reward {REWARD_VERSION} ({REWARD_CONTRACT_VERSION}, global/local="
         f"{reward_config.global_alpha:g}/{reward_config.local_alpha:g}), "
-        "reward_normalizer=running_global_local_normalize_before_update, "
-        "fixed_scale=off, marginal_tat=off, "
+        "reward_normalizer=global_off_local_normalize_before_update, "
+        "tat_signal=actual_new_completion_CmdTat_mean, "
+        "fixed_scale=off, marginal_tat=off, completion_ema=off, "
         f"replay_capacity={int(config.replay_capacity_env_steps)}, "
         f"curriculum_end_step={int(config.curriculum_end_step)}, "
         f"exploration={float(config.exploration_noise_std):g}->"
