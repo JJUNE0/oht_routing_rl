@@ -32,6 +32,7 @@ from cocel_rl.algorithms.contextual_td7 import (
     STACK_VERSION,
     contextual_algorithm_variant,
     encode_observation_stack,
+    flatten_action_stack,
     flatten_state_stack,
     load_contextual_checkpoint,
     save_contextual_checkpoint,
@@ -55,13 +56,12 @@ from contextual_observation import (
     ObservationNormalizerConfig,
 )
 from contextual_topology import load_cached_contextual_topology
-from contextual_reward import (
-    RAIL_REWARD_FIXED_TAT_REFERENCE,
+from contextual_reward import ContextualRewardBuilder, ContextualRewardConfig
+from contextual_reward_version_cfg import (
     RAIL_REWARD_MODES,
-    REWARD_CONTRACT_VERSION,
     REWARD_VERSION,
-    ContextualRewardBuilder,
-    ContextualRewardConfig,
+    canonical_reward_version,
+    reward_contract,
 )
 from contextual_reward_diagnostic import (
     LeadingIndicatorTracker,
@@ -88,6 +88,7 @@ CHECKPOINT_DIRECTORY_VERSION = "contextual_checkpoint_dir_slug_v1"
 class ContextualRuntimeConfig:
     mode: str = "baseline_only"
     action_enabled: bool = False
+    reward_version: str = REWARD_VERSION
     action_mode: str = REGION_B_RL
     action_scale: float = 0.05
     num_stacks: int = 1
@@ -96,44 +97,48 @@ class ContextualRuntimeConfig:
     curriculum_scale_start: float = 0.05
     curriculum_scale_end: float = 1.0
     curriculum_shape: str = "geometric"
-    smooth_b_rl_weight: float = 0.05
-    smooth_exp_residual_weight: float = 0.5
+    smooth_b_rl_weight: float | None = None
+    smooth_exp_residual_weight: float | None = None
     warmup_steps: int = 10_000
     episode_burnin_steps: int = 0
     normalizer_freeze_steps: int = 10_000
-    reward_normalizer_freeze_steps: int = 30_000
-    global_normalization_enabled: bool = False
-    local_normalization_enabled: bool = True
-    tat_reference: float = 165.0
-    tat_weight: float = 2.3
-    tat_one_sided: bool = False
-    op_weight: float = 0.0
-    use_op: bool = False
-    backlog_weight: float = 0.0025
-    backlog_growth_enabled: bool = False
-    backlog_growth_horizon: int = 300
-    backlog_growth_scale: float = 30.0
-    backlog_growth_weight: float = 0.0
-    idle_reserve_target: float = 200.0
-    idle_reserve_scale: float = 50.0
-    idle_reserve_weight: float = 0.0
-    local_oht_weight: float = 0.3
-    local_predicted_oht_weight: float = 0.2
-    local_stop_weight: float = 0.3
-    local_idle_weight: float = 0.1
-    local_capacity_weight: float = 0.1
-    local_fixed_scale_enabled: bool = False
-    local_reward_scale: float = 1.0
-    rail_reward_mode: str = RAIL_REWARD_FIXED_TAT_REFERENCE
-    rail_free_flow_neutral_ratio: float = 2.0
+    reward_normalizer_freeze_steps: int | None = None
+    global_normalization_enabled: bool | None = None
+    local_normalization_enabled: bool | None = None
+    tat_reference: float | None = None
+    tat_weight: float | None = None
+    tat_one_sided: bool | None = None
+    tat_excess_clip: float | None = None
+    tat_ema_beta: float | None = None
+    global_zero_on_first_tick: bool | None = None
+    op_weight: float | None = None
+    use_op: bool | None = None
+    backlog_weight: float | None = None
+    backlog_growth_enabled: bool | None = None
+    backlog_growth_horizon: int | None = None
+    backlog_growth_scale: float | None = None
+    backlog_growth_weight: float | None = None
+    idle_reserve_target: float | None = None
+    idle_reserve_scale: float | None = None
+    idle_reserve_weight: float | None = None
+    local_oht_weight: float | None = None
+    local_predicted_oht_weight: float | None = None
+    local_stop_weight: float | None = None
+    local_idle_weight: float | None = None
+    local_capacity_weight: float | None = None
+    local_fixed_scale_enabled: bool | None = None
+    local_reward_scale: float | None = None
+    rail_reward_mode: str | None = None
+    rail_free_flow_neutral_ratio: float | None = None
     rail_baseline_ratio_reference: float | None = None
-    reward_rail_tat_weight: float = 1.0
+    reward_rail_tat_weight: float | None = None
     reward_rail_tat_clip: float | None = None
     tat_raw_clip: float | None = None
     reward_diagnostic_dir: str | None = None
     reward_diagnostic_windows: str = "0:1000,10000:11000,20000:21000"
-    tat_confidence_n0: float = 50.0
-    tat_confidence_ramp: bool = False
+    tat_confidence_n0: float | None = None
+    tat_confidence_ramp: bool | None = None
+    tat_confidence_supported: bool | None = None
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     seed: int = 0
     topology_cache_path: str | None = None
@@ -161,15 +166,102 @@ class ContextualRuntimeConfig:
     lap_enabled: bool = True
     critic_loss_mode: str = "auto"
     early_stop_queued_threshold: float = 500.0
-    tat_termination_grace_steps: int = 10_000
-    early_stop_tat_threshold: float = 200.0
-    tat_above_threshold_patience: int = 300
-    terminal_tat_penalty: float = -20.0
+    tat_termination_enabled: bool | None = None
+    tat_termination_grace_steps: int | None = None
+    early_stop_tat_threshold: float | None = None
+    tat_above_threshold_patience: int | None = None
+    tat_termination_inclusive: bool | None = None
+    terminal_tat_penalty: float | None = None
     max_stale_sim_time_ticks: int = 5
     dispatch_mode: str = DISPATCH_FIRST_MATCH
     minimum_sign_sample_count: int = 100
 
+    @staticmethod
+    def _runtime_to_reward_fields():
+        return {
+            "smooth_b_rl_weight": "smooth_b_rl_weight",
+            "smooth_exp_residual_weight": "smooth_exp_residual_weight",
+            "reward_normalizer_freeze_steps": "freeze_after_env_steps",
+            "global_normalization_enabled": "global_normalization_enabled",
+            "local_normalization_enabled": "local_normalization_enabled",
+            "tat_reference": "tat_reference",
+            "tat_weight": "tat_weight",
+            "tat_one_sided": "tat_one_sided",
+            "tat_excess_clip": "tat_excess_clip",
+            "tat_ema_beta": "tat_ema_beta",
+            "global_zero_on_first_tick": "global_zero_on_first_tick",
+            "op_weight": "op_weight",
+            "use_op": "use_op",
+            "backlog_weight": "backlog_weight",
+            "backlog_growth_enabled": "backlog_growth_enabled",
+            "backlog_growth_horizon": "backlog_growth_horizon",
+            "backlog_growth_scale": "backlog_growth_scale",
+            "backlog_growth_weight": "backlog_growth_weight",
+            "idle_reserve_target": "idle_reserve_target",
+            "idle_reserve_scale": "idle_reserve_scale",
+            "idle_reserve_weight": "idle_reserve_weight",
+            "local_oht_weight": "local_oht_weight",
+            "local_predicted_oht_weight": "local_predicted_oht_weight",
+            "local_stop_weight": "local_stop_weight",
+            "local_idle_weight": "local_idle_weight",
+            "local_capacity_weight": "local_capacity_weight",
+            "local_fixed_scale_enabled": "local_fixed_scale_enabled",
+            "local_reward_scale": "local_reward_scale",
+            "rail_reward_mode": "rail_reward_mode",
+            "rail_free_flow_neutral_ratio": "rail_free_flow_neutral_ratio",
+            "rail_baseline_ratio_reference": "rail_baseline_ratio_reference",
+            "reward_rail_tat_weight": "rail_tat_weight",
+            "reward_rail_tat_clip": "rail_tat_clip",
+            "tat_raw_clip": "tat_raw_clip",
+            "tat_confidence_n0": "tat_confidence_n0",
+            "tat_confidence_ramp": "tat_confidence_ramp",
+            "tat_confidence_supported": "tat_confidence_supported",
+        }
+
     def __post_init__(self):
+        canonical_version = (
+            canonical_reward_version(self.reward_version)
+        )
+        object.__setattr__(
+            self, "reward_version", canonical_version
+        )
+        profile = ContextualRewardConfig.for_version(
+            canonical_version,
+            action_mode=self.action_mode,
+        )
+        runtime_to_reward = self._runtime_to_reward_fields()
+        incompatible = []
+        for runtime_name, reward_name in runtime_to_reward.items():
+            expected = getattr(profile, reward_name)
+            actual = getattr(self, runtime_name)
+            if actual is None:
+                object.__setattr__(self, runtime_name, expected)
+            elif actual != expected:
+                incompatible.append((runtime_name, actual, expected))
+        contract = reward_contract(canonical_version)
+        termination_profile = {
+            "tat_termination_enabled": contract.tat_termination_enabled,
+            "tat_termination_grace_steps": contract.tat_termination_grace_steps,
+            "early_stop_tat_threshold": contract.tat_termination_threshold,
+            "tat_above_threshold_patience": contract.tat_termination_patience,
+            "tat_termination_inclusive": contract.tat_termination_inclusive,
+            "terminal_tat_penalty": contract.terminal_tat_penalty,
+        }
+        for name, expected in termination_profile.items():
+            actual = getattr(self, name)
+            if actual is None:
+                object.__setattr__(self, name, expected)
+            elif actual != expected:
+                incompatible.append((name, actual, expected))
+        if incompatible:
+            details = ", ".join(
+                f"{name}={actual!r} (expected {expected!r})"
+                for name, actual, expected in incompatible
+            )
+            raise ValueError(
+                f"Reward {canonical_version} is a locked full "
+                f"reward profile; incompatible overrides: {details}"
+            )
         if self.mode not in {"baseline_only", "actor_inference", "training"}:
             raise ValueError(
                 "mode must be baseline_only, actor_inference, or training"
@@ -350,6 +442,34 @@ class ContextualRuntimeConfig:
             or self.tat_confidence_n0 <= 0
         ):
             raise ValueError("tat_confidence_n0 must be finite and positive")
+        self.make_reward_config()
+
+    def make_reward_config(self) -> ContextualRewardConfig:
+        """Resolve and validate the complete named reward contract."""
+        profile = ContextualRewardConfig.for_version(
+            self.reward_version,
+            action_mode=self.action_mode,
+        )
+        runtime_to_reward = self._runtime_to_reward_fields()
+        mismatches = [
+            (
+                runtime_name,
+                getattr(self, runtime_name),
+                getattr(profile, reward_name),
+            )
+            for runtime_name, reward_name in runtime_to_reward.items()
+            if getattr(self, runtime_name) != getattr(profile, reward_name)
+        ]
+        if mismatches:
+            details = ", ".join(
+                f"{name}={actual!r} (expected {expected!r})"
+                for name, actual, expected in mismatches
+            )
+            raise ValueError(
+                f"Reward {self.reward_version} is a locked full reward "
+                f"profile; incompatible overrides: {details}"
+            )
+        return profile
 
 
 class ClientAlgorithm:
@@ -395,6 +515,7 @@ class ClientAlgorithm:
             self.config.num_stacks, self.config.stack_interval
         )
         self.last_controlled_action = None
+        self.last_applied_action = None
         self.last_policy_action = None
         self.last_exploratory_action = None
         self.last_diagnostics: dict[str, float] = {}
@@ -467,6 +588,7 @@ class ClientAlgorithm:
         base = (
             f"{ALGORITHM_VERSION}_{self.algorithm_variant}_"
             f"{self.action_version}_{PARAMETER_DW_STATE_VERSION}_"
+            f"reward_{self.config.reward_version}_"
             f"{STACK_VERSION}_s{self.config.num_stacks}_"
             f"i{self.config.stack_interval}"
         )
@@ -487,6 +609,7 @@ class ClientAlgorithm:
             f"ctx_td7_s{int(self.config.sale_enabled)}_"
             f"l{int(self.config.lap_enabled)}_"
             f"k{self.config.num_stacks}_i{self.config.stack_interval}_"
+            f"r{self.config.reward_version}_"
             f"{self.config.action_mode}_"
             f"{self.config.replay_sampling_mode}_{digest}"
         )
@@ -500,64 +623,7 @@ class ClientAlgorithm:
             if self.reward_builder is None:
                 self.reward_builder = ContextualRewardBuilder(
                     self.topology,
-                    ContextualRewardConfig(
-                        freeze_after_env_steps=(
-                            self.config.reward_normalizer_freeze_steps
-                        ),
-                        global_normalization_enabled=(
-                            self.config.global_normalization_enabled
-                        ),
-                        local_normalization_enabled=(
-                            self.config.local_normalization_enabled
-                        ),
-                        local_reward_scale=self.config.local_reward_scale,
-                        local_fixed_scale_enabled=(
-                            self.config.local_fixed_scale_enabled
-                        ),
-                        tat_reference=self.config.tat_reference,
-                        tat_weight=self.config.tat_weight,
-                        tat_one_sided=self.config.tat_one_sided,
-                        op_weight=self.config.op_weight,
-                        use_op=self.config.use_op,
-                        backlog_weight=self.config.backlog_weight,
-                        backlog_growth_enabled=(
-                            self.config.backlog_growth_enabled
-                        ),
-                        backlog_growth_horizon=(
-                            self.config.backlog_growth_horizon
-                        ),
-                        backlog_growth_scale=self.config.backlog_growth_scale,
-                        backlog_growth_weight=(
-                            self.config.backlog_growth_weight
-                        ),
-                        idle_reserve_target=self.config.idle_reserve_target,
-                        idle_reserve_scale=self.config.idle_reserve_scale,
-                        idle_reserve_weight=self.config.idle_reserve_weight,
-                        local_predicted_oht_weight=(
-                            self.config.local_predicted_oht_weight
-                        ),
-                        local_oht_weight=self.config.local_oht_weight,
-                        local_stop_weight=self.config.local_stop_weight,
-                        local_idle_weight=self.config.local_idle_weight,
-                        local_capacity_weight=self.config.local_capacity_weight,
-                        rail_reward_mode=self.config.rail_reward_mode,
-                        rail_free_flow_neutral_ratio=(
-                            self.config.rail_free_flow_neutral_ratio
-                        ),
-                        rail_baseline_ratio_reference=(
-                            self.config.rail_baseline_ratio_reference
-                        ),
-                        rail_tat_weight=self.config.reward_rail_tat_weight,
-                        rail_tat_clip=self.config.reward_rail_tat_clip,
-                        tat_raw_clip=self.config.tat_raw_clip,
-                        action_mode=self.config.action_mode,
-                        smooth_b_rl_weight=self.config.smooth_b_rl_weight,
-                        smooth_exp_residual_weight=(
-                            self.config.smooth_exp_residual_weight
-                        ),
-                        tat_confidence_n0=self.config.tat_confidence_n0,
-                        tat_confidence_ramp=self.config.tat_confidence_ramp,
-                    ),
+                    self.config.make_reward_config(),
                     completion_diagnostic_path=self.rail_tat_diagnostic_path,
                     global_step_provider=lambda: self.total_steps,
                     completion_diagnostic_max_global_step=(
@@ -586,56 +652,7 @@ class ClientAlgorithm:
         )
         self.reward_builder = ContextualRewardBuilder(
             self.topology,
-            ContextualRewardConfig(
-                freeze_after_env_steps=(
-                    self.config.reward_normalizer_freeze_steps
-                ),
-                global_normalization_enabled=(
-                    self.config.global_normalization_enabled
-                ),
-                local_normalization_enabled=(
-                    self.config.local_normalization_enabled
-                ),
-                local_reward_scale=self.config.local_reward_scale,
-                local_fixed_scale_enabled=self.config.local_fixed_scale_enabled,
-                tat_reference=self.config.tat_reference,
-                tat_weight=self.config.tat_weight,
-                tat_one_sided=self.config.tat_one_sided,
-                op_weight=self.config.op_weight,
-                use_op=self.config.use_op,
-                backlog_weight=self.config.backlog_weight,
-                backlog_growth_enabled=self.config.backlog_growth_enabled,
-                backlog_growth_horizon=self.config.backlog_growth_horizon,
-                backlog_growth_scale=self.config.backlog_growth_scale,
-                backlog_growth_weight=self.config.backlog_growth_weight,
-                idle_reserve_target=self.config.idle_reserve_target,
-                idle_reserve_scale=self.config.idle_reserve_scale,
-                idle_reserve_weight=self.config.idle_reserve_weight,
-                local_predicted_oht_weight=(
-                    self.config.local_predicted_oht_weight
-                ),
-                local_oht_weight=self.config.local_oht_weight,
-                local_stop_weight=self.config.local_stop_weight,
-                local_idle_weight=self.config.local_idle_weight,
-                local_capacity_weight=self.config.local_capacity_weight,
-                rail_reward_mode=self.config.rail_reward_mode,
-                rail_free_flow_neutral_ratio=(
-                    self.config.rail_free_flow_neutral_ratio
-                ),
-                rail_baseline_ratio_reference=(
-                    self.config.rail_baseline_ratio_reference
-                ),
-                rail_tat_weight=self.config.reward_rail_tat_weight,
-                rail_tat_clip=self.config.reward_rail_tat_clip,
-                tat_raw_clip=self.config.tat_raw_clip,
-                action_mode=self.config.action_mode,
-                smooth_b_rl_weight=self.config.smooth_b_rl_weight,
-                smooth_exp_residual_weight=(
-                    self.config.smooth_exp_residual_weight
-                ),
-                tat_confidence_n0=self.config.tat_confidence_n0,
-                tat_confidence_ramp=self.config.tat_confidence_ramp,
-            ),
+            self.config.make_reward_config(),
             completion_diagnostic_path=self.rail_tat_diagnostic_path,
             global_step_provider=lambda: self.total_steps,
             completion_diagnostic_max_global_step=(
@@ -660,6 +677,7 @@ class ClientAlgorithm:
             seed=self.config.seed,
             lap_enabled=self.config.lap_enabled,
             action_version=self.action_version,
+            reward_version=self.config.reward_version,
             sampling_mode=self.config.replay_sampling_mode,
             num_stacks=self.config.num_stacks,
             stack_interval=self.config.stack_interval,
@@ -704,6 +722,16 @@ class ClientAlgorithm:
                     "algorithm_version": self.runtime_variant,
                     "action_mode": self.config.action_mode,
                     "action_version": self.action_version,
+                    "reward_version": self.reward_builder.reward_version,
+                    "reward_contract_version": (
+                        self.reward_builder.reward_contract_version
+                    ),
+                    "reward_tat_version": (
+                        self.reward_builder.reward_tat_version
+                    ),
+                    "reward_normalization_version": (
+                        self.reward_builder.reward_normalization_version
+                    ),
                     "parameter_dw_state_version": PARAMETER_DW_STATE_VERSION,
                     "stack_version": STACK_VERSION,
                     "action_scale": self.config.action_scale,
@@ -805,6 +833,14 @@ class ClientAlgorithm:
             "critic_loss_mode": self.config.critic_loss_mode,
             "action_mode": self.config.action_mode,
             "action_version": self.action_version,
+            "reward_version": self.reward_builder.reward_version,
+            "reward_contract_version": (
+                self.reward_builder.reward_contract_version
+            ),
+            "reward_tat_version": self.reward_builder.reward_tat_version,
+            "reward_normalization_version": (
+                self.reward_builder.reward_normalization_version
+            ),
             "parameter_dw_state_version": PARAMETER_DW_STATE_VERSION,
             "stack_version": STACK_VERSION,
             "num_stacks": self.config.num_stacks,
@@ -891,6 +927,7 @@ class ClientAlgorithm:
         if hasattr(self, "observation_history"):
             self.observation_history.clear()
         self.last_controlled_action = None
+        self.last_applied_action = None
         self.last_policy_action = None
         self.last_exploratory_action = None
         self._last_sim_time = None
@@ -912,6 +949,7 @@ class ClientAlgorithm:
         if hasattr(self, "observation_history"):
             self.observation_history.clear()
         self.last_controlled_action = None
+        self.last_applied_action = None
         self.last_policy_action = None
         self.last_exploratory_action = None
         self._last_replay_summary = {}
@@ -1027,6 +1065,7 @@ class ClientAlgorithm:
         if hasattr(self, "observation_history"):
             self.observation_history.clear()
         self.last_controlled_action = None
+        self.last_applied_action = None
         self.last_policy_action = None
         self.last_exploratory_action = None
         self.last_diagnostics = {}
@@ -1425,14 +1464,31 @@ class ClientAlgorithm:
         )
         return (*values, torch.from_numpy(np.ascontiguousarray(global_batch)))
 
+    @staticmethod
+    def _cpu_previous_applied_action(observation):
+        frames = (
+            tuple(observation)
+            if isinstance(observation, (tuple, list))
+            else (observation,)
+        )
+        if len(frames) == 1:
+            return torch.from_numpy(frames[0].previous_applied_action)
+        return torch.from_numpy(np.ascontiguousarray(np.stack([
+            frame.previous_applied_action for frame in frames
+        ], axis=1)))
+
     def _actor_inference(self, observation, *, attention_diagnostics=False):
         t0 = time.perf_counter()
         cpu_tensors = self._cpu_tensors(observation)
+        cpu_previous_action = self._cpu_previous_applied_action(observation)
         tensor_conversion_ms = (time.perf_counter() - t0) * 1000.0
 
         t0 = time.perf_counter()
         device_tensors = tuple(
             tensor.to(self.device, non_blocking=False) for tensor in cpu_tensors
+        )
+        previous_action = cpu_previous_action.to(
+            self.device, non_blocking=False
         )
         batch = device_tensors[0].shape[0]
         if device_tensors[0].ndim == 2:
@@ -1453,6 +1509,11 @@ class ClientAlgorithm:
             actor_state = flatten_state_stack(
                 encoded_stack.state, self.config.num_stacks
             )
+            actor_previous_action = flatten_action_stack(
+                previous_action,
+                num_stacks=self.config.num_stacks,
+                action_dim=1,
+            )
             sale_state = (
                 self.learner.sale_fixed.state(structured_batch)
                 if self.learner is not None
@@ -1463,9 +1524,16 @@ class ClientAlgorithm:
                 else None
             )
             actor_output = (
-                self.actor(actor_state, sale_state)
+                self.actor(
+                    actor_state,
+                    sale_state,
+                    previous_action=actor_previous_action,
+                )
                 if sale_state is not None
-                else self.actor(actor_state)
+                else self.actor(
+                    actor_state,
+                    previous_action=actor_previous_action,
+                )
             )
         self._synchronize()
         encoder_actor_ms = (time.perf_counter() - t0) * 1000.0
@@ -1520,10 +1588,18 @@ class ClientAlgorithm:
             return self._baseline_only_result(pclient, baseline)
 
     def _update_tat_termination(self, total_tat: float) -> bool:
+        if not self.config.tat_termination_enabled:
+            self.tat_above_threshold_count = 0
+            return False
         if self.episode_steps < self.config.tat_termination_grace_steps:
             self.tat_above_threshold_count = 0
             return False
-        if total_tat >= self.config.early_stop_tat_threshold:
+        above_threshold = (
+            total_tat >= self.config.early_stop_tat_threshold
+            if self.config.tat_termination_inclusive
+            else total_tat > self.config.early_stop_tat_threshold
+        )
+        if above_threshold:
             self.tat_above_threshold_count += 1
         else:
             self.tat_above_threshold_count = 0
@@ -1578,6 +1654,14 @@ class ClientAlgorithm:
             pclient,
             parameter_dw=self.parameterDw,
             parameter_c=self.parameterC,
+            previous_applied_action=(
+                np.zeros(
+                    (len(self.topology.controlled_rail_ids), 1),
+                    dtype=np.float32,
+                )
+                if self.last_applied_action is None
+                else self.last_applied_action.reshape(-1, 1)
+            ),
         )
         observation_calls += 1
         observation_build_ms = (time.perf_counter() - t0) * 1000.0
@@ -1737,6 +1821,7 @@ class ClientAlgorithm:
             congestion_cost=congestion_cost,
         )
         applied_action = action_result.applied_controlled_action
+        self.last_applied_action = applied_action.copy()
         for physical_row, rail_id_value in enumerate(self.topology.all_rail_ids):
             rail_id = int(rail_id_value)
             pclient.RAILLINECOST_DIC[rail_id].FRailLineCost = float(
@@ -2223,8 +2308,14 @@ class ClientAlgorithm:
         )
 
         record = {
-            "reward_version": REWARD_VERSION,
-            "reward_contract_version": REWARD_CONTRACT_VERSION,
+            "reward_version": self.reward_builder.reward_version,
+            "reward_contract_version": (
+                self.reward_builder.reward_contract_version
+            ),
+            "reward_tat_version": self.reward_builder.reward_tat_version,
+            "reward_normalization_version": (
+                self.reward_builder.reward_normalization_version
+            ),
             "global_step": int(global_step),
             "episode_id": int(completed.episode_id),
             "episode_step": int(completed.env_step),

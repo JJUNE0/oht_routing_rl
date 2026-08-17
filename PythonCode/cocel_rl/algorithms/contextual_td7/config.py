@@ -6,16 +6,16 @@ from .stacking import validate_stack_config
 
 
 ALGORITHM_VERSION = (
-    "contextual_directional_td7_stacked_independent_twin_critic_v2"
+    "contextual_directional_td7_previous_applied_action_v3"
 )
 
 
 def contextual_algorithm_variant(sale_enabled: bool, lap_enabled: bool) -> str:
     return {
-        (True, True): "contextual_td7_sale_lap_v2",
-        (False, True): "contextual_td7_no_sale_lap_v2",
-        (True, False): "contextual_td7_sale_uniform_v2",
-        (False, False): "contextual_twin_delayed_uniform_v2",
+        (True, True): "contextual_td7_sale_lap_v3_prevact",
+        (False, True): "contextual_td7_no_sale_lap_v3_prevact",
+        (True, False): "contextual_td7_sale_uniform_v3_prevact",
+        (False, False): "contextual_twin_delayed_uniform_v3_prevact",
     }[(bool(sale_enabled), bool(lap_enabled))]
 
 
@@ -78,8 +78,12 @@ class ContextualNetworkConfig:
         return self.action_dim * self.num_stacks
 
     @property
-    def critic_input_dim(self) -> int:
+    def actor_input_dim(self) -> int:
         return (self.context_dim + self.action_dim) * self.num_stacks
+
+    @property
+    def critic_input_dim(self) -> int:
+        return (self.context_dim + 2 * self.action_dim) * self.num_stacks
 
 
 @dataclass(frozen=True)

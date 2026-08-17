@@ -56,6 +56,7 @@ conda activate aicc
 python .\PythonCode\main_contextual.py `
   --mode training `
   --action-enabled `
+  --reward-version U `
   --action-mode region_b_rl `
   --sale `
   --lap `
@@ -67,13 +68,12 @@ python .\PythonCode\main_contextual.py `
   --exploration-noise-clip 0.20 `
   --warmup-steps 10000 `
   --normalizer-freeze-steps 10000 `
-  --rail-free-flow-reference-config .\diagnostics\rail_free_flow_reference.json `
-  --reward-diagnostic-dir .\diagnostics\reward_j `
+  --reward-diagnostic-dir .\diagnostics\reward_u `
   --curriculum-end-step 20000 `
   --curriculum-scale-start 0.05 `
   --curriculum-scale-end 1.0 `
   --curriculum-shape geometric `
-  --smooth-b-rl-weight 0.25 `
+  --smooth-b-rl-weight 0.05 `
   --minimum-replay-env-steps 100 `
   --minimum-action-enabled-env-steps 100 `
   --replay-capacity-env-steps 10000 `
@@ -213,6 +213,64 @@ found in `CmdCompleteTat` and keeps that command ID fixed until completion.
 the command even if it moves to another OHT. The completion tick retains the
 last valid TAT values with `completed=1`; later ticks omit the trace until the
 next episode selects a new command.
+
+## Selecting historical Reward E through U
+
+All named reward contracts and their complete parameter profiles are managed
+in `contextual_reward_version_cfg.py`. Add or revise a reward version there;
+`contextual_reward.py` contains the generic immutable config schema and reward
+calculation/runtime state only. Existing imports from `contextual_reward` are
+re-exported for compatibility.
+
+The runtime defaults to `U` and accepts these unique locked profiles:
+
+`E`, `F_RAMP`, `F_NO_RAMP`, `G`, `H`, `I`, `J`, `K`, `L`, `M`, `N`,
+`O`, `P`, `Q`, `R`, `S_REBALANCE`, `S_EHYBRID`, `T`, and `U`.
+
+```powershell
+python .\PythonCode\main_contextual.py --reward-version E
+python .\PythonCode\main_contextual.py --reward-version F_RAMP
+python .\PythonCode\main_contextual.py --reward-version S_REBALANCE
+python .\PythonCode\main_contextual.py --reward-version T
+python .\PythonCode\main_contextual.py --reward-version U
+```
+
+This selects a complete locked profile, not only a TAT formula. The profile
+also selects global/local coefficients, local raw terms, backlog, rail and
+smooth rewards, global/local reward-normalizer enablement, normalization
+ordering/freeze, clipping, TAT confidence, and TAT termination/terminal
+penalty. Reward E-G restore the historical marginal-TAT EMA path; I through
+`S_REBALANCE` use fixed reward scale; `S_EHYBRID` restores both running reward
+normalizers; T keeps only the local normalizer; U uses newly completed
+commands' actual `CmdTat`. Replay, checkpoints, standalone reward-normalizer
+files, W&B metadata, and checkpoint directories carry the unique profile key
+and reject cross-profile state.
+
+Historical aliases are accepted: `F` resolves to `F_RAMP`, while `S` resolves
+to the later `S_EHYBRID`. Use `F_NO_RAMP` and `S_REBALANCE` explicitly for the
+other same-letter contracts. Hyphenated spellings such as `F-NO-RAMP` are also
+canonicalized.
+
+The older individual reward CLI knobs remain parseable for compatibility, but
+a value that differs from the selected named profile is rejected. A changed
+coefficient, termination, or normalization rule must be introduced as a new
+unique reward profile rather than reusing an existing identity.
+
+## Previous applied action input
+
+The decision-time state is action-augmented without mixing controller memory
+into the physical observation normalizer. For transition `t`, the actor uses
+`pi(observation_t, applied_action_(t-1))` and the critic uses
+`Q(observation_t, applied_action_(t-1), candidate_action_t)`. The critic keeps
+the traditional current candidate-action input; the previous action is state
+memory needed to evaluate the existing action-delta smoothing reward.
+
+For stacked input, every selected observation frame carries the simulator-
+applied action immediately preceding that frame. Thus a stack with offsets
+`[0, I, 2I]` pairs observations `[s_t, s_(t-I), s_(t-2I)]` with previous
+actions `[a_(t-1), a_(t-I-1), a_(t-2I-1)]`. The next state at `t+1` is paired
+with `a_t`. Episode reset starts with a zero previous action. This observation,
+network, replay, stack, and checkpoint contract requires a fresh run.
 
 실행 후 simulator GUI에서 Python 연동을 활성화하고 Run을 시작합니다.
 

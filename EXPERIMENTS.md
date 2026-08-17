@@ -1189,3 +1189,61 @@ architectural stabilization change is selected.
   variants use the `v3_prevact` suffix to isolate checkpoint directories.
   `EXP_META.note=prevact`; start from fresh replay/checkpoint state. No run was
   launched.
+
+## 2026-08-17 - Locked runtime selection for Reward T/U
+
+- Added `--reward-version {T,U}` with Reward U as the default. Reward T selects
+  the signed `TotalTat` level term; Reward U selects the newly completed actual
+  `CmdTat` event term.
+- Selection is a complete locked profile covering global/local formulas and
+  coefficients, backlog, rail, smoothing, clipping, global/local reward
+  normalizer enablement, normalize-before-update ordering, and the 30,000-step
+  reward-normalizer freeze. A conflicting legacy reward CLI override is
+  rejected instead of being mislabeled as T or U.
+- Replay snapshots, standalone reward-normalizer files, checkpoint payloads,
+  W&B metadata/run names, runtime/checkpoint variants, and JSONL diagnostics
+  now carry the selected reward identity. Cross-version reward and normalizer
+  state is rejected. Checkpoint schema is
+  `contextual_td7_checkpoint_v7_locked_reward_profile`; W&B metadata schema is
+  `contextual_wandb_compact_v7_reward_profiles_t_u`.
+- Reward T and U formulas themselves are unchanged. `EXP_META.note=rewardselect`;
+  no simulator or W&B run was launched.
+
+## 2026-08-17 - Locked historical Reward E-U profiles
+
+- Extended `--reward-version` from T/U to the complete historical profile set
+  `E,F_RAMP,F_NO_RAMP,G,H,I,J,K,L,M,N,O,P,Q,R,S_REBALANCE,S_EHYBRID,T,U`;
+  Reward U remains the default. Historical alias `F` resolves to `F_RAMP`, and
+  alias `S` resolves to the later `S_EHYBRID` contract.
+- Restored the Reward E-G marginal-TAT EMA path, Reward-F completion-confidence
+  path (`n0=500` for the archived runs), fixed-scale I-through-S-rebalance
+  profiles, Reward-M capped one-sided TAT, Reward-N/P/Q/R/S-rebalance
+  unbounded one-sided TAT, and every recorded coefficient/rail/smooth/local
+  configuration. Reward T/U formulas are unchanged.
+- Each profile also locks global/local reward-normalizer enablement and freeze,
+  normalize-before-update behavior, TAT confidence support, TAT termination
+  enablement/threshold/grace/patience/comparator, and terminal TAT penalty.
+  Reward O disables TAT termination exactly as recorded.
+- The two incompatible historical Reward-S contracts now use distinct replay,
+  checkpoint, normalizer, W&B, and checkpoint-directory identities. W&B stores
+  both the unique profile key and the historical letter. Metric/metadata schema
+  is `contextual_wandb_compact_v8_reward_profiles_e_u`; diagnostic schema is
+  `contextual_reward_diagnostic_v23_reward_profiles_e_u`.
+- `EXP_META.note=rewardprofiles`. This is a runtime-selection/reproduction
+  change; no simulator or W&B run was launched. Start every selected profile
+  with fresh replay/checkpoint/reward-normalizer state unless its complete
+  unique profile identity already matches.
+
+## 2026-08-17 - Reward-version configuration module split
+
+- Moved the authoritative Reward E-U contracts, aliases, complete coefficient
+  profiles, normalizer settings, and TAT termination policies into
+  `PythonCode/contextual_reward_version_cfg.py`.
+- `contextual_reward.py` now imports those definitions and focuses on the
+  generic reward config schema, validation, temporal tracking, and reward
+  calculation. Existing version-related imports from `contextual_reward`
+  remain compatible, while production callers use the dedicated config
+  module directly.
+- This is a code-organization-only change: reward formulas, reward identities,
+  W&B metric/schema keys, checkpoints, and replay compatibility are unchanged.
+  No simulator or W&B run was launched.

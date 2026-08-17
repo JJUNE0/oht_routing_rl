@@ -13,7 +13,7 @@ from contextual_observation import (
     LOCAL_DIM,
     OBSERVATION_VERSION,
 )
-from contextual_reward import REWARD_VERSION
+from contextual_reward_version_cfg import REWARD_VERSION
 from contextual_topology import ContextualTopology
 from contextual_transition import CompletedContextualTransition
 
@@ -29,7 +29,7 @@ class ContextualReplayError(RuntimeError):
     pass
 
 
-REPLAY_VERSION = "contextual_step_snapshot_stacked_window_v3"
+REPLAY_VERSION = "contextual_step_snapshot_previous_applied_action_v4"
 REPLAY_SAMPLING_VERSION = "contextual_replay_sampling_modes_v2"
 REPLAY_SAMPLING_RAIL = "rail"
 REPLAY_SAMPLING_SNAPSHOT = "snapshot"
@@ -60,6 +60,7 @@ def snapshot_from_transition(
     transition: CompletedContextualTransition,
     *,
     action_version: str = ACTION_VERSION,
+    reward_version: str = REWARD_VERSION,
 ) -> ContextualStepSnapshot:
     """Copy the raw state and controlled vectors from a completed transition."""
     state_raw = transition.state.physical_local_raw
@@ -77,6 +78,11 @@ def snapshot_from_transition(
             "physical_local_state", state_raw, (physical_count, LOCAL_DIM)
         ),
         global_state=_copy_array("global_state", state_global, (GLOBAL_DIM,)),
+        previous_applied_action=_copy_array(
+            "previous_applied_action",
+            transition.state.previous_applied_action,
+            (controlled_count, 1),
+        ),
         policy_action=_copy_array(
             "policy_action", transition.action, (controlled_count, 1)
         ),
@@ -92,6 +98,11 @@ def snapshot_from_transition(
         next_global_state=_copy_array(
             "next_global_state", next_global, (GLOBAL_DIM,)
         ),
+        next_previous_applied_action=_copy_array(
+            "next_previous_applied_action",
+            transition.next_state.previous_applied_action,
+            (controlled_count, 1),
+        ),
         done=bool(transition.done),
         env_step=int(transition.env_step),
         next_env_step=int(transition.next_env_step),
@@ -99,7 +110,7 @@ def snapshot_from_transition(
         topology_hash=transition.topology_hash,
         mapping_hash=transition.mapping_hash,
         observation_version=OBSERVATION_VERSION,
-        reward_version=REWARD_VERSION,
+        reward_version=str(reward_version),
         action_version=str(action_version),
     )
 
@@ -118,6 +129,7 @@ class ContextualStepReplayBuffer:
         lap_alpha: float = 0.4,
         lap_min_priority: float = 1.0,
         action_version: str = ACTION_VERSION,
+        reward_version: str = REWARD_VERSION,
         sampling_mode: str = REPLAY_SAMPLING_RAIL,
         num_stacks: int = 1,
         stack_interval: int = 1,
@@ -149,6 +161,7 @@ class ContextualStepReplayBuffer:
         self.lap_alpha = float(lap_alpha)
         self.lap_min_priority = float(lap_min_priority)
         self.action_version = str(action_version)
+        self.reward_version = str(reward_version)
         self.sampling_mode = str(sampling_mode)
         self.num_stacks, self.stack_interval = validate_stack_config(
             num_stacks, stack_interval
@@ -186,6 +199,9 @@ class ContextualStepReplayBuffer:
         )
         self._global = np.empty(
             (self.state_capacity, GLOBAL_DIM), np.float32
+        )
+        self._previous_applied_action = np.empty(
+            (self.state_capacity, self.controlled_count), np.float32
         )
         self._state_generation = np.zeros(self.state_capacity, np.int64)
         self._state_valid = np.zeros(self.state_capacity, bool)
@@ -242,7 +258,7 @@ class ContextualStepReplayBuffer:
     def _validate_snapshot(self, snapshot: ContextualStepSnapshot) -> None:
         expected_versions = (
             (snapshot.observation_version, OBSERVATION_VERSION, "observation"),
-            (snapshot.reward_version, REWARD_VERSION, "reward"),
+            (snapshot.reward_version, self.reward_version, "reward"),
             (snapshot.action_version, self.action_version, "action"),
         )
         if snapshot.topology_hash != self.topology.topology_hash:
@@ -261,6 +277,8 @@ class ContextualStepReplayBuffer:
         _copy_array("physical_local_state", snapshot.physical_local_state,
                     (self.physical_count, LOCAL_DIM))
         _copy_array("global_state", snapshot.global_state, (GLOBAL_DIM,))
+        _copy_array("previous_applied_action", snapshot.previous_applied_action,
+                    (self.controlled_count, 1))
         _copy_array("policy_action", snapshot.policy_action,
                     (self.controlled_count, 1))
         _copy_array("applied_action", snapshot.applied_action,
@@ -271,8 +289,20 @@ class ContextualStepReplayBuffer:
                     (self.physical_count, LOCAL_DIM))
         _copy_array("next_global_state", snapshot.next_global_state,
                     (GLOBAL_DIM,))
+        _copy_array("next_previous_applied_action",
+                    snapshot.next_previous_applied_action,
+                    (self.controlled_count, 1))
+        if not np.array_equal(
+            snapshot.next_previous_applied_action,
+            snapshot.applied_action,
+        ):
+            raise ContextualReplayError(
+                "next_previous_applied_action must equal applied_action"
+            )
 
-    def _store_state(self, key, physical, global_state) -> tuple[int, int]:
+    def _store_state(
+        self, key, physical, global_state, previous_applied_action
+    ) -> tuple[int, int]:
         existing = self._key_to_state.get(key)
         if existing is not None:
             slot, generation = existing
@@ -283,6 +313,10 @@ class ContextualStepReplayBuffer:
                 if not (
                     np.array_equal(self._physical[slot], physical)
                     and np.array_equal(self._global[slot], global_state)
+                    and np.array_equal(
+                        self._previous_applied_action[slot],
+                        np.asarray(previous_applied_action).reshape(-1),
+                    )
                 ):
                     raise ContextualReplayError(
                         "same episode/env step has different raw state"
@@ -297,6 +331,9 @@ class ContextualStepReplayBuffer:
         generation = int(self._state_generation[slot]) + 1
         self._physical[slot] = physical
         self._global[slot] = global_state
+        self._previous_applied_action[slot] = np.asarray(
+            previous_applied_action, dtype=np.float32
+        ).reshape(-1)
         self._state_generation[slot] = generation
         self._state_valid[slot] = True
         self._state_keys[slot] = key
@@ -350,11 +387,15 @@ class ContextualStepReplayBuffer:
             raise ContextualReplayError("episode-crossing snapshot")
         self._episode_first_step.setdefault(state_key[0], state_key[1])
         state_slot, state_gen = self._store_state(
-            state_key, snapshot.physical_local_state, snapshot.global_state
+            state_key,
+            snapshot.physical_local_state,
+            snapshot.global_state,
+            snapshot.previous_applied_action,
         )
         next_slot, next_gen = self._store_state(
             next_key, snapshot.next_physical_local_state,
-            snapshot.next_global_state
+            snapshot.next_global_state,
+            snapshot.next_previous_applied_action,
         )
 
         slot = self._transition_cursor
@@ -398,7 +439,9 @@ class ContextualStepReplayBuffer:
     ) -> ReplaySampleKey:
         return self.push(
             snapshot_from_transition(
-                transition, action_version=self.action_version
+                transition,
+                action_version=self.action_version,
+                reward_version=self.reward_version,
             )
         )
 
@@ -731,6 +774,12 @@ class ContextualStepReplayBuffer:
         batch_count = int(transition_slots.size)
         state_global_raw = self._global[state_slots]
         next_global_raw = self._global[next_slots]
+        previous_applied_action = self._previous_applied_action[
+            state_slots, controlled_rows[:, None]
+        ].astype(np.float32, copy=True)
+        next_previous_applied_action = self._previous_applied_action[
+            next_slots, controlled_rows[:, None]
+        ].astype(np.float32, copy=True)
         global_norm = self._readonly_normalize(
             self.observation_builder.global_normalizer,
             state_global_raw.reshape(-1, GLOBAL_DIM), "replay_state_global"
@@ -830,16 +879,24 @@ class ContextualStepReplayBuffer:
             incoming_relation = incoming_relation[:, 0]
             outgoing_relation = outgoing_relation[:, 0]
             global_norm = global_norm[:, 0]
+            previous_applied_action = previous_applied_action[:, 0, None]
             next_center = next_center[:, 0]
             next_incoming = next_incoming[:, 0]
             next_outgoing = next_outgoing[:, 0]
             next_global_norm = next_global_norm[:, 0]
+            next_previous_applied_action = (
+                next_previous_applied_action[:, 0, None]
+            )
             policy_action = policy_action[:, 0, None]
             applied_action = applied_action[:, 0, None]
             next_applied_action = next_applied_action[:, 0, None]
         else:
+            previous_applied_action = previous_applied_action[:, :, None]
             policy_action = policy_action[:, :, None]
             applied_action = applied_action[:, :, None]
+            next_previous_applied_action = (
+                next_previous_applied_action[:, :, None]
+            )
             next_applied_action = next_applied_action[:, :, None]
 
         arrays = {
@@ -849,6 +906,7 @@ class ContextualStepReplayBuffer:
             "incoming_relation": incoming_relation,
             "outgoing_relation": outgoing_relation,
             "global_state": global_norm,
+            "previous_applied_action": previous_applied_action,
             "policy_action": policy_action,
             "applied_action": applied_action,
             "reward": self._reward[transition_slots, controlled_rows][:, None],
@@ -858,6 +916,7 @@ class ContextualStepReplayBuffer:
             "next_incoming_relation": incoming_relation,
             "next_outgoing_relation": outgoing_relation,
             "next_global_state": next_global_norm,
+            "next_previous_applied_action": next_previous_applied_action,
             "next_applied_action": next_applied_action,
             "done": self._done[transition_slots][:, None],
             "controlled_rail_id": self.topology.controlled_rail_ids[
@@ -925,7 +984,9 @@ class ContextualStepReplayBuffer:
         lap_enabled: bool = False,
     ) -> int:
         c = int(capacity_env_steps)
-        state = (2 * c) * (physical_count * LOCAL_DIM + GLOBAL_DIM) * 4
+        state = (2 * c) * (
+            physical_count * LOCAL_DIM + GLOBAL_DIM + controlled_count
+        ) * 4
         vectors = c * controlled_count * 3 * 4
         metadata = c * (7 * 8 + 4 + 1) + (2 * c) * (8 + 1)
         static_mapping = controlled_count * (1 + 2 * 10) * 8

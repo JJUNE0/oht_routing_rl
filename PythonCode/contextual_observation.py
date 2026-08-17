@@ -43,7 +43,7 @@ RELATION_FEATURE_NAMES = (
 LOCAL_DIM = len(LOCAL_FEATURE_NAMES)
 GLOBAL_DIM = len(GLOBAL_FEATURE_NAMES)
 RELATION_DIM = len(RELATION_FEATURE_NAMES)
-OBSERVATION_VERSION = "physical_raw_contextual_v1"
+OBSERVATION_VERSION = "physical_raw_contextual_previous_applied_action_v2"
 
 
 class ObservationContractError(RuntimeError):
@@ -173,6 +173,7 @@ class ContextualObservationBatch:
     incoming_relation: np.ndarray
     outgoing_relation: np.ndarray
     global_state: np.ndarray
+    previous_applied_action: np.ndarray
     controlled_rail_ids: np.ndarray
     topology_hash: str
     mapping_hash: str
@@ -381,6 +382,7 @@ class ContextualObservationBuilder:
         *,
         parameter_dw: Mapping[int, float],
         parameter_c: Mapping[int, float],
+        previous_applied_action=None,
     ) -> ContextualObservationBatch:
         physical_raw, global_raw = self.build_raw(
             pclient, parameter_dw=parameter_dw, parameter_c=parameter_c
@@ -399,6 +401,28 @@ class ContextualObservationBuilder:
         incoming = physical_norm[self._incoming_physical_rows]
         outgoing = physical_norm[self._outgoing_physical_rows]
 
+        controlled_count = len(self.topology.controlled_rail_ids)
+        if previous_applied_action is None:
+            previous_action = np.zeros((controlled_count, 1), np.float32)
+        else:
+            previous_action = np.asarray(
+                previous_applied_action, dtype=np.float32
+            ).reshape(-1, 1)
+            if previous_action.shape != (controlled_count, 1):
+                raise ObservationContractError(
+                    "previous_applied_action shape mismatch: "
+                    f"actual={previous_action.shape}, "
+                    f"expected=({controlled_count}, 1)"
+                )
+            if not np.isfinite(previous_action).all():
+                raise ObservationContractError(
+                    "previous_applied_action contains NaN or Inf"
+                )
+            if (np.abs(previous_action) > 1.0 + 1e-6).any():
+                raise ObservationContractError(
+                    "previous_applied_action must be in [-1, 1]"
+                )
+
         self.local_normalizer.update(physical_raw, name="physical_local_raw")
         self.global_normalizer.update(global_raw, name="global_raw")
         self.env_steps += 1
@@ -413,6 +437,7 @@ class ContextualObservationBuilder:
             incoming_relation=self._incoming_relation,
             outgoing_relation=self._outgoing_relation,
             global_state=np.ascontiguousarray(global_norm),
+            previous_applied_action=np.ascontiguousarray(previous_action),
             controlled_rail_ids=np.ascontiguousarray(
                 self.topology.controlled_rail_ids.copy()
             ),
@@ -435,6 +460,7 @@ class ContextualObservationBuilder:
             "incoming_relation": (controlled_count, 10, RELATION_DIM),
             "outgoing_relation": (controlled_count, 10, RELATION_DIM),
             "global_state": (GLOBAL_DIM,),
+            "previous_applied_action": (controlled_count, 1),
             "controlled_rail_ids": (controlled_count,),
         }
         for name, shape in expected.items():

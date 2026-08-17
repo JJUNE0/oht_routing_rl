@@ -200,12 +200,12 @@ class ContextualActor(nn.Module):
         cfg = self.config
         self.sale_enabled = sale_embedding_dim > 0
         self.task_projection = (
-            nn.Linear(cfg.stacked_context_dim, sale_feature_dim)
+            nn.Linear(cfg.actor_input_dim, sale_feature_dim)
             if self.sale_enabled else None
         )
         input_dim = (
             sale_feature_dim + sale_embedding_dim
-            if self.sale_enabled else cfg.stacked_context_dim
+            if self.sale_enabled else cfg.actor_input_dim
         )
         self.network = nn.Sequential(
             nn.Linear(input_dim, cfg.hidden_dim),
@@ -219,19 +219,44 @@ class ContextualActor(nn.Module):
         nn.init.uniform_(self.network[-1].bias, -3e-3, 3e-3)
 
     def forward(
-        self, state: torch.Tensor, sale_state: torch.Tensor | None = None
+        self,
+        state: torch.Tensor,
+        sale_state: torch.Tensor | None = None,
+        *,
+        previous_action: torch.Tensor | None = None,
     ) -> ActorOutput:
         _require_tensor("state", state, (self.config.stacked_context_dim,))
+        if previous_action is None:
+            previous_action = state.new_zeros(
+                state.shape[0], self.config.stacked_action_dim
+            )
+        _require_tensor(
+            "previous_action",
+            previous_action,
+            (self.config.stacked_action_dim,),
+        )
+        if state.shape[0] != previous_action.shape[0]:
+            raise ValueError("state/previous_action batch sizes differ")
+        actor_state = interleave_state_action(
+            state,
+            previous_action,
+            num_stacks=self.config.num_stacks,
+            context_dim=self.config.context_dim,
+            action_dim=self.config.action_dim,
+        )
         if self.sale_enabled:
             from .sale import avg_l1_norm
             if sale_state is None:
                 raise ValueError("SALE actor requires fixed SALE state")
             actor_input = torch.cat(
-                (avg_l1_norm(self.task_projection(state)), sale_state.detach()),
+                (
+                    avg_l1_norm(self.task_projection(actor_state)),
+                    sale_state.detach(),
+                ),
                 dim=-1,
             )
         else:
-            actor_input = state
+            actor_input = actor_state
         pre_tanh = self.network(actor_input)
         action = torch.tanh(pre_tanh)
         _require_finite("actor.pre_tanh", pre_tanh)
@@ -308,16 +333,36 @@ class ContextualTwinCritic(nn.Module):
         self, state: torch.Tensor, action: torch.Tensor,
         sale_state: torch.Tensor | None = None,
         sale_state_action: torch.Tensor | None = None,
+        *,
+        previous_action: torch.Tensor | None = None,
     ) -> TwinCriticOutput:
         _require_tensor("state", state, (self.config.stacked_context_dim,))
         _require_tensor("action", action, (self.config.stacked_action_dim,))
-        if state.shape[0] != action.shape[0]:
-            raise ValueError("state/action batch sizes differ")
-        state_action = interleave_state_action(
+        if previous_action is None:
+            previous_action = state.new_zeros(
+                state.shape[0], self.config.stacked_action_dim
+            )
+        _require_tensor(
+            "previous_action",
+            previous_action,
+            (self.config.stacked_action_dim,),
+        )
+        if not (
+            state.shape[0] == action.shape[0] == previous_action.shape[0]
+        ):
+            raise ValueError("state/previous-action/current-action batches differ")
+        state_previous_action = interleave_state_action(
             state,
-            action,
+            previous_action,
             num_stacks=self.config.num_stacks,
             context_dim=self.config.context_dim,
+            action_dim=self.config.action_dim,
+        )
+        state_action = interleave_state_action(
+            state_previous_action,
+            action,
+            num_stacks=self.config.num_stacks,
+            context_dim=self.config.context_dim + self.config.action_dim,
             action_dim=self.config.action_dim,
         )
         if self.sale_enabled:
@@ -335,8 +380,18 @@ class ContextualTwinCritic(nn.Module):
         return TwinCriticOutput(q1=q1, q2=q2)
 
     def q1_value(
-        self, state, action, sale_state=None, sale_state_action=None
+        self,
+        state,
+        action,
+        sale_state=None,
+        sale_state_action=None,
+        *,
+        previous_action=None,
     ):
         return self(
-            state, action, sale_state, sale_state_action
+            state,
+            action,
+            sale_state,
+            sale_state_action,
+            previous_action=previous_action,
         ).q1

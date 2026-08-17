@@ -26,7 +26,7 @@ from .stacking import (
 )
 
 
-LEARNER_VERSION = "contextual_td7_stacked_independent_twin_critic_v5"
+LEARNER_VERSION = "contextual_td7_previous_applied_action_actor_critic_v6"
 LEARNER_PERFORMANCE_VERSION = "contextual_td7_sparse_diagnostics_v1"
 DIAGNOSTICS_INTERVAL = 10
 
@@ -331,6 +331,11 @@ class ContextualTD7Learner:
         online_state = flatten_state_stack(
             online_encoding.state, self.network_config.num_stacks
         )
+        replay_previous_applied = flatten_action_stack(
+            batch.previous_applied_action,
+            num_stacks=self.network_config.num_stacks,
+            action_dim=self.network_config.action_dim,
+        )
         replay_applied = flatten_action_stack(
             batch.applied_action,
             num_stacks=self.network_config.num_stacks,
@@ -378,16 +383,26 @@ class ContextualTD7Learner:
             next_state = flatten_state_stack(
                 next_encoding.state, self.network_config.num_stacks
             )
+            next_previous_applied = flatten_action_stack(
+                batch.next_previous_applied_action,
+                num_stacks=self.network_config.num_stacks,
+                action_dim=self.network_config.action_dim,
+            )
             target_sale_zs = target_sale_zsa = None
             if self.config.sale_enabled:
                 target_sale_zs = self.sale_target_fixed.state(
                     _observation_args(batch, next_state=True)
                 )
                 next_policy = self.target_actor(
-                    next_state, target_sale_zs
+                    next_state,
+                    target_sale_zs,
+                    previous_action=next_previous_applied,
                 ).action
             else:
-                next_policy = self.target_actor(next_state).action
+                next_policy = self.target_actor(
+                    next_state,
+                    previous_action=next_previous_applied,
+                ).action
             next_current_applied = target_applied_action(
                 next_policy,
                 action_scale=self.applied_action_scale,
@@ -407,6 +422,7 @@ class ContextualTD7Learner:
             target_q_pair = self.target_critic(
                 next_state, next_applied,
                 target_sale_zs, target_sale_zsa,
+                previous_action=next_previous_applied,
             )
             tq1, tq2 = target_q_pair.q1, target_q_pair.q2
             if (
@@ -446,7 +462,11 @@ class ContextualTD7Learner:
         # Contract: replay policy_action is diagnostics only. Critic supervision
         # consumes the residual that was actually applied to the simulator.
         q_pair = self.critic(
-            online_state, replay_applied, fixed_zs, fixed_zsa
+            online_state,
+            replay_applied,
+            fixed_zs,
+            fixed_zsa,
+            previous_action=replay_previous_applied,
         )
         loss_function = (
             F.smooth_l1_loss
@@ -499,7 +519,11 @@ class ContextualTD7Learner:
                     actor_encoding.state, self.network_config.num_stacks
                 )
                 actor_sale_zs = fixed_zs
-            policy_output = self.actor(actor_state, actor_sale_zs)
+            policy_output = self.actor(
+                actor_state,
+                actor_sale_zs,
+                previous_action=replay_previous_applied,
+            )
             actor_current_applied = scale_policy_action(
                 policy_output.action, self.applied_action_scale
             )
@@ -517,7 +541,11 @@ class ContextualTD7Learner:
                 if self.config.sale_enabled else None
             )
             q1_actor = self.critic.q1_value(
-                actor_state, actor_applied, actor_sale_zs, actor_sale_zsa
+                actor_state,
+                actor_applied,
+                actor_sale_zs,
+                actor_sale_zsa,
+                previous_action=replay_previous_applied,
             )
             pretanh_penalty = (
                 self.config.pretanh_penalty

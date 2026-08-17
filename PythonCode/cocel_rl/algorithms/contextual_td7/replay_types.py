@@ -12,11 +12,13 @@ import torch
 class ContextualStepSnapshot:
     physical_local_state: np.ndarray
     global_state: np.ndarray
+    previous_applied_action: np.ndarray
     policy_action: np.ndarray
     applied_action: np.ndarray
     reward: np.ndarray
     next_physical_local_state: np.ndarray
     next_global_state: np.ndarray
+    next_previous_applied_action: np.ndarray
     done: bool
     env_step: int
     next_env_step: int
@@ -43,6 +45,7 @@ class ContextualReplayBatch:
     incoming_relation: torch.Tensor
     outgoing_relation: torch.Tensor
     global_state: torch.Tensor
+    previous_applied_action: torch.Tensor
     policy_action: torch.Tensor
     applied_action: torch.Tensor
     reward: torch.Tensor
@@ -52,6 +55,7 @@ class ContextualReplayBatch:
     next_incoming_relation: torch.Tensor
     next_outgoing_relation: torch.Tensor
     next_global_state: torch.Tensor
+    next_previous_applied_action: torch.Tensor
     next_applied_action: torch.Tensor
     done: torch.Tensor
     controlled_rail_id: torch.Tensor

@@ -15,36 +15,35 @@ from contextual_action import ACTION_MODES, EXP_RESIDUAL, REGION_B_RL
 from contextual_observation import RunningFeatureNormalizer
 from contextual_reward_diagnostic import RewardDiagnosticWriter
 from contextual_topology import ContextualTopology
-
-REWARD_VERSION = "U"
-REWARD_CONTRACT_VERSION = (
-    "contextual_controlled_reward_v23_completion_tat_global_raw_local_running_norm"
-)
-REWARD_TAT_VERSION = "actual_new_completion_cmd_tat_ref165_v1"
-REWARD_NORMALIZATION_VERSION = (
-    "reward_u_global_raw_local_running_normalizer_v1"
-)
-TAT_PENALTY_START = 160.0
-
-TAT_SIGNAL_COMPLETION_EVENT = "completion_event"
-TAT_SIGNAL_TOTAL_TAT_LEVEL = "total_tat_level"
-TAT_SIGNAL_MODES = (
-    TAT_SIGNAL_COMPLETION_EVENT,
-    TAT_SIGNAL_TOTAL_TAT_LEVEL,
-)
-
-RAIL_REWARD_FIXED_TAT_REFERENCE = "fixed_tat_reference"
-RAIL_REWARD_BASELINE_RATIO = "baseline_ratio"
-RAIL_REWARD_FREE_FLOW_NEUTRAL_2 = "free_flow_neutral_2"
-RAIL_REWARD_MODES = (
-    RAIL_REWARD_FIXED_TAT_REFERENCE,
+# Imported explicitly so legacy callers can keep importing these names from
+# contextual_reward while the dedicated module remains their single source.
+from contextual_reward_version_cfg import (
     RAIL_REWARD_BASELINE_RATIO,
+    RAIL_REWARD_FIXED_TAT_REFERENCE,
     RAIL_REWARD_FREE_FLOW_NEUTRAL_2,
+    RAIL_REWARD_MODES,
+    RAIL_TAT_FIXED_REFERENCE,
+    RAIL_TAT_FREE_FLOW_RATIO,
+    RAIL_TAT_MODES,
+    REWARD_ALIASES,
+    REWARD_CONTRACTS,
+    REWARD_CONTRACT_VERSION,
+    REWARD_NORMALIZATION_VERSION,
+    REWARD_PROFILE_CONFIGS,
+    REWARD_TAT_VERSION,
+    REWARD_VERSION,
+    REWARD_VERSION_CHOICES,
+    REWARD_VERSIONS,
+    TAT_PENALTY_START,
+    TAT_SIGNAL_COMPLETION_EVENT,
+    TAT_SIGNAL_MARGINAL_TAT_EMA,
+    TAT_SIGNAL_MODES,
+    TAT_SIGNAL_TOTAL_TAT_LEVEL,
+    RewardContract,
+    canonical_reward_version,
+    reward_contract,
 )
-# Deprecated source-level aliases for compatibility-only callers.
-RAIL_TAT_FIXED_REFERENCE = RAIL_REWARD_FIXED_TAT_REFERENCE
-RAIL_TAT_FREE_FLOW_RATIO = RAIL_REWARD_BASELINE_RATIO
-RAIL_TAT_MODES = RAIL_REWARD_MODES
+
 
 ACTIVE_OHT_CYCLE_STATES = frozenset({
     int(OHTState.MOVE_TO_LOAD),
@@ -60,6 +59,7 @@ class ContextualRewardError(RuntimeError):
 
 @dataclass(frozen=True)
 class ContextualRewardConfig:
+    reward_version: str = REWARD_VERSION
     global_alpha: float = 0.5
     local_alpha: float = 0.5
     rail_tat_weight: float = 1.0
@@ -89,10 +89,14 @@ class ContextualRewardConfig:
     use_backlog: bool = True
     tat_reference: float = 165.0
     tat_one_sided: bool = False
-    tat_signal_mode: str = TAT_SIGNAL_COMPLETION_EVENT
+    tat_excess_clip: float | None = None
+    tat_ema_beta: float = 0.05
+    global_zero_on_first_tick: bool = False
+    tat_signal_mode: str | None = None
     op_reference: float = 0.80
     tat_confidence_n0: float = 50.0
     tat_confidence_ramp: bool = False
+    tat_confidence_supported: bool = False
     freeze_after_env_steps: int = 30_000
     global_normalization_enabled: bool = False
     local_normalization_enabled: bool = True
@@ -104,7 +108,34 @@ class ContextualRewardConfig:
     global_clip: float | None = 5.0
     local_clip: float | None = None
 
+    @classmethod
+    def for_version(
+        cls,
+        reward_version: str = REWARD_VERSION,
+        *,
+        action_mode: str = REGION_B_RL,
+    ) -> "ContextualRewardConfig":
+        """Build one complete immutable historical reward profile."""
+        contract = reward_contract(reward_version)
+        return cls(
+            reward_version=contract.version,
+            action_mode=action_mode,
+            tat_signal_mode=contract.tat_signal_mode,
+            **REWARD_PROFILE_CONFIGS[contract.version],
+        )
+
+    @property
+    def contract(self) -> RewardContract:
+        return reward_contract(self.reward_version)
+
     def __post_init__(self):
+        canonical_version = canonical_reward_version(self.reward_version)
+        contract = reward_contract(canonical_version)
+        object.__setattr__(self, "reward_version", canonical_version)
+        if self.tat_signal_mode is None:
+            object.__setattr__(
+                self, "tat_signal_mode", contract.tat_signal_mode
+            )
         numeric = (
             self.global_alpha, self.local_alpha, self.rail_tat_weight,
             self.smooth_b_rl_weight, self.smooth_exp_residual_weight,
@@ -113,6 +144,7 @@ class ContextualRewardConfig:
             self.backlog_growth_scale, self.backlog_growth_weight,
             self.idle_reserve_target, self.idle_reserve_scale,
             self.idle_reserve_weight,
+            self.tat_ema_beta,
             self.tat_confidence_n0, self.normalizer_epsilon,
             self.local_reward_scale, self.local_oht_weight,
             self.local_predicted_oht_weight, self.local_stop_weight,
@@ -124,6 +156,13 @@ class ContextualRewardConfig:
             raise ValueError("tat_reference and normalizer_epsilon must be positive")
         if self.tat_weight < 0:
             raise ValueError("tat_weight must be non-negative")
+        if self.tat_excess_clip is not None and (
+            not np.isfinite(self.tat_excess_clip)
+            or self.tat_excess_clip <= 0
+        ):
+            raise ValueError("tat_excess_clip must be positive or None")
+        if not 0.0 < self.tat_ema_beta <= 1.0:
+            raise ValueError("tat_ema_beta must be in (0, 1]")
         if self.tat_signal_mode not in TAT_SIGNAL_MODES:
             raise ValueError(f"tat_signal_mode must be one of {TAT_SIGNAL_MODES}")
         if self.local_reward_scale <= 0:
@@ -452,8 +491,27 @@ class ContextualRewardBuilder:
         self._rail_pass_trackers: dict[int, RailPassTemporalTracker] = {}
         self._reset_temporal()
 
+    @property
+    def reward_version(self) -> str:
+        return self.config.contract.version
+
+    @property
+    def reward_contract_version(self) -> str:
+        return self.config.contract.contract_version
+
+    @property
+    def reward_tat_version(self) -> str:
+        return self.config.contract.tat_version
+
+    @property
+    def reward_normalization_version(self) -> str:
+        return self.config.contract.normalization_version
+
     def _reset_temporal(self) -> None:
         self._total_completed_jobs = 0.0
+        self._prev_completed_jobs: float | None = None
+        self._prev_total_tat_sum = 0.0
+        self._marginal_tat_ema = 0.0
         self._prev_op_rate: float | None = None
         self._backlog_history = deque(
             maxlen=int(self.config.backlog_growth_horizon) + 1
@@ -691,6 +749,7 @@ class ContextualRewardBuilder:
             "invalid_count": 0,
             "duplicate_count": 0,
         }
+        first_marginal_tick = False
         if cfg.tat_signal_mode == TAT_SIGNAL_COMPLETION_EVENT:
             completion_tats, completion_counts = self._new_completion_cmd_tats(
                 pclient
@@ -700,29 +759,72 @@ class ContextualRewardBuilder:
                 (cfg.tat_reference - cmd_tat) / cfg.tat_reference
                 for cmd_tat in completion_tats
             ])) if completion_tats else 0.0
+        elif cfg.tat_signal_mode == TAT_SIGNAL_MARGINAL_TAT_EMA:
+            self._last_new_completion_command_ids = set()
+            current_tat_sum = cur_tat * completed
+            previous_completed = (
+                0.0
+                if self._prev_completed_jobs is None
+                else self._prev_completed_jobs
+            )
+            delta_completed = completed - previous_completed
+            if delta_completed > 0:
+                marginal_tat = (
+                    current_tat_sum - self._prev_total_tat_sum
+                ) / delta_completed
+                self._marginal_tat_ema = (
+                    marginal_tat
+                    if self._marginal_tat_ema <= 0.0
+                    else (
+                        (1.0 - cfg.tat_ema_beta) * self._marginal_tat_ema
+                        + cfg.tat_ema_beta * marginal_tat
+                    )
+                )
+            tat_signal_available = self._marginal_tat_ema > 0.0
+            tat_error = (
+                (cfg.tat_reference - self._marginal_tat_ema)
+                / cfg.tat_reference
+                if tat_signal_available else 0.0
+            )
+            first_marginal_tick = self._prev_completed_jobs is None
+            self._prev_completed_jobs = completed
+            self._prev_total_tat_sum = current_tat_sum
         else:
             self._last_new_completion_command_ids = set()
-            # Compatibility-only Reward T / legacy branch. Runtime Reward U
-            # selects completion_event and never uses TotalTat in its reward.
             tat_signal_available = cur_tat > 0.0
             if tat_signal_available:
-                tat_error = (
-                    -max(0.0, cur_tat - TAT_PENALTY_START)
-                    / cfg.tat_reference
-                    if cfg.tat_one_sided
-                    else (cfg.tat_reference - cur_tat) / cfg.tat_reference
-                )
+                if cfg.tat_one_sided:
+                    tat_excess = max(0.0, cur_tat - TAT_PENALTY_START)
+                    if cfg.tat_excess_clip is not None:
+                        tat_excess = min(tat_excess, cfg.tat_excess_clip)
+                    tat_error = -tat_excess / cfg.tat_reference
+                else:
+                    tat_error = (
+                        (cfg.tat_reference - cur_tat) / cfg.tat_reference
+                    )
             else:
                 tat_error = 0.0
         self._update_command_trace(pclient)
         tat_raw_preclip = (
             cfg.tat_weight * tat_error if cfg.use_tat else 0.0
         )
-        # Reward U is signed and unbounded (tat_raw_clip=None). The preserved
-        # Reward-T/legacy compatibility branch is likewise left unbounded.
-        tat_raw_postclip = float(tat_raw_preclip)
-        tat_confidence = float(tat_signal_available)
-        tat_raw_ramped = tat_raw_postclip
+        tat_raw_postclip = (
+            float(np.clip(
+                tat_raw_preclip, -cfg.tat_raw_clip, cfg.tat_raw_clip
+            ))
+            if cfg.tat_raw_clip is not None and not cfg.tat_one_sided
+            else float(tat_raw_preclip)
+        )
+        tat_confidence = (
+            completed / (completed + cfg.tat_confidence_n0)
+            if (
+                tat_signal_available
+                and cfg.tat_confidence_supported
+                and cfg.tat_confidence_ramp
+            )
+            else float(tat_signal_available)
+        )
+        tat_raw_ramped = tat_raw_postclip * tat_confidence
         op_delta = (
             float(self._prev_op_rate) - cur_op
             if self._prev_op_rate is not None else 0.0
@@ -774,6 +876,15 @@ class ContextualRewardBuilder:
             + backlog_growth_raw
             + idle_reserve_raw
         )
+        if cfg.global_zero_on_first_tick and first_marginal_tick:
+            tat_raw_preclip = 0.0
+            tat_raw_postclip = 0.0
+            tat_raw_ramped = 0.0
+            op_raw = 0.0
+            backlog_raw = 0.0
+            backlog_growth_raw = 0.0
+            idle_reserve_raw = 0.0
+            raw = 0.0
         completion_array = np.asarray(completion_tats, dtype=np.float64)
         completion_mean = (
             float(completion_array.mean()) if completion_array.size else 0.0
@@ -2215,10 +2326,12 @@ class ContextualRewardBuilder:
         )
         tolerance = 1e-12
         record = {
-            "reward_version": REWARD_VERSION,
-            "reward_contract_version": REWARD_CONTRACT_VERSION,
-            "reward_tat_version": REWARD_TAT_VERSION,
-            "reward_normalization_version": REWARD_NORMALIZATION_VERSION,
+            "reward_version": self.reward_version,
+            "reward_contract_version": self.reward_contract_version,
+            "reward_tat_version": self.reward_tat_version,
+            "reward_normalization_version": (
+                self.reward_normalization_version
+            ),
             "global_step": global_step,
             "episode_id": int(episode_id),
             "episode_step": int(env_step),
@@ -3065,11 +3178,11 @@ class ContextualRewardBuilder:
         )
         np.savez_compressed(
             target,
-            reward_version=np.asarray(REWARD_VERSION),
-            reward_contract_version=np.asarray(REWARD_CONTRACT_VERSION),
-            reward_tat_version=np.asarray(REWARD_TAT_VERSION),
+            reward_version=np.asarray(self.reward_version),
+            reward_contract_version=np.asarray(self.reward_contract_version),
+            reward_tat_version=np.asarray(self.reward_tat_version),
             reward_normalization_version=np.asarray(
-                REWARD_NORMALIZATION_VERSION
+                self.reward_normalization_version
             ),
             topology_hash=np.asarray(self.topology.topology_hash),
             mapping_hash=np.asarray(self.topology.mapping_hash),
@@ -3095,16 +3208,31 @@ class ContextualRewardBuilder:
                 str(saved["reward_contract_version"].item())
                 if "reward_contract_version" in saved.files else None
             )
+            saved_reward_tat = (
+                str(saved["reward_tat_version"].item())
+                if "reward_tat_version" in saved.files else None
+            )
+            saved_reward_normalization = (
+                str(saved["reward_normalization_version"].item())
+                if "reward_normalization_version" in saved.files else None
+            )
             if (
-                saved_reward_version != REWARD_VERSION
-                or saved_reward_contract != REWARD_CONTRACT_VERSION
+                saved_reward_version != self.reward_version
+                or saved_reward_contract != self.reward_contract_version
+                or saved_reward_tat != self.reward_tat_version
+                or saved_reward_normalization
+                != self.reward_normalization_version
             ):
                 raise ContextualRewardError(
                     "reward normalizer version mismatch: "
                     f"saved={saved_reward_version!r}/"
-                    f"{saved_reward_contract!r}, "
-                    f"runtime={REWARD_VERSION!r}/"
-                    f"{REWARD_CONTRACT_VERSION!r}. A fresh normalizer is "
+                    f"{saved_reward_contract!r}/"
+                    f"{saved_reward_tat!r}/"
+                    f"{saved_reward_normalization!r}, "
+                    f"runtime={self.reward_version!r}/"
+                    f"{self.reward_contract_version!r}/"
+                    f"{self.reward_tat_version!r}/"
+                    f"{self.reward_normalization_version!r}. A fresh normalizer is "
                     "required because statistics from another reward contract "
                     "are incompatible."
                 )

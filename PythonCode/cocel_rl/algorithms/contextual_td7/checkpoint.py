@@ -11,8 +11,6 @@ import torch
 
 from contextual_action import action_version
 from contextual_observation import OBSERVATION_VERSION
-from contextual_reward import REWARD_VERSION
-
 from .learner import LEARNER_VERSION
 from .replay_buffer import REPLAY_VERSION
 from .replay_buffer import LAP_VERSION
@@ -20,12 +18,11 @@ from .sale import SALE_VERSION
 from .stacking import STACK_VERSION
 
 
-CHECKPOINT_VERSION = "contextual_td7_checkpoint_v5_stacked_runtime_config"
+CHECKPOINT_VERSION = (
+    "contextual_td7_checkpoint_v7_locked_reward_profile"
+)
 LEGACY_CHECKPOINT_VERSIONS = {
     "contextual_td7_checkpoint_v3_independent_twin_critic",
-}
-COMPATIBLE_REWARD_VERSIONS = {
-    REWARD_VERSION,
 }
 CRITIC_INITIALIZATION = "independent"
 
@@ -37,7 +34,7 @@ class ContextualCheckpointError(RuntimeError):
 def read_contextual_runtime_config(path) -> tuple[dict, bool]:
     """Read saved runtime settings before constructing the runtime.
 
-    Version 4 checkpoints contain the complete ContextualRuntimeConfig.
+    Current checkpoints contain the complete ContextualRuntimeConfig.
     Version 3 checkpoints are reconstructed from the metadata that existed at
     the time; settings absent from that format must retain current defaults.
     """
@@ -147,7 +144,12 @@ def save_contextual_checkpoint(
         "critic_initialization": CRITIC_INITIALIZATION,
         "learner_version": LEARNER_VERSION,
         "observation_version": OBSERVATION_VERSION,
-        "reward_version": REWARD_VERSION,
+        "reward_version": reward_builder.reward_version,
+        "reward_contract_version": reward_builder.reward_contract_version,
+        "reward_tat_version": reward_builder.reward_tat_version,
+        "reward_normalization_version": (
+            reward_builder.reward_normalization_version
+        ),
         "action_version": action_version(learner.config.action_mode),
         "replay_version": REPLAY_VERSION,
         "stack_version": STACK_VERSION,
@@ -196,6 +198,7 @@ def save_contextual_checkpoint(
         "reward_global_normalizer": _normalizer_state(
             reward_builder.global_normalizer
         ),
+        "reward_steps": int(reward_builder.reward_steps),
         "python_random_state": random.getstate(),
         "numpy_random_state": np.random.get_state(),
         "torch_random_state": torch.get_rng_state(),
@@ -294,13 +297,22 @@ def load_contextual_checkpoint(
                 f"checkpoint {key} mismatch: saved={payload.get(key)!r}, "
                 f"runtime={value!r}"
             )
-    if payload.get("reward_version") not in COMPATIBLE_REWARD_VERSIONS:
-        raise ContextualCheckpointError(
-            "checkpoint reward_version mismatch: "
-            f"saved={payload.get('reward_version')!r}, "
-            f"runtime={REWARD_VERSION!r}. A fresh run is required because "
-            "reward normalizer statistics are incompatible."
-        )
+    expected_reward = {
+        "reward_version": reward_builder.reward_version,
+        "reward_contract_version": reward_builder.reward_contract_version,
+        "reward_tat_version": reward_builder.reward_tat_version,
+        "reward_normalization_version": (
+            reward_builder.reward_normalization_version
+        ),
+    }
+    for key, value in expected_reward.items():
+        if payload.get(key) != value:
+            raise ContextualCheckpointError(
+                f"checkpoint {key} mismatch: "
+                f"saved={payload.get(key)!r}, runtime={value!r}. A fresh "
+                "run is required because reward formula/normalizer state "
+                "from another reward profile is incompatible."
+            )
     for state_key in ("online_critic", "target_critic"):
         if _twin_state_max_abs_diff(payload[state_key]) <= 0.0:
             raise ContextualCheckpointError(
@@ -362,6 +374,7 @@ def load_contextual_checkpoint(
         reward_builder.global_normalizer,
         payload["reward_global_normalizer"],
     )
+    reward_builder.reward_steps = int(payload["reward_steps"])
     random.setstate(payload["python_random_state"])
     np.random.set_state(payload["numpy_random_state"])
     torch.set_rng_state(payload["torch_random_state"].cpu())

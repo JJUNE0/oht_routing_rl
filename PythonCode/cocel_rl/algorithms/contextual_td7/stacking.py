@@ -10,7 +10,7 @@ import torch
 
 
 STACK_VERSION = (
-    "contextual_latent_obs_applied_action_stack_v2_first_transition_pad"
+    "contextual_latent_obs_previous_current_applied_action_stack_v3"
 )
 
 

@@ -30,9 +30,13 @@ from cocel_rl.algorithms.contextual_td7 import (
     read_contextual_runtime_config,
 )
 from contextual_action import ACTION_MODES, REGION_B_RL
-from contextual_reward import (
-    RAIL_REWARD_FIXED_TAT_REFERENCE,
+from contextual_reward import ContextualRewardConfig
+from contextual_reward_version_cfg import (
     RAIL_REWARD_MODES,
+    REWARD_VERSION,
+    REWARD_VERSIONS,
+    canonical_reward_version,
+    reward_contract,
 )
 
 
@@ -114,6 +118,16 @@ def parse_args():
         choices=("baseline_only", "actor_inference", "training"),
         default="baseline_only",
     )
+    parser.add_argument(
+        "--reward-version",
+        type=canonical_reward_version,
+        choices=REWARD_VERSIONS,
+        default=REWARD_VERSION,
+        help=(
+            "Select the complete locked reward profile, including global/"
+            "local formulas, rail/smooth terms, and reward normalizers."
+        ),
+    )
     parser.add_argument("--action-enabled", action="store_true")
     parser.add_argument(
         "--action-mode", choices=ACTION_MODES, default=REGION_B_RL
@@ -153,9 +167,9 @@ def parse_args():
         choices=("geometric", "linear"),
         default="geometric",
     )
-    parser.add_argument("--smooth-b-rl-weight", type=float, default=0.05)
+    parser.add_argument("--smooth-b-rl-weight", type=float, default=None)
     parser.add_argument(
-        "--smooth-exp-residual-weight", type=float, default=0.5
+        "--smooth-exp-residual-weight", type=float, default=None
     )
     parser.add_argument(
         "--exploration-noise-std",
@@ -180,7 +194,7 @@ def parse_args():
     parser.add_argument("--episode-burnin-steps", type=int, default=0)
     parser.add_argument("--normalizer-freeze-steps", type=int, default=10_000)
     parser.add_argument(
-        "--reward-normalizer-freeze-steps", type=int, default=30_000,
+        "--reward-normalizer-freeze-steps", type=int, default=None,
         help=(
             "Reward-only running-normalizer freeze step; observation "
             "normalization remains controlled by --normalizer-freeze-steps."
@@ -189,12 +203,12 @@ def parse_args():
     parser.add_argument(
         "--rail-reward-mode",
         choices=RAIL_REWARD_MODES,
-        default=RAIL_REWARD_FIXED_TAT_REFERENCE,
+        default=None,
     )
     parser.add_argument(
         "--rail-free-flow-neutral-ratio",
         type=float,
-        default=2.0,
+        default=None,
         help="Route/free-flow ratio that receives zero rail reward.",
     )
     parser.add_argument(
@@ -207,13 +221,13 @@ def parse_args():
         default="0:1000,10000:11000,20000:21000",
         help="Start-inclusive:end-exclusive global-step windows.",
     )
-    parser.add_argument("--tat-confidence-n0", type=float, default=500.0)
+    parser.add_argument("--tat-confidence-n0", type=float, default=None)
     parser.add_argument(
         "--use-tat-confidence",
         "--use-tat-cofidence",
         dest="use_tat_cofidence",
         action="store_true",
-        default=False,
+        default=None,
         help=(
             "Apply completed/(completed + n0) confidence ramp to the TAT "
             "reward term. Disabled by default."
@@ -276,9 +290,9 @@ def parse_args():
     parser.add_argument("--wandb-log-interval", type=int, default=10)
     parser.add_argument("--console-log-interval", type=int, default=100)
     parser.add_argument("--early-stop-queued-threshold", type=float, default=500.0)
-    parser.add_argument("--early-stop-tat-threshold", type=float, default=200.0)
-    parser.add_argument("--tat-termination-grace-steps", type=int, default=10_000)
-    parser.add_argument("--tat-above-threshold-patience", type=int, default=300)
+    parser.add_argument("--early-stop-tat-threshold", type=float, default=None)
+    parser.add_argument("--tat-termination-grace-steps", type=int, default=None)
+    parser.add_argument("--tat-above-threshold-patience", type=int, default=None)
     parser.add_argument("--max-stale-sim-time-ticks", type=int, default=5)
     parser.add_argument("--checkpoint-root", default=None)
     parser.add_argument("--resume-checkpoint", default=None)
@@ -316,7 +330,34 @@ def parse_args():
         default=100,
         help="Write the smoke summary every N active ticks.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    reward_profile = ContextualRewardConfig.for_version(
+        args.reward_version,
+        action_mode=args.action_mode,
+    )
+    reward_defaults = {
+        "smooth_b_rl_weight": reward_profile.smooth_b_rl_weight,
+        "smooth_exp_residual_weight": reward_profile.smooth_exp_residual_weight,
+        "reward_normalizer_freeze_steps": (
+            reward_profile.freeze_after_env_steps
+        ),
+        "rail_reward_mode": reward_profile.rail_reward_mode,
+        "rail_free_flow_neutral_ratio": (
+            reward_profile.rail_free_flow_neutral_ratio
+        ),
+        "tat_confidence_n0": reward_profile.tat_confidence_n0,
+        "use_tat_cofidence": reward_profile.tat_confidence_ramp,
+    }
+    contract = reward_contract(args.reward_version)
+    reward_defaults.update({
+        "early_stop_tat_threshold": contract.tat_termination_threshold,
+        "tat_termination_grace_steps": contract.tat_termination_grace_steps,
+        "tat_above_threshold_patience": contract.tat_termination_patience,
+    })
+    for name, value in reward_defaults.items():
+        if getattr(args, name) is None:
+            setattr(args, name, value)
+    return args
 
 
 def read_port(path="wpconfig.json"):
@@ -498,6 +539,7 @@ def main():
     config_kwargs = {
         "mode": args.mode,
         "action_enabled": args.action_enabled,
+        "reward_version": args.reward_version,
         "action_mode": args.action_mode,
         "dispatch_mode": args.dispatch_mode,
         "action_scale": args.action_scale,
@@ -572,6 +614,7 @@ def main():
     print(
         "[main-contextual] "
         f"mode={args.mode}, action_enabled={args.action_enabled}, "
+        f"reward_version={client.config.reward_version}, "
         f"action_mode={args.action_mode}, "
         f"dispatch_mode={client.config.dispatch_mode}, "
         f"action_scale={client._action_scale()}, "

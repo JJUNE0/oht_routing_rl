@@ -20,8 +20,9 @@ from contextual_action import (
     action_version,
 )
 from contextual_dispatch import DISPATCH_SELECTION_VERSION
-from contextual_reward import (
-    ContextualRewardConfig,
+from contextual_observation import OBSERVATION_VERSION
+from contextual_reward import ContextualRewardConfig
+from contextual_reward_version_cfg import (
     REWARD_CONTRACT_VERSION,
     REWARD_NORMALIZATION_VERSION,
     REWARD_TAT_VERSION,
@@ -32,7 +33,12 @@ EXP_META = {
     "cost_structure": "b_rl",
     "action_range": "b_rl_0.0-1.0",
     "topology": "directed_10in_10out_controlled_centers_v2",
-    "observation": "contextual_obs_controlled_stacked_v2",
+    "observation": "contextual_obs_previous_applied_action_v3",
+    "observation_version": OBSERVATION_VERSION,
+    "previous_action_input": (
+        "actor_and_critic_previous_applied_action_separate_from_encoder"
+    ),
+    "critic_action_input": "previous_applied_plus_current_candidate_action",
     "stack_version": STACK_VERSION,
     "num_stacks": 1,
     "stack_interval": 1,
@@ -88,13 +94,13 @@ EXP_META = {
     "send_cost_logging_version": "post_send_v2",
     "protocol_version": "single_end_time_v2",
     "diagnostic_schema_version": (
-        "contextual_reward_diagnostic_v21_reward_u_command_trace"
+        "contextual_reward_diagnostic_v23_reward_profiles_e_u"
     ),
     "wandb_metric_schema_version": (
-        "contextual_wandb_compact_v6_reward_u_command_trace"
+        "contextual_wandb_compact_v8_reward_profiles_e_u"
     ),
     "reward_budget_version": (
-        "completion_tat_backlog_final_abs_contribution_v1"
+        "tat_backlog_final_abs_contribution_v2_reward_profile"
     ),
     "completion_tracking_source": "PClient.OHT_DIC.CmdCompleteTat.CmdTat",
     "completion_tracking_boundary": "OHT_state_5_to_0_2_3",
@@ -118,15 +124,12 @@ EXP_META = {
     "early_stop_tat_threshold": 200.0,
     "tat_above_threshold_patience": 300,
     "terminal_tat_penalty": -20.0,
-    "note": "completiontat",
+    "note": "rewardprofiles",
     "description": (
-        "Reward U is a clean Reward-T ablation that replaces only the direct "
-        "TotalTat-level signal with the mean signed quality of actual CmdTat "
-        "records for commands newly completed in the current reward tick. "
-        "Global normalization remains off; Reward-E local normalize-before-"
-        "update, backlog, rail reward, smoothing, and all other runtime/"
-        "learner contracts are retained. W&B traces the first valid command "
-        "seen in each episode through its completion."
+        "Runtime reward selection uses a locked historical E-U profile. The selected "
+        "version controls the complete reward formula and reward-normalizer "
+        "contract; Reward U remains the default. Actor/critic previous-action "
+        "inputs and all non-reward training contracts are unchanged."
     ),
 }
 
@@ -608,42 +611,18 @@ if any(key.startswith(REMOVED_WANDB_PREFIXES) for key in WANDB_METRIC_KEYS):
 
 def runtime_exp_meta(config) -> dict:
     meta = dict(EXP_META)
-    reward_config = ContextualRewardConfig(
+    reward_config = ContextualRewardConfig.for_version(
+        config.reward_version,
         action_mode=config.action_mode,
-        smooth_b_rl_weight=config.smooth_b_rl_weight,
-        smooth_exp_residual_weight=config.smooth_exp_residual_weight,
-        tat_confidence_n0=config.tat_confidence_n0,
-        tat_confidence_ramp=config.tat_confidence_ramp,
-        freeze_after_env_steps=config.reward_normalizer_freeze_steps,
-        global_normalization_enabled=config.global_normalization_enabled,
-        local_normalization_enabled=config.local_normalization_enabled,
-        local_fixed_scale_enabled=config.local_fixed_scale_enabled,
-        local_reward_scale=config.local_reward_scale,
-        tat_reference=config.tat_reference,
-        tat_weight=config.tat_weight,
-        tat_one_sided=config.tat_one_sided,
-        op_weight=config.op_weight,
-        use_op=config.use_op,
-        backlog_weight=config.backlog_weight,
-        backlog_growth_enabled=config.backlog_growth_enabled,
-        backlog_growth_horizon=config.backlog_growth_horizon,
-        backlog_growth_scale=config.backlog_growth_scale,
-        backlog_growth_weight=config.backlog_growth_weight,
-        idle_reserve_target=config.idle_reserve_target,
-        idle_reserve_scale=config.idle_reserve_scale,
-        idle_reserve_weight=config.idle_reserve_weight,
-        local_oht_weight=config.local_oht_weight,
-        local_predicted_oht_weight=config.local_predicted_oht_weight,
-        local_stop_weight=config.local_stop_weight,
-        local_idle_weight=config.local_idle_weight,
-        local_capacity_weight=config.local_capacity_weight,
-        rail_reward_mode=config.rail_reward_mode,
-        rail_free_flow_neutral_ratio=config.rail_free_flow_neutral_ratio,
-        rail_baseline_ratio_reference=config.rail_baseline_ratio_reference,
-        rail_tat_weight=config.reward_rail_tat_weight,
-        rail_tat_clip=config.reward_rail_tat_clip,
-        tat_raw_clip=config.tat_raw_clip,
     )
+    contract = reward_config.contract
+    meta["reward_version"] = contract.version
+    meta["reward_historical_version"] = contract.historical_version
+    meta["reward_contract_version"] = contract.contract_version
+    meta["reward_tat_version"] = contract.tat_version
+    meta["reward_normalization_version"] = contract.normalization_version
+    meta["tat_signal"] = contract.tat_signal_description
+    meta["calibration_status"] = f"locked_reward_{contract.version.lower()}"
     sale = bool(config.sale_enabled)
     lap = bool(config.lap_enabled)
     action_mode = str(config.action_mode)
@@ -659,7 +638,7 @@ def runtime_exp_meta(config) -> dict:
     meta["dispatch_mode"] = str(config.dispatch_mode)
     meta["dispatch_selection_version"] = DISPATCH_SELECTION_VERSION
     meta["note"] = (
-        f"{meta['note']}_s{int(config.num_stacks)}i"
+        f"{meta['note']}_r{contract.version}_s{int(config.num_stacks)}i"
         f"{int(config.stack_interval)}_dispatch_"
         f"{str(config.dispatch_mode).replace('-', '_')}"
     )
@@ -713,12 +692,24 @@ def runtime_exp_meta(config) -> dict:
     )
     meta["tat_confidence_n0"] = float(reward_config.tat_confidence_n0)
     meta["tat_confidence_ramp"] = bool(reward_config.tat_confidence_ramp)
+    meta["tat_confidence_supported"] = bool(
+        reward_config.tat_confidence_supported
+    )
     meta["tat_reference"] = float(reward_config.tat_reference)
     meta["tat_weight"] = float(reward_config.tat_weight)
     meta["tat_one_sided"] = bool(reward_config.tat_one_sided)
+    meta["tat_excess_clip"] = reward_config.tat_excess_clip
+    meta["tat_ema_beta"] = float(reward_config.tat_ema_beta)
+    meta["global_zero_on_first_tick"] = bool(
+        reward_config.global_zero_on_first_tick
+    )
+    meta["marginal_tat_enabled"] = (
+        reward_config.tat_signal_mode == "marginal_tat_ema"
+    )
     meta["tat_signal_mode"] = str(reward_config.tat_signal_mode)
     meta["op_reference"] = float(reward_config.op_reference)
     meta["op_weight"] = float(reward_config.op_weight)
+    meta["use_op"] = bool(reward_config.use_op)
     meta["backlog_weight"] = float(reward_config.backlog_weight)
     meta["backlog_growth_enabled"] = bool(
         reward_config.backlog_growth_enabled
@@ -735,7 +726,7 @@ def runtime_exp_meta(config) -> dict:
     meta["idle_reserve_target"] = float(reward_config.idle_reserve_target)
     meta["idle_reserve_scale"] = float(reward_config.idle_reserve_scale)
     meta["idle_reserve_weight"] = float(reward_config.idle_reserve_weight)
-    meta["tat_early_termination"] = True
+    meta["tat_early_termination"] = bool(config.tat_termination_enabled)
     meta["early_stop_tat_threshold"] = float(
         config.early_stop_tat_threshold
     )
@@ -744,6 +735,9 @@ def runtime_exp_meta(config) -> dict:
     )
     meta["tat_above_threshold_patience"] = int(
         config.tat_above_threshold_patience
+    )
+    meta["tat_termination_inclusive"] = bool(
+        config.tat_termination_inclusive
     )
     meta["terminal_tat_penalty"] = float(config.terminal_tat_penalty)
     meta["curriculum_end_step"] = int(config.curriculum_end_step)
@@ -786,11 +780,16 @@ def runtime_exp_meta(config) -> dict:
         f"action_mode={action_mode}, dispatch_mode={config.dispatch_mode}, "
         f"critic_loss={config.critic_loss_mode}, "
         "independently initialized Q1/Q2 heads, "
-        f"reward {REWARD_VERSION} ({REWARD_CONTRACT_VERSION}, global/local="
+        f"reward {contract.version} (historical={contract.historical_version}, "
+        f"{contract.contract_version}, global/local="
         f"{reward_config.global_alpha:g}/{reward_config.local_alpha:g}), "
-        "reward_normalizer=global_off_local_normalize_before_update, "
-        "tat_signal=actual_new_completion_CmdTat_mean, "
-        "fixed_scale=off, marginal_tat=off, completion_ema=off, "
+        "reward_normalizer="
+        f"global_{'running' if reward_config.global_normalization_enabled else 'off'}_"
+        f"local_{'running' if reward_config.local_normalization_enabled else 'off'}, "
+        f"tat_signal={contract.tat_signal_description}, "
+        f"fixed_scale={'on' if reward_config.local_fixed_scale_enabled else 'off'}, "
+        f"marginal_tat={'on' if meta['marginal_tat_enabled'] else 'off'}, "
+        "completion_ema=off, "
         f"replay_capacity={int(config.replay_capacity_env_steps)}, "
         f"curriculum_end_step={int(config.curriculum_end_step)}, "
         f"exploration={float(config.exploration_noise_std):g}->"
