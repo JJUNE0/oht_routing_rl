@@ -31,6 +31,9 @@ python .\PythonCode\main_contextual.py `
 `N`만 허용합니다. simulator GUI에서 Python 연동을 활성화한 뒤 Run을
 시작해야 TCP 세션이 연결됩니다.
 
+공식 진입점은 `main_contextual.py` 하나입니다. `main.py`는 기존 실행기를
+위한 얇은 wrapper이며, 삭제된 region-token 경로인 `--region`은 거부합니다.
+
 ## Reward N 계약
 
 controlled rail `i`의 최종 reward는 다음과 같습니다.

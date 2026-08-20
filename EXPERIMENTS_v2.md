@@ -78,3 +78,18 @@ Reward N run/checkpoint와 맞지 않는 오래된 기록이다. v2 기준값은
   `runtime_env_step=220000`, `learner_updates=209899` 복원을 확인했다.
 - `python -m unittest discover -s tests -p 'test_contextual*.py'`:
   249 tests 통과.
+
+## 2026-08-20 - legacy runtime 제거
+
+- `ClientAlgorithm.py`, `ClientAlgorithm_region.py`,
+  `ClientAlgorithm_0704.py`를 삭제했다.
+- 중복 TCP loop를 갖고 있던 `main.py`는 `main_contextual.py`를 호출하는
+  호환 wrapper로 축소했다. 삭제된 region-token 경로인 `--region`은
+  명시적으로 거부한다.
+- 공식 실행 진입점은 `PythonCode/main_contextual.py` 하나다.
+- 기존 `token_td7` 패키지는 import되지 않는 라이브러리 코드로 남지만,
+  삭제된 runtime 클래스 이름을 가리키던 주석은 제거했다.
+- Reward N, observation/action, learner, replay, checkpoint 계약은 변경하지
+  않았다. simulator와 W&B run은 실행하지 않았다.
+- wrapper compile/help/`--region` 거부 동작을 확인했고,
+  `test_contextual*.py` 249개가 통과했다.

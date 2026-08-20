@@ -31,6 +31,6 @@ run_{MMDD_HHMM}_{cost_structure}_{action_range}_{reward_version}_{note}
 ## 실행
 
 ```bash
-python main.py           # per-rail TD7
-python main.py --region  # region-token TD7
+python PythonCode/main_contextual.py
+python PythonCode/main_contextual.py --mode training --action-enabled --reward-version N
 ```

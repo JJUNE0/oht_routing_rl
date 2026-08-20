@@ -154,7 +154,7 @@ class TokenTD7Learner:
         self.numeric_failure = None
 
         # curriculum scale이 buffer에 저장된 action과 actor loss action의 분포를 정렬한다.
-        # ClientAlgorithm_region이 매 learn() 호출 전 set_curriculum_scale()로 갱신.
+        # The caller updates this before each learn() call.
         self.curriculum_scale = 1.0
         self.pretanh_penalty_coef = float(algo.get("pretanh_penalty_coef", 0.1))
 
@@ -678,7 +678,7 @@ class TokenTD7Learner:
         self.total_losses = stats
 
     def set_curriculum_scale(self, scale: float):
-        """ClientAlgorithm_region이 매 learn() 전 현재 curriculum scale을 동기화."""
+        """Synchronize the current curriculum scale before learning."""
         self.curriculum_scale = float(scale)
 
     def get_params(self):
