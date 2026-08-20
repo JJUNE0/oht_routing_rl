@@ -1,6 +1,7 @@
 """Compare per-rail TD7 with two region-token TD7 implementations.
 
-The input CSV files are produced by ``download_wandb_run.py``.  Use
+The input CSV files are produced by
+``oht_routing/utils/download_wandb_run.py``. Use
 ``--refresh`` to download the selected W&B metrics again before plotting.
 """
 
@@ -17,7 +18,7 @@ import numpy as np
 import pandas as pd
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_OUTPUT = PROJECT_ROOT / "results" / "figures" / "per_region_rl_diagnosis"
 RUNS = {
     "ozl3xyft": {
@@ -92,7 +93,13 @@ def refresh_history(run_id: str) -> None:
     run_meta = RUNS[run_id]
     command = [
         sys.executable,
-        str(PROJECT_ROOT / "PythonCode" / "download_wandb_run.py"),
+        str(
+            PROJECT_ROOT
+            / "PythonCode"
+            / "oht_routing"
+            / "utils"
+            / "download_wandb_run.py"
+        ),
         "--run-path",
         f"{run_meta['project']}/{run_id}",
         "--output-dir",

@@ -11,13 +11,17 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+PYTHON_CODE_DIR = Path(__file__).resolve().parents[2]
+if str(PYTHON_CODE_DIR) not in sys.path:
+    sys.path.insert(0, str(PYTHON_CODE_DIR))
+
 import PClient
 from oht_routing.mdp.topology import TopologyAuditError, build_contextual_topology
 
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 9100
-DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent.parent
+DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parents[3]
 EXPECTED_SIMULATION_STATES = {0, 1, 2, 3, 4, 5, 6}
 
 

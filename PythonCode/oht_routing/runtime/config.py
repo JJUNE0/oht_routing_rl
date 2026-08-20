@@ -20,7 +20,7 @@ from oht_routing.routing.dispatch import (
     DISPATCH_MODES,
 )
 from oht_routing.mdp.reward.builder import ContextualRewardConfig
-from oht_routing.telemetry.reward_diagnostic import parse_diagnostic_windows
+from oht_routing.utils.reward_diagnostic import parse_diagnostic_windows
 from oht_routing.mdp.reward.config import (
     REWARD_VERSION,
     canonical_reward_version,

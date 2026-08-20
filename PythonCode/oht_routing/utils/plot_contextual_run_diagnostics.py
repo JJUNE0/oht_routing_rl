@@ -19,7 +19,7 @@ import numpy as np
 import pandas as pd
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_RUN_IDS = (
     "0lwv8bat",
     "nccazyej",

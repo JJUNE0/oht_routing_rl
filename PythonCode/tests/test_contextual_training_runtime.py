@@ -30,12 +30,12 @@ from test_contextual_observation import (
     make_topology,
 )
 from test_contextual_runtime import make_runtime_pclient
-from oht_routing.telemetry.wandb import (
+from oht_routing.utils.wandb_logging import (
     WANDB_METRIC_KEYS,
     ContextualWandbLogger,
     runtime_exp_meta,
 )
-from export_wandb_run import EXPORT_COLUMNS
+from oht_routing.utils.export_wandb_run import EXPORT_COLUMNS
 
 
 class TrainingObservationBuilder:

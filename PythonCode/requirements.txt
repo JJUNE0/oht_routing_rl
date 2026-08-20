@@ -4,6 +4,7 @@
 #   - CPU만 사용해도 동작합니다(자동 감지).
 numpy
 pandas
+matplotlib
 torch
 wandb
 PyYAML

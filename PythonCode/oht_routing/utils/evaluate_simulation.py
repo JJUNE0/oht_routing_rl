@@ -1,16 +1,20 @@
+"""Evaluate simulator SQLite results against the configured baseline."""
+
 import numpy as np
 import pandas as pd 
 import sqlite3
 import os 
 from typing import Tuple
-import torch
 import argparse
 
 #####################################################################################################################################
 #####################################################사용자 변경 부분#################################################################
 #####################################################################################################################################
 # DB 파일 위치 (기본값: 이 스크립트 기준 ../results). 필요 시 절대경로로 교체해 사용.
-root_file_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "results")
+PROJECT_ROOT = os.path.abspath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..")
+)
+root_file_dir = os.path.join(PROJECT_ROOT, "results")
 db_file_dir = r'' # 예: r'SimulationResult_3_13_9_50_55.db'
 file_path = os.path.join(root_file_dir,db_file_dir)
 
@@ -141,7 +145,9 @@ def evaluate(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    default_results = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "results/contextual_td7/0806")
+    default_results = os.path.join(
+        PROJECT_ROOT, "results", "contextual_td7", "0806"
+    )
     parser.add_argument('--save_dir', type=str, default=default_results, help="결과 DB가 들어있는 폴더")
     parser.add_argument('--db_filename', type=str, default='ep_3.db', help="평가할 결과 DB 파일명")
     args = parser.parse_args()

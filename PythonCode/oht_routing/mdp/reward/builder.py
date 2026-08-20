@@ -16,7 +16,7 @@ from oht_routing.mdp.reward.rail_cycle import (
     RailPassTemporalTracker,
 )
 from oht_routing.mdp.action import ACTION_MODES, REGION_B_RL
-from oht_routing.telemetry.reward_diagnostic import RewardDiagnosticWriter
+from oht_routing.utils.reward_diagnostic import RewardDiagnosticWriter
 from oht_routing.mdp.topology import ContextualTopology
 from oht_routing.mdp.reward.config import (
     RAIL_REWARD_FREE_FLOW_NEUTRAL_2,

@@ -60,13 +60,13 @@ from oht_routing.mdp.termination import (
     WARMUP_EPISODE_TRANSITION_VERSION,
 )
 from oht_routing.mdp.reward.builder import ContextualRewardBuilder
-from oht_routing.telemetry.reward_diagnostic import (
+from oht_routing.utils.reward_diagnostic import (
     LeadingIndicatorTracker,
     RewardDiagnosticWriter,
     parse_diagnostic_windows,
 )
 from oht_routing.mdp.transition import ContextualTransitionAligner
-from oht_routing.telemetry.wandb import ContextualWandbLogger
+from oht_routing.utils.wandb_logging import ContextualWandbLogger
 from oht_routing.runtime.diagnostics import ContextualRuntimeDiagnosticsMixin
 from oht_routing.runtime.config import ContextualRuntimeConfig
 

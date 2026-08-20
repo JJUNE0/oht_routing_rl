@@ -1,9 +1,9 @@
 """Download a Weights & Biases run's metrics for local analysis.
 
 Example:
-    python download_wandb_run.py
-    python download_wandb_run.py --run-path bjy6614-postech/oht-routing-rl-td7-region/5ytouc3j
-    python download_wandb_run.py --keys global/tat reward/step_reward loss/q1
+    python PythonCode/oht_routing/utils/download_wandb_run.py
+    python PythonCode/oht_routing/utils/download_wandb_run.py --run-path ENTITY/PROJECT/RUN_ID
+    python PythonCode/oht_routing/utils/download_wandb_run.py --keys env/tat critic/q1_mean
 
 Authentication:
     Run ``wandb login`` once, or set the WANDB_API_KEY environment variable.
@@ -17,7 +17,7 @@ from pathlib import Path
 import wandb
 
 DEFAULT_RUN_PATH = "bjy6614-postech/oht-routing-rl-td7-region/w5l4ytzi"
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 
 def parse_args():

@@ -5,12 +5,12 @@ import csv
 import sys
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 PYTHON_CODE_DIR = PROJECT_ROOT / "PythonCode"
 if str(PYTHON_CODE_DIR) not in sys.path:
     sys.path.insert(0, str(PYTHON_CODE_DIR))
 
-from oht_routing.telemetry.wandb import (
+from oht_routing.utils.wandb_logging import (
     EXP_META,
     REMOVED_WANDB_PREFIXES,
     WANDB_METRIC_KEYS,

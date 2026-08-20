@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from oht_routing.mdp.reward.builder import ContextualRewardBuilder, ContextualRewardConfig
-from oht_routing.telemetry.reward_diagnostic import (
+from oht_routing.utils.reward_diagnostic import (
     DIAGNOSTIC_SCHEMA_VERSION,
     RewardDiagnosticWriter,
     diagnostic_window_name,

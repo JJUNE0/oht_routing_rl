@@ -79,9 +79,21 @@ oht_routing/
 │  └─ reward/                      Reward N 설정, 조합, rail-cycle 추적
 ├─ routing/dispatch.py             simulator dispatch 선택
 ├─ runtime/                        client, CLI, bootstrap, protocol, TCP server
-└─ telemetry/                      W&B와 reward 진단
+└─ utils/                          W&B, reward 진단, topology/분석 도구
 oht_dispatching/                   job-to-OHT dispatching 전용 패키지
 tests/                             contextual 회귀 테스트
+```
+
+## 유틸리티
+
+`PythonCode/oht_routing/utils` 아래 도구는 저장소 루트에서 직접
+실행합니다.
+
+```powershell
+python .\PythonCode\oht_routing\utils\check_rail_topology.py --help
+python .\PythonCode\oht_routing\utils\download_wandb_run.py --help
+python .\PythonCode\oht_routing\utils\export_wandb_run.py --help
+python .\PythonCode\oht_routing\utils\evaluate_simulation.py --help
 ```
 
 ## State normalizer
@@ -129,7 +141,8 @@ PyTorch가 memory-efficient attention backward의 비결정적 CUDA 경로를
 
 ## W&B와 실험 기록
 
-모든 새 실험 전에 `oht_routing/telemetry/wandb.py`의 `EXP_META`를 먼저
+모든 새 실험 전에 `oht_routing/utils/wandb_logging.py`의 `EXP_META`를
+먼저
 갱신합니다. run 이름은 `_make_run_name`이 만들며 직접 짓지 않습니다.
 `wandb.init`은 runtime config와 `EXP_META`를 함께 기록하고
 `EXP_META["description"]`을 notes로 전달합니다.
@@ -137,8 +150,8 @@ PyTorch가 memory-efficient attention backward의 비결정적 CUDA 경로를
 v2 변경과 실험 결과는 루트의 `EXPERIMENTS_v2.md`에 기록합니다.
 reward 공식 변경 시 reward version을 올리고, action/observation/replay/
 checkpoint 계약 변경 시 해당 버전과 호환성 영향을 함께 기록합니다.
-W&B metric을 바꾸면 루트와 `PythonCode`의 `export_wandb_run.py`도
-같이 수정합니다.
+W&B metric을 바꾸면
+`oht_routing/utils/export_wandb_run.py`도 같이 수정합니다.
 
 ## 테스트
 

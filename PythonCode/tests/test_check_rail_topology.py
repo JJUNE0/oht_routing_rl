@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from unittest.mock import patch
 
-import check_rail_topology
+from oht_routing.utils import check_rail_topology
 
 
 @dataclass

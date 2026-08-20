@@ -6,7 +6,7 @@
 
 ## 기록 원칙
 
-- 실제 실행 전에 `PythonCode/oht_routing/telemetry/wandb.py`의
+- 실제 실행 전에 `PythonCode/oht_routing/utils/wandb_logging.py`의
   `EXP_META`를 먼저
   갱신한다.
 - run 이름은 `_make_run_name`으로만 생성한다.
@@ -14,8 +14,8 @@
   기록한다.
 - action, observation, replay, checkpoint 계약을 바꾸면 해당 버전과 기존
   checkpoint 호환 여부를 기록한다.
-- W&B metric을 바꾸면 루트와 `PythonCode`의
-  `export_wandb_run.py`를 동시에 갱신한다.
+- W&B metric을 바꾸면
+  `PythonCode/oht_routing/utils/export_wandb_run.py`를 동시에 갱신한다.
 - simulator/W&B를 실제로 실행하지 않은 코드 변경은 실험 결과처럼 쓰지
   않고, 검증한 테스트와 호환성만 기록한다.
 
@@ -101,7 +101,7 @@ Reward N run/checkpoint와 맞지 않는 오래된 기록이다. v2 기준값은
   `PythonCode/oht_routing/algorithms/rl/contextual_td7`로 옮겼다.
 - MDP 계약은 `oht_routing/mdp`, simulator 수명주기는
   `oht_routing/runtime`, dispatch는 `oht_routing/routing`, W&B와
-  reward 진단은 `oht_routing/telemetry`로 분리했다.
+  reward 진단은 `oht_routing/utils`로 분리했다.
 - 사용되지 않던 TD3, TD7, token-TD7, generic buffer/config를 포함한
   `cocel_rl` 패키지와 빈 `PythonCode/core` 디렉터리를 삭제했다.
 - 실행 진입점 `PythonCode/main_contextual.py`와 `main.py` 호환
@@ -121,3 +121,18 @@ Reward N run/checkpoint와 맞지 않는 오래된 기록이다. v2 기준값은
   `oht_routing/routing/dispatch.py`에 유지했다.
 - 실행 코드와 Reward N 계약은 변경하지 않았으며 simulator와 W&B run은
   시작하지 않았다.
+
+## 2026-08-20 - telemetry와 보조 스크립트를 `utils`로 통합
+
+- `oht_routing/telemetry`를 `oht_routing/utils`로 이름을 바꾸고
+  runtime 및 테스트 import를 새 경로로 갱신했다.
+- topology audit, W&B download/export/package, contextual/region plot,
+  SQLite 결과 평가 스크립트를 `oht_routing/utils`로 이동했다.
+- 중복되던 두 `export_wandb_run.py`는
+  `oht_routing/utils/export_wandb_run.py` 하나로 합쳤다.
+- simulator 데이터 모델과 공식 실행 진입점은 이동하지 않았다.
+- Reward N, checkpoint, W&B metric/schema 계약은 변경하지 않았으며
+  simulator와 W&B run은 시작하지 않았다.
+- 새 패키지 compile/import와 topology/W&B/evaluation 도구의 CLI를
+  확인했고, `test_contextual*.py` 249개가 통과했다.
+- plot 도구가 사용하는 `matplotlib`을 `requirements.txt`에 명시했다.

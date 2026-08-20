@@ -7,7 +7,7 @@ import zipfile
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[3]
 WANDB_RESULTS = ROOT / "results" / "wandb"
 OUTPUT = WANDB_RESULTS / "contextual_td7_4runs_labeled_for_gpt.zip"
 RUN_IDS = ("f8u5by9y", "zuw9nno8", "0lwv8bat", "26hxsuet")
