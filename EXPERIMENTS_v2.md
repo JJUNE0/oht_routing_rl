@@ -165,3 +165,11 @@ Reward N run/checkpoint와 맞지 않는 오래된 기록이다. v2 기준값은
   W&B run은 시작하지 않았다.
 - simulator package compile/import, `main.py`와 topology utility CLI를
   확인했고 `test_contextual*.py` 249개가 통과했다.
+
+## 2026-08-21 - simulator DB 평가 도구 이동
+
+- `oht_routing/utils/evaluate_simulation.py`를
+  `PythonCode/simulator/evaluate.py`로 옮겼다.
+- simulator 결과 DB 평가는 routing utility가 아니라 simulator 도구가
+  소유하도록 경계를 바로잡았다.
+- 평가 공식과 기본 결과 경로는 변경하지 않았다.

@@ -12,7 +12,7 @@ import argparse
 #####################################################################################################################################
 # DB 파일 위치 (기본값: 이 스크립트 기준 ../results). 필요 시 절대경로로 교체해 사용.
 PROJECT_ROOT = os.path.abspath(
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..")
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
 )
 root_file_dir = os.path.join(PROJECT_ROOT, "results")
 db_file_dir = r'' # 예: r'SimulationResult_3_13_9_50_55.db'

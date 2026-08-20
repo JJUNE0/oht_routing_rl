@@ -94,7 +94,7 @@ tests/                             contextual 회귀 테스트
 python .\PythonCode\oht_routing\utils\check_rail_topology.py --help
 python .\PythonCode\oht_routing\utils\download_wandb_run.py --help
 python .\PythonCode\oht_routing\utils\export_wandb_run.py --help
-python .\PythonCode\oht_routing\utils\evaluate_simulation.py --help
+python .\PythonCode\simulator\evaluate.py --help
 ```
 
 ## State normalizer
