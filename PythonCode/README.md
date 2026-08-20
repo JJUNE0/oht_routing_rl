@@ -78,7 +78,7 @@ oht_routing/
 ├─ mdp/                            action, observation, transition, termination
 │  └─ reward/                      Reward N 설정, 조합, rail-cycle 추적
 ├─ routing/dispatch.py             simulator dispatch 선택
-├─ runtime/                        client, CLI, bootstrap, protocol, TCP server
+├─ runtime/                        client, CLI/config, protocol, TCP server
 └─ utils/                          W&B, reward 진단, topology/분석 도구
 oht_dispatching/                   job-to-OHT dispatching 전용 패키지
 simulator/                         TCP protocol과 simulator entity 모델

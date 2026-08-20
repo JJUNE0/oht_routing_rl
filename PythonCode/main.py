@@ -11,7 +11,7 @@ from oht_routing.runtime.protocol import (
     read_port,
     send_active_data,
 )
-from oht_routing.runtime.bootstrap import (
+from oht_routing.runtime.config import (
     runtime_config_from_args,
     seed_everything,
 )

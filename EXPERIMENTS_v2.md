@@ -173,3 +173,19 @@ Reward N run/checkpoint와 맞지 않는 오래된 기록이다. v2 기준값은
 - simulator 결과 DB 평가는 routing utility가 아니라 simulator 도구가
   소유하도록 경계를 바로잡았다.
 - 평가 공식과 기본 결과 경로는 변경하지 않았다.
+
+## 2026-08-21 - runtime config 조립 통합
+
+- `runtime/bootstrap.py`의 CLI 설정 조립, checkpoint runtime 설정 복원,
+  process seed 설정을 `runtime/config.py`로 합치고 `bootstrap.py`를
+  삭제했다.
+- `runtime_config_from_args()`는 dataclass 필드와 CLI의 같은 이름을
+  자동 매핑하고, 이름이 다른 다섯 필드만 alias로 관리하도록 줄였다.
+- seed 적용은 config 객체 생성의 부작용이 되지 않도록 `main.py`에서
+  `seed_everything(config.seed)`를 명시적으로 호출하는 방식을 유지했다.
+- `ContextualRuntimeConfig`가 runtime 설정의 최상위 원본이며,
+  `ClientAlgorithm`이 이를 learner/network/reward 설정으로 변환한다.
+- Reward N, checkpoint 및 W&B 계약은 변경하지 않았으며 simulator와
+  W&B run은 시작하지 않았다.
+- 기본 CLI config build/seed와 `main.py` CLI를 확인했고,
+  `test_contextual*.py` 249개가 통과했다.
