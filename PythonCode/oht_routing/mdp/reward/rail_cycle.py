@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from Oht import OHTState
+from simulator.oht import OHTState
 
 
 ACTIVE_OHT_CYCLE_STATES = frozenset({

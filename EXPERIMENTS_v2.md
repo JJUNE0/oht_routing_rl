@@ -148,3 +148,20 @@ Reward N run/checkpoint와 맞지 않는 오래된 기록이다. v2 기준값은
   simulator와 W&B run은 시작하지 않았다.
 - 새 `main.py` compile/help와 `main_contextual.py` 제거를 확인했고,
   `test_contextual*.py` 249개가 통과했다.
+
+## 2026-08-20 - simulator protocol/model 패키지 분리
+
+- 최상위 `PClient.py`, `Job.py`, `Oht.py`, `RailLine.py`와 관련
+  payload 모델을 `PythonCode/simulator` 패키지로 옮겼다.
+- 파일명은 snake_case로 정리하고 기존 wire-facing 클래스명과 simulator
+  protocol 동작은 유지했다.
+- runtime, topology audit, reward 및 protocol 테스트 import를
+  `simulator` 패키지 경로로 갱신했다.
+- `simulator`는 저수준 TCP/wire 계약, `oht_routing`과
+  `oht_dispatching`은 정책을 소유하도록 경계를 분리했다.
+- runtime console prefix를 파일명 기반 `[main-contextual]`에서
+  `[contextual-runtime]`으로 바꿨다.
+- Reward N, checkpoint 및 W&B 계약은 변경하지 않았으며 simulator와
+  W&B run은 시작하지 않았다.
+- simulator package compile/import, `main.py`와 topology utility CLI를
+  확인했고 `test_contextual*.py` 249개가 통과했다.

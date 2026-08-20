@@ -5,8 +5,8 @@ from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-import PClient
-from Oht import OHTState
+from simulator import client as PClient
+from simulator.oht import OHTState
 from main import SmokeReporter, handle_command
 
 

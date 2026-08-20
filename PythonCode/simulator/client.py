@@ -1,18 +1,21 @@
-import socket
-from datetime import datetime
 import math
+import os
+import socket
 import sys
 import time
-import os, sys
-from RailLineCost import RailLineCost
-from Job import Job
-from Oht import Oht
-from RailLine import RailLine
-from LinePassTime import LinePassTime
-from ohtLinePassTime import ohtLinePassTime
-from ohtPos import ohtPos
-from OHTCommandTime import OHTCommandTime
 from collections import OrderedDict
+from datetime import datetime
+
+from .job import Job
+from .line_pass_time import LinePassTime
+from .oht import Oht
+from .oht_command_time import OHTCommandTime
+from .oht_line_pass_time import ohtLinePassTime
+from .oht_position import ohtPos
+from .rail_line import RailLine
+from .rail_line_cost import RailLineCost
+
+
 class PClient:
        BUFFER_SIZE= int(8912);
        RAILINE_COUNT = 0;

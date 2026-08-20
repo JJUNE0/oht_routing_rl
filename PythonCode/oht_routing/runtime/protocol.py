@@ -117,7 +117,7 @@ def send_active_data(pclient, client, reporter=None, log_interval=100):
     )
     if step % int(log_interval) == 0:
         print(
-            "[main-contextual] "
+            "[contextual-runtime] "
             f"step={step}, episode={client.episode_id}, "
             f"episode_step={client.episode_steps}, action={action_state}, "
             f"warmup_remaining={warmup_remaining}, "

@@ -81,6 +81,7 @@ oht_routing/
 ├─ runtime/                        client, CLI, bootstrap, protocol, TCP server
 └─ utils/                          W&B, reward 진단, topology/분석 도구
 oht_dispatching/                   job-to-OHT dispatching 전용 패키지
+simulator/                         TCP protocol과 simulator entity 모델
 tests/                             contextual 회귀 테스트
 ```
 

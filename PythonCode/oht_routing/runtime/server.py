@@ -4,7 +4,7 @@ import socket
 import traceback
 from datetime import datetime
 
-import PClient
+from simulator import client as PClient
 from oht_routing.runtime.client import ContextualTrainingFailure
 from oht_routing.runtime.protocol import handle_command, read_port
 
@@ -15,7 +15,7 @@ EXPECTED_SIMULATION_STATES = {0, 1, 2, 3, 4, 5, 6}
 
 def _run_session(connection, address, port, args, client, reporter):
     print(
-        "[main-contextual] TCP accepted; "
+        "[contextual-runtime] TCP accepted; "
         f"starting PClient initialization handshake: {address}"
     )
     # PClient owns the fixed-width initialization/reset handshake.
@@ -23,7 +23,7 @@ def _run_session(connection, address, port, args, client, reporter):
     pclient = PClient.PClient(connection, sim_end_time=args.sim_end_time)
     client.on_new_connection()
     print(datetime.now().strftime("%Y.%m.%d - %H:%M:%S"))
-    print("[main-contextual] PClient initialization completed")
+    print("[contextual-runtime] PClient initialization completed")
     print("Socket ??筌먦끉裕?? ???ㅼ뒦???筌???????")
     print(HOST)
     print(port)
@@ -35,7 +35,7 @@ def _run_session(connection, address, port, args, client, reporter):
         command_count += 1
         if command != 0 or command_count % args.console_log_interval == 0:
             print(datetime.now().strftime("%Y.%m.%d - %H:%M:%S"))
-            print(f"[main-contextual] command={command}, count={command_count}")
+            print(f"[contextual-runtime] command={command}, count={command_count}")
             pclient.WriteAdminLog("RecieveSimulationStandardData.")
         if command not in EXPECTED_SIMULATION_STATES:
             pending = pclient.PeekPending(64)
@@ -57,7 +57,7 @@ def _run_session(connection, address, port, args, client, reporter):
 def _accept_sessions(server, port, args, client, reporter):
     while True:
         print(datetime.now().strftime("%Y.%m.%d - %H:%M:%S"))
-        print(f"[main-contextual] waiting on {HOST}:{port}")
+        print(f"[contextual-runtime] waiting on {HOST}:{port}")
         connection, address = server.accept()
         with connection:
             try:
@@ -68,7 +68,7 @@ def _accept_sessions(server, port, args, client, reporter):
                 raise
             except (ConnectionError, IndexError):
                 traceback.print_exc()
-                print("[main-contextual] disconnected; waiting for reconnect")
+                print("[contextual-runtime] disconnected; waiting for reconnect")
             except FloatingPointError:
                 raise
             except Exception:
@@ -77,7 +77,7 @@ def _accept_sessions(server, port, args, client, reporter):
                     raise ContextualTrainingFailure(
                         "training failure latched; operator restart required"
                     )
-                print("[main-contextual] session failed; waiting for reconnect")
+                print("[contextual-runtime] session failed; waiting for reconnect")
 
 
 def serve_contextual(args, client, reporter):

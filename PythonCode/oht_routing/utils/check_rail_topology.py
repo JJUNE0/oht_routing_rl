@@ -15,7 +15,7 @@ PYTHON_CODE_DIR = Path(__file__).resolve().parents[2]
 if str(PYTHON_CODE_DIR) not in sys.path:
     sys.path.insert(0, str(PYTHON_CODE_DIR))
 
-import PClient
+from simulator import client as PClient
 from oht_routing.mdp.topology import TopologyAuditError, build_contextual_topology
 
 

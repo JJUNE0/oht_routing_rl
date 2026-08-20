@@ -9,7 +9,7 @@ from typing import Callable
 
 import numpy as np
 
-from Oht import OHTState
+from simulator.oht import OHTState
 from oht_routing.mdp.reward.rail_cycle import (
     ContextualRailRewardMixin,
     OHTCycleTracker,

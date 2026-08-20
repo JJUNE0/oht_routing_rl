@@ -6,7 +6,7 @@ def print_runtime_summary(args, client):
     config = client.config
     reward = config.make_reward_config()
     print(
-        "[main-contextual] "
+        "[contextual-runtime] "
         f"mode={args.mode}, action_enabled={args.action_enabled}, "
         f"reward_version={config.reward_version}, "
         f"action_mode={args.action_mode}, "
@@ -55,7 +55,7 @@ def print_runtime_summary(args, client):
         f"device={client.device}"
     )
     print(
-        "[main-contextual] rail_tat_diagnostic="
+        "[contextual-runtime] rail_tat_diagnostic="
         f"{client.rail_tat_diagnostic_path}, "
         f"global_step<{config.rail_tat_diagnostic_max_step}"
     )
