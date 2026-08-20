@@ -111,3 +111,13 @@ Reward N run/checkpoint와 맞지 않는 오래된 기록이다. v2 기준값은
   W&B run도 시작하지 않았다.
 - 새 패키지 compile/import smoke와 `test_contextual*.py` 249개 회귀
   테스트가 통과했다.
+
+## 2026-08-20 - `oht_dispatching` 패키지 경계 추가
+
+- `PythonCode/oht_dispatching` 패키지를 추가했다.
+- `oht_routing`은 rail/path 비용과 경로 제어, `oht_dispatching`은
+  job-to-OHT 할당과 dispatch 정책을 소유하도록 책임 경계를 정했다.
+- 기존 command 6 선택 코드는 동작 변경 없이
+  `oht_routing/routing/dispatch.py`에 유지했다.
+- 실행 코드와 Reward N 계약은 변경하지 않았으며 simulator와 W&B run은
+  시작하지 않았다.

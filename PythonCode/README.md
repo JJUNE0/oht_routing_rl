@@ -80,6 +80,7 @@ oht_routing/
 ├─ routing/dispatch.py             simulator dispatch 선택
 ├─ runtime/                        client, CLI, bootstrap, protocol, TCP server
 └─ telemetry/                      W&B와 reward 진단
+oht_dispatching/                   job-to-OHT dispatching 전용 패키지
 tests/                             contextual 회귀 테스트
 ```
 
