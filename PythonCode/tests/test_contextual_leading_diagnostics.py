@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from contextual_reward_diagnostic import (
+from oht_routing.telemetry.reward_diagnostic import (
     LeadingIndicatorTracker,
     RunningPearson,
 )

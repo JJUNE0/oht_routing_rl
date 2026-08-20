@@ -6,7 +6,8 @@
 
 ## 기록 원칙
 
-- 실제 실행 전에 `PythonCode/contextual_wandb.py`의 `EXP_META`를 먼저
+- 실제 실행 전에 `PythonCode/oht_routing/telemetry/wandb.py`의
+  `EXP_META`를 먼저
   갱신한다.
 - run 이름은 `_make_run_name`으로만 생성한다.
 - reward 공식을 바꾸면 `reward_version`을 올리고 새 식과 호환성 영향을
@@ -93,3 +94,20 @@ Reward N run/checkpoint와 맞지 않는 오래된 기록이다. v2 기준값은
   않았다. simulator와 W&B run은 실행하지 않았다.
 - wrapper compile/help/`--region` 거부 동작을 확인했고,
   `test_contextual*.py` 249개가 통과했다.
+
+## 2026-08-20 - `oht_routing` 패키지로 재배치
+
+- 활성 contextual TD7 구현을
+  `PythonCode/oht_routing/algorithms/rl/contextual_td7`로 옮겼다.
+- MDP 계약은 `oht_routing/mdp`, simulator 수명주기는
+  `oht_routing/runtime`, dispatch는 `oht_routing/routing`, W&B와
+  reward 진단은 `oht_routing/telemetry`로 분리했다.
+- 사용되지 않던 TD3, TD7, token-TD7, generic buffer/config를 포함한
+  `cocel_rl` 패키지와 빈 `PythonCode/core` 디렉터리를 삭제했다.
+- 실행 진입점 `PythonCode/main_contextual.py`와 `main.py` 호환
+  wrapper는 유지했다.
+- import 경로만 변경했다. Reward N 공식, action/observation/replay,
+  checkpoint, W&B metric/schema 계약은 바꾸지 않았으며 simulator와
+  W&B run도 시작하지 않았다.
+- 새 패키지 compile/import smoke와 `test_contextual*.py` 249개 회귀
+  테스트가 통과했다.

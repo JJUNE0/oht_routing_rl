@@ -26,7 +26,9 @@ run_{MMDD_HHMM}_{cost_structure}_{action_range}_{reward_version}_{note}
 
 - reward 공식 변경 → `reward_version` 알파벳 올리기 + `EXPERIMENTS_v2.md` 한 줄 기록
 - action 방식·obs 구조 등 코드 교체 → 버전 명시 + `EXPERIMENTS_v2.md` 기록
-- `ClientAlgorithm.py` 에 wandb 메트릭 추가/변경 → `export_wandb_run.py` 동시 수정
+- `PythonCode/oht_routing/runtime/client.py` 또는
+  `PythonCode/oht_routing/telemetry/wandb.py`에서 W&B 메트릭
+  추가/변경 → 두 `export_wandb_run.py` 동시 수정
 
 ## 실행
 

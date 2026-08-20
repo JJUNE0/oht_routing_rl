@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
-from contextual_topology import (
+from oht_routing.mdp.topology import (
     TOPOLOGY_VERSION,
     TopologyAuditError,
     build_contextual_topology,

@@ -11,7 +11,7 @@ from test_contextual_training_runtime import (
 )
 from test_contextual_observation import make_topology
 from test_contextual_runtime import make_runtime_pclient
-from ClientAlgorithm_contextual import ClientAlgorithm, ContextualRuntimeConfig
+from oht_routing.runtime.client import ClientAlgorithm, ContextualRuntimeConfig
 
 
 EXP_META = {

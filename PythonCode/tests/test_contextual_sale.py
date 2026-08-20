@@ -6,12 +6,12 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from cocel_rl.algorithms.contextual_td7 import (
+from oht_routing.algorithms.rl.contextual_td7 import (
     ContextualLearnerConfig,
     ContextualStepReplayBuffer,
     ContextualTD7Learner,
 )
-from cocel_rl.algorithms.contextual_td7.sale import (
+from oht_routing.algorithms.rl.contextual_td7.sale import (
     SALEOnline,
     avg_l1_norm,
 )

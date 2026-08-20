@@ -10,7 +10,7 @@ PYTHON_CODE_DIR = PROJECT_ROOT / "PythonCode"
 if str(PYTHON_CODE_DIR) not in sys.path:
     sys.path.insert(0, str(PYTHON_CODE_DIR))
 
-from contextual_wandb import (
+from oht_routing.telemetry.wandb import (
     EXP_META,
     REMOVED_WANDB_PREFIXES,
     WANDB_METRIC_KEYS,

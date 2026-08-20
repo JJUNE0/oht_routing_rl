@@ -2,9 +2,9 @@ import unittest
 
 import numpy as np
 
-from contextual_observation import ContextualObservationBatch
-from contextual_reward import ContextualRewardBuilder, ContextualRewardConfig
-from contextual_transition import (
+from oht_routing.mdp.observation import ContextualObservationBatch
+from oht_routing.mdp.reward.builder import ContextualRewardBuilder, ContextualRewardConfig
+from oht_routing.mdp.transition import (
     ContextualTransitionAligner,
     ContextualTransitionError,
 )

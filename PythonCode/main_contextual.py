@@ -2,21 +2,21 @@
 
 import sys
 
-from ClientAlgorithm_contextual import ClientAlgorithm
-from contextual_cli import parse_args
+from oht_routing.runtime.client import ClientAlgorithm
+from oht_routing.runtime.cli import parse_args
 # Public imports retained for protocol tests and existing launcher integrations.
-from contextual_protocol_runtime import (
+from oht_routing.runtime.protocol import (
     SmokeReporter,
     handle_command,
     read_port,
     send_active_data,
 )
-from contextual_runtime_bootstrap import (
+from oht_routing.runtime.bootstrap import (
     runtime_config_from_args,
     seed_everything,
 )
-from contextual_runtime_summary import print_runtime_summary
-from contextual_server import serve_contextual
+from oht_routing.runtime.summary import print_runtime_summary
+from oht_routing.runtime.server import serve_contextual
 
 
 def _configure_console_encoding():

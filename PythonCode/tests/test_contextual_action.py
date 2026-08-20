@@ -2,7 +2,7 @@ import unittest
 
 import numpy as np
 
-from contextual_action import (
+from oht_routing.mdp.action import (
     EXP_RESIDUAL,
     REGION_B_RL,
     ContextualActionError,

@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from cocel_rl.algorithms.contextual_td7 import (
+from oht_routing.algorithms.rl.contextual_td7 import (
     ContextualLearnerConfig,
     ContextualNetworkConfig,
     ContextualStepReplayBuffer,

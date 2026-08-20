@@ -5,7 +5,7 @@ import unittest
 
 import torch
 
-from cocel_rl.algorithms.contextual_td7 import (
+from oht_routing.algorithms.rl.contextual_td7 import (
     ContextualActor,
     ContextualNetworkConfig,
     ContextualNetworkError,

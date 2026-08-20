@@ -2,7 +2,7 @@ import unittest
 
 import torch
 
-from cocel_rl.algorithms.contextual_td7.targets import (
+from oht_routing.algorithms.rl.contextual_td7.targets import (
     bellman_target,
     scale_policy_action,
     target_applied_action,

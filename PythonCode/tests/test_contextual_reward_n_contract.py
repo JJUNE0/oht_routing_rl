@@ -2,13 +2,13 @@ import unittest
 
 import numpy as np
 
-from contextual_action import REGION_B_RL
-from contextual_reward import ContextualRewardBuilder, ContextualRewardConfig
-from contextual_reward_version_cfg import (
+from oht_routing.mdp.action import REGION_B_RL
+from oht_routing.mdp.reward.builder import ContextualRewardBuilder, ContextualRewardConfig
+from oht_routing.mdp.reward.config import (
     RAIL_REWARD_FREE_FLOW_NEUTRAL_2,
     reward_contract,
 )
-from contextual_termination import (
+from oht_routing.mdp.termination import (
     TAT_TERMINATION_REWARD_PROFILE,
     tat_termination_profile,
 )

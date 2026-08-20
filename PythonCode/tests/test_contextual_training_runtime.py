@@ -7,19 +7,19 @@ from unittest.mock import patch
 import numpy as np
 import torch
 
-from ClientAlgorithm_contextual import ClientAlgorithm, ContextualRuntimeConfig
-from ClientAlgorithm_contextual import ContextualTrainingFailure
-from contextual_action import EXP_RESIDUAL, REGION_B_RL
-from cocel_rl.algorithms.contextual_td7 import (
+from oht_routing.runtime.client import ClientAlgorithm, ContextualRuntimeConfig
+from oht_routing.runtime.client import ContextualTrainingFailure
+from oht_routing.mdp.action import EXP_RESIDUAL, REGION_B_RL
+from oht_routing.algorithms.rl.contextual_td7 import (
     ALGORITHM_VERSION,
     ContextualLearnerConfig,
     ContextualNetworkConfig,
     ContextualTD7Learner,
 )
-from cocel_rl.algorithms.contextual_td7.learner_types import (
+from oht_routing.algorithms.rl.contextual_td7.learner_types import (
     ContextualLearnerUpdate,
 )
-from contextual_observation import (
+from oht_routing.mdp.observation import (
     OBSERVATION_VERSION,
     ContextualObservationBatch,
     RunningFeatureNormalizer,
@@ -30,7 +30,7 @@ from test_contextual_observation import (
     make_topology,
 )
 from test_contextual_runtime import make_runtime_pclient
-from contextual_wandb import (
+from oht_routing.telemetry.wandb import (
     WANDB_METRIC_KEYS,
     ContextualWandbLogger,
     runtime_exp_meta,

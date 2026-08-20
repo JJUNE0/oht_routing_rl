@@ -12,7 +12,7 @@ from datetime import datetime
 from pathlib import Path
 
 import PClient
-from contextual_topology import TopologyAuditError, build_contextual_topology
+from oht_routing.mdp.topology import TopologyAuditError, build_contextual_topology
 
 
 DEFAULT_HOST = "127.0.0.1"

@@ -65,24 +65,21 @@ TAT 종료 조건은 10,000 environment-step grace 이후
 `-20` terminal penalty를 한 번 broadcast합니다.
 
 계약의 단일 소스는
-`contextual_reward_version_cfg.py`의 `REWARD_N_CONTRACT`와
+`oht_routing/mdp/reward/config.py`의 `REWARD_N_CONTRACT`와
 `REWARD_N_PROFILE`입니다.
 
 ## 코드 구조
 
 ```text
-main_contextual.py                 얇은 실행 진입점
-contextual_cli.py                  CLI 정의
-contextual_runtime_bootstrap.py    resume 설정 복원과 seed 설정
-contextual_runtime_config.py       runtime 설정 계약과 검증
-contextual_protocol_runtime.py     simulator command 처리
-contextual_server.py               TCP 연결/재연결 수명주기
-contextual_runtime_summary.py      시작 시 설정 요약
-ClientAlgorithm_contextual.py      학습 runtime orchestration
-contextual_runtime_diagnostics.py  reward 진단과 W&B tick
-contextual_reward.py               Reward N global/local 조합
-contextual_rail_reward.py          OHT cycle 및 rail reward 추적
-cocel_rl/algorithms/contextual_td7 TD7, SALE, LAP, replay, checkpoint
+main_contextual.py
+└─ 얇은 실행 진입점
+oht_routing/
+├─ algorithms/rl/contextual_td7/   TD7, SALE, LAP, replay, checkpoint
+├─ mdp/                            action, observation, transition, termination
+│  └─ reward/                      Reward N 설정, 조합, rail-cycle 추적
+├─ routing/dispatch.py             simulator dispatch 선택
+├─ runtime/                        client, CLI, bootstrap, protocol, TCP server
+└─ telemetry/                      W&B와 reward 진단
 tests/                             contextual 회귀 테스트
 ```
 
@@ -131,7 +128,7 @@ PyTorch가 memory-efficient attention backward의 비결정적 CUDA 경로를
 
 ## W&B와 실험 기록
 
-모든 새 실험 전에 `contextual_wandb.py`의 `EXP_META`를 먼저
+모든 새 실험 전에 `oht_routing/telemetry/wandb.py`의 `EXP_META`를 먼저
 갱신합니다. run 이름은 `_make_run_name`이 만들며 직접 짓지 않습니다.
 `wandb.init`은 runtime config와 `EXP_META`를 함께 기록하고
 `EXP_META["description"]`을 notes로 전달합니다.

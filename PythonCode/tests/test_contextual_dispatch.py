@@ -3,11 +3,11 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from ClientAlgorithm_contextual import (
+from oht_routing.runtime.client import (
     ClientAlgorithm,
     ContextualRuntimeConfig,
 )
-from contextual_dispatch import (
+from oht_routing.routing.dispatch import (
     DISPATCH_COST,
     DISPATCH_FIRST_MATCH,
 )

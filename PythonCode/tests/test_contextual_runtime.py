@@ -9,18 +9,18 @@ from unittest.mock import patch
 import numpy as np
 import torch
 
-from cocel_rl.algorithms.contextual_td7 import (
+from oht_routing.algorithms.rl.contextual_td7 import (
     ContextualActor,
     ContextualNetworkConfig,
     SALEOnline,
 )
-from ClientAlgorithm_contextual import (
+from oht_routing.runtime.client import (
     ClientAlgorithm,
     ContextualRuntimeConfig,
 )
-from contextual_dispatch import DISPATCH_COST
-from contextual_action import EXP_RESIDUAL
-from contextual_observation import ContextualObservationBatch
+from oht_routing.routing.dispatch import DISPATCH_COST
+from oht_routing.mdp.action import EXP_RESIDUAL
+from oht_routing.mdp.observation import ContextualObservationBatch
 from test_contextual_observation import (
     CONTROLLED_COUNT,
     PHYSICAL_COUNT,

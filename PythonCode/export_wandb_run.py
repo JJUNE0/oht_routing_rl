@@ -4,7 +4,7 @@ The downloader can import ``EXPORT_COLUMNS`` to request a stable column order,
 and tests keep this schema synchronized with the runtime logger.
 """
 
-from contextual_wandb import EXP_META, WANDB_METRIC_KEYS
+from oht_routing.telemetry.wandb import EXP_META, WANDB_METRIC_KEYS
 
 REWARD_N_EXPORT_COLUMNS = {
     "reward/global/tat_component_raw",

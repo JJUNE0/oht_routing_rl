@@ -5,7 +5,7 @@ from pathlib import Path
 
 import numpy as np
 
-from contextual_observation import (
+from oht_routing.mdp.observation import (
     GLOBAL_DIM,
     LOCAL_FEATURE_NAMES,
     LOCAL_DIM,
@@ -15,7 +15,7 @@ from contextual_observation import (
     ObservationContractError,
     ObservationNormalizerConfig,
 )
-from contextual_topology import ContextualTopology
+from oht_routing.mdp.topology import ContextualTopology
 
 
 BOUNDARY_IDS = (3250, 3251, 3252)

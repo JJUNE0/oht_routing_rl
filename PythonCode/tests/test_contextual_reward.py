@@ -5,8 +5,8 @@ from unittest.mock import patch
 
 import numpy as np
 
-from contextual_action import EXP_RESIDUAL, REGION_B_RL
-from contextual_reward import (
+from oht_routing.mdp.action import EXP_RESIDUAL, REGION_B_RL
+from oht_routing.mdp.reward.builder import (
     ContextualRewardBuilder,
     ContextualRewardConfig,
     ContextualRewardError,

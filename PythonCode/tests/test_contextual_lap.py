@@ -2,7 +2,7 @@ import unittest
 
 import numpy as np
 
-from cocel_rl.algorithms.contextual_td7.replay_buffer import (
+from oht_routing.algorithms.rl.contextual_td7.replay_buffer import (
     ContextualReplayError,
     ContextualStepReplayBuffer,
     ReplaySampleKey,
