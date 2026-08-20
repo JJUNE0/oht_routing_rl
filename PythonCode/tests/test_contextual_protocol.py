@@ -7,7 +7,7 @@ from unittest.mock import Mock, patch
 
 import PClient
 from Oht import OHTState
-from main_contextual import SmokeReporter, handle_command
+from main import SmokeReporter, handle_command
 
 
 class DummySocket:

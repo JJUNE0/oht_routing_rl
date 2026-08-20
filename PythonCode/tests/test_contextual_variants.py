@@ -18,7 +18,7 @@ from oht_routing.algorithms.rl.contextual_td7 import (
     REPLAY_SAMPLING_SNAPSHOT,
     contextual_algorithm_variant,
 )
-from main_contextual import parse_args
+from main import parse_args
 from test_contextual_learner import SMALL_NETWORK
 from test_contextual_sale import sale_replay
 
@@ -34,7 +34,7 @@ EXPECTED = {
 class ContextualVariantTests(unittest.TestCase):
     def parse(self, *arguments):
         with patch.object(
-            sys, "argv", ["main_contextual.py", *arguments]
+            sys, "argv", ["main.py", *arguments]
         ):
             return parse_args()
 

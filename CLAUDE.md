@@ -34,6 +34,6 @@ run_{MMDD_HHMM}_{cost_structure}_{action_range}_{reward_version}_{note}
 ## 실행
 
 ```bash
-python PythonCode/main_contextual.py
-python PythonCode/main_contextual.py --mode training --action-enabled --reward-version N
+python PythonCode/main.py
+python PythonCode/main.py --mode training --action-enabled --reward-version N
 ```

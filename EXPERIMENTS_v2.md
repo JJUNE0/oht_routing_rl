@@ -136,3 +136,15 @@ Reward N run/checkpoint와 맞지 않는 오래된 기록이다. v2 기준값은
 - 새 패키지 compile/import와 topology/W&B/evaluation 도구의 CLI를
   확인했고, `test_contextual*.py` 249개가 통과했다.
 - plot 도구가 사용하는 `matplotlib`을 `requirements.txt`에 명시했다.
+
+## 2026-08-20 - 실행 진입점을 `main.py`로 단일화
+
+- 호환 wrapper였던 기존 `PythonCode/main.py`를 제거하고
+  `main_contextual.py`의 실제 contextual runtime 진입점을
+  `PythonCode/main.py`로 옮겼다.
+- `main_contextual.py`는 삭제했으며 공식 실행 명령과 테스트 import를
+  `main.py`로 갱신했다.
+- runtime, Reward N, checkpoint 및 W&B 계약은 변경하지 않았고
+  simulator와 W&B run은 시작하지 않았다.
+- 새 `main.py` compile/help와 `main_contextual.py` 제거를 확인했고,
+  `test_contextual*.py` 249개가 통과했다.

@@ -13,10 +13,10 @@ E~U 구현과 실험 기록은 `contextual-region-brl-v1` 브랜치와 루트의
 conda activate aicc
 
 # baseline
-python .\PythonCode\main_contextual.py
+python .\PythonCode\main.py
 
 # Reward N 학습
-python .\PythonCode\main_contextual.py `
+python .\PythonCode\main.py `
   --mode training `
   --action-enabled `
   --reward-version N `
@@ -31,8 +31,8 @@ python .\PythonCode\main_contextual.py `
 `N`만 허용합니다. simulator GUI에서 Python 연동을 활성화한 뒤 Run을
 시작해야 TCP 세션이 연결됩니다.
 
-공식 진입점은 `main_contextual.py` 하나입니다. `main.py`는 기존 실행기를
-위한 얇은 wrapper이며, 삭제된 region-token 경로인 `--region`은 거부합니다.
+공식 진입점은 `main.py` 하나입니다. 삭제된 region-token 경로는 더 이상
+별도 wrapper나 진입점을 제공하지 않습니다.
 
 ## Reward N 계약
 
@@ -71,7 +71,7 @@ TAT 종료 조건은 10,000 environment-step grace 이후
 ## 코드 구조
 
 ```text
-main_contextual.py
+main.py
 └─ 얇은 실행 진입점
 oht_routing/
 ├─ algorithms/rl/contextual_td7/   TD7, SALE, LAP, replay, checkpoint
@@ -101,7 +101,7 @@ python .\PythonCode\oht_routing\utils\evaluate_simulation.py --help
 관측 통계만 수집하는 run에서는 다음처럼 frozen snapshot을 저장합니다.
 
 ```powershell
-python .\PythonCode\main_contextual.py `
+python .\PythonCode\main.py `
   --mode training `
   --action-enabled `
   --save-state-normalizer .\PythonCode\normalizers\contextual_state_n_seed0.npz
@@ -121,7 +121,7 @@ checkpoint는 명시적인 호환 경로로 읽으며, reward identity나 topolo
 observation, network 계약이 다르면 fail-fast합니다.
 
 ```powershell
-python .\PythonCode\main_contextual.py `
+python .\PythonCode\main.py `
   --mode training `
   --action-enabled `
   --resume-checkpoint .\PythonCode\checkpoints\ctx_td7_reward_version_n\step_220000.pt `

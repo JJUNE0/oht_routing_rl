@@ -1,23 +1,56 @@
-"""Compatibility entry point for the contextual TD7 v2 runtime."""
-
-from __future__ import annotations
+"""Entry point for contextual baseline, inference, and training."""
 
 import sys
 
-from main_contextual import main as run_contextual
+from oht_routing.runtime.client import ClientAlgorithm
+from oht_routing.runtime.cli import parse_args
+# Public imports retained for protocol tests and existing launcher integrations.
+from oht_routing.runtime.protocol import (
+    SmokeReporter,
+    handle_command,
+    read_port,
+    send_active_data,
+)
+from oht_routing.runtime.bootstrap import (
+    runtime_config_from_args,
+    seed_everything,
+)
+from oht_routing.runtime.summary import print_runtime_summary
+from oht_routing.runtime.server import serve_contextual
 
 
-REMOVED_FLAGS = {"--region"}
+def _configure_console_encoding():
+    try:
+        sys.stdout.reconfigure(
+            encoding="utf-8", errors="replace", line_buffering=True
+        )
+        sys.stderr.reconfigure(
+            encoding="utf-8", errors="replace", line_buffering=True
+        )
+    except (AttributeError, ValueError):
+        pass
 
 
 def main():
-    removed = sorted(REMOVED_FLAGS.intersection(sys.argv[1:]))
-    if removed:
-        raise SystemExit(
-            f"{', '.join(removed)} was removed with the legacy token-TD7 "
-            "runtime; use main_contextual.py and its contextual options."
+    _configure_console_encoding()
+    args = parse_args()
+    if args.sim_end_time <= 0:
+        raise ValueError("--sim-end-time must be positive")
+    if args.console_log_interval <= 0:
+        raise ValueError("--console-log-interval must be positive")
+
+    config = runtime_config_from_args(args)
+    seed_everything(config.seed)
+    client = ClientAlgorithm(config)
+    reporter = (
+        SmokeReporter(
+            args.smoke_report, args.mode, args.smoke_report_interval
         )
-    run_contextual()
+        if args.smoke_report is not None
+        else None
+    )
+    print_runtime_summary(args, client)
+    serve_contextual(args, client, reporter)
 
 
 if __name__ == "__main__":
