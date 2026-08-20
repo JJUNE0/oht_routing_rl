@@ -41,19 +41,57 @@ class ContextualNetworkTests(unittest.TestCase):
 
     def test_actor_and_twin_critic_shapes_ranges_and_finite_gradients(self):
         state = torch.randn(11, 128, requires_grad=True)
-        actor_output = self.actor(state)
+        previous_action = torch.randn(11, 1).tanh().requires_grad_(True)
+        actor_output = self.actor(
+            state, previous_action=previous_action
+        )
         self.assertEqual(actor_output.action.shape, (11, 1))
         self.assertEqual(actor_output.pre_tanh.shape, (11, 1))
         self.assertTrue((actor_output.action >= -1.0).all())
         self.assertTrue((actor_output.action <= 1.0).all())
         action = actor_output.action.detach().requires_grad_(True)
-        critic_output = self.critic(state, action)
+        critic_output = self.critic(
+            state, action, previous_action=previous_action
+        )
         self.assertEqual(critic_output.q1.shape, (11, 1))
         self.assertEqual(critic_output.q2.shape, (11, 1))
         (critic_output.q1 + critic_output.q2).mean().backward()
         self.assertIsNotNone(action.grad)
         self.assertTrue(torch.isfinite(action.grad).all())
         self.assertGreater(float(action.grad.abs().sum()), 0.0)
+        self.assertIsNotNone(previous_action.grad)
+        self.assertGreater(float(previous_action.grad.abs().sum()), 0.0)
+
+    def test_previous_action_changes_both_actor_and_critic_outputs(self):
+        state = torch.randn(7, self.config.stacked_context_dim)
+        current_action = torch.full(
+            (7, self.config.stacked_action_dim), 0.25
+        )
+        low = torch.full_like(current_action, -0.75)
+        high = torch.full_like(current_action, 0.75)
+
+        actor_low = self.actor(state, previous_action=low).action
+        actor_high = self.actor(state, previous_action=high).action
+        critic_low = self.critic(
+            state, current_action, previous_action=low
+        )
+        critic_high = self.critic(
+            state, current_action, previous_action=high
+        )
+
+        self.assertGreater(
+            float((actor_low - actor_high).detach().abs().sum()), 0.0
+        )
+        self.assertGreater(
+            float((critic_low.q1 - critic_high.q1).detach().abs().sum()), 0.0
+        )
+        self.assertEqual(
+            self.actor.network[0].in_features, self.config.actor_input_dim
+        )
+        self.assertEqual(
+            self.critic.q1.network[0].in_features,
+            self.config.critic_input_dim,
+        )
 
     def test_actor_loss_reaches_every_observation_group(self):
         inputs = make_inputs(5, requires_grad=True)

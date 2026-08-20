@@ -15,20 +15,14 @@ from ClientAlgorithm_contextual import ClientAlgorithm, ContextualRuntimeConfig
 
 
 EXP_META = {
-    "algorithm_version": "contextual_td7_uniform_no_sale_v3",
-    "action_mode": "region_b_rl",
-    "action_version": "contextual_region_b_rl_v1",
     "cost_structure": "b_rl",
     "action_range": "0.0-1.0",
-    "reward_version": "D",
-    "reward_contract_version": (
-        "contextual_controlled_reward_v4_balanced_global_local"
-    ),
+    "reward_version": "E",
     "centering": False,
-    "note": "runtime_fake1500",
+    "note": "epburnin",
     "description": (
-        "Phase 7 fake 1500-tick synchronous training runtime smoke; "
-        "no simulator and W&B disabled."
+        "Fake 1,500-tick runtime smoke with a three-step deterministic "
+        "episode burn-in; no simulator and W&B disabled."
     ),
 }
 
@@ -41,6 +35,7 @@ def run():
         exploration_noise_std=0.10,
         exploration_noise_clip=0.20,
         warmup_steps=100,
+        episode_burnin_steps=3,
         normalizer_freeze_steps=100,
         replay_capacity_env_steps=1_000,
         batch_size=1_024,
@@ -64,6 +59,7 @@ def run():
     pclient = make_runtime_pclient()
     runtime._ensure_initialized(pclient)
     runtime.learner = FakeLearner()
+    runtime.checkpoint_loaded = True
 
     # Actor/network correctness is covered separately; avoid 1,500 large CPU
     # attention forwards in this runtime state-machine smoke.
@@ -89,6 +85,21 @@ def run():
         before = runtime.learner.learner_update_count
         result = runtime.Algorithm(pclient)
         after = runtime.learner.learner_update_count
+        if tick < 3:
+            assert runtime.last_diagnostics["burnin/active"] == 1.0
+            assert runtime.last_diagnostics["burnin/action_source"] == 1.0
+            assert runtime.last_diagnostics["action/exploration_noise_std"] == 0.0
+            assert runtime.replay_buffer.push_count == 0
+            assert after == before == 0
+            np.testing.assert_array_equal(
+                runtime.last_controlled_action, zero_policy
+            )
+        elif tick == 3:
+            assert runtime.last_diagnostics["burnin/active"] == 0.0
+            assert runtime.replay_buffer.push_count == 0
+            assert runtime.transition_aligner.pending is not None
+        elif tick == 4:
+            assert runtime.replay_buffer.push_count == 1
         if after > before and update_start_tick is None:
             update_start_tick = tick
         updates_by_tick.append(after - before)

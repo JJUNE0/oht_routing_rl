@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, Mapping
 
@@ -55,6 +56,23 @@ ACTIVE_OHT_CYCLE_STATES = frozenset({
 
 class ContextualRewardError(RuntimeError):
     """Raised when reward inputs violate the controlled-center contract."""
+
+
+REWARD_NORMALIZER_SNAPSHOT_VERSION = (
+    "contextual_reward_normalizer_snapshot_v2_profile_fingerprint"
+)
+
+
+def reward_normalizer_profile_fingerprint(
+    config: "ContextualRewardConfig",
+) -> str:
+    payload = json.dumps(
+        asdict(config),
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -3169,52 +3187,163 @@ class ContextualRewardBuilder:
             raise ContextualRewardError("reward diagnostics contain NaN or Inf")
         return result
 
-    def save_normalizers(self, path: str | Path) -> Path:
+    @property
+    def normalizer_profile_fingerprint(self) -> str:
+        return reward_normalizer_profile_fingerprint(self.config)
+
+    def default_normalizer_snapshot_path(
+        self, *, seed: int, root: str | Path = "normalizers"
+    ) -> Path:
+        topology = str(self.topology.topology_hash)[:8]
+        mapping = str(self.topology.mapping_hash)[:8]
+        profile = self.normalizer_profile_fingerprint[:12]
+        return Path(root) / (
+            f"contextual_reward_{self.reward_version.lower()}_{profile}_"
+            f"{topology}_{mapping}_seed{int(seed)}.npz"
+        )
+
+    def normalizers_ready_for_snapshot(self) -> bool:
+        requirements = (
+            (
+                self.config.local_normalization_enabled,
+                self.local_normalizer,
+            ),
+            (
+                self.config.global_normalization_enabled,
+                self.global_normalizer,
+            ),
+        )
+        return bool(
+            self.reward_steps >= self.config.freeze_after_env_steps
+            and all(
+                not enabled
+                or (normalizer.frozen and int(normalizer.count) > 0)
+                for enabled, normalizer in requirements
+            )
+        )
+
+    def save_normalizers(
+        self, path: str | Path, *, require_frozen: bool = False
+    ) -> Path:
+        if require_frozen and not self.normalizers_ready_for_snapshot():
+            raise ContextualRewardError(
+                "refusing to save reward normalizers before every enabled "
+                "local/global statistic is populated and frozen"
+            )
         target = Path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
-        local, global_state = (
-            self.local_normalizer.state_dict(),
-            self.global_normalizer.state_dict(),
-        )
-        np.savez_compressed(
-            target,
-            reward_version=np.asarray(self.reward_version),
-            reward_contract_version=np.asarray(self.reward_contract_version),
-            reward_tat_version=np.asarray(self.reward_tat_version),
-            reward_normalization_version=np.asarray(
-                self.reward_normalization_version
-            ),
-            topology_hash=np.asarray(self.topology.topology_hash),
-            mapping_hash=np.asarray(self.topology.mapping_hash),
-            reward_steps=np.asarray(self.reward_steps),
-            local_mean=local["mean"], local_m2=local["m2"],
-            local_count=np.asarray(local["count"]),
-            local_update_calls=np.asarray(local["update_calls"]),
-            local_frozen=np.asarray(local["frozen"]),
-            global_mean=global_state["mean"], global_m2=global_state["m2"],
-            global_count=np.asarray(global_state["count"]),
-            global_update_calls=np.asarray(global_state["update_calls"]),
-            global_frozen=np.asarray(global_state["frozen"]),
-        )
+        local = self.local_normalizer.state_dict()
+        global_state = self.global_normalizer.state_dict()
+        temporary = target.with_suffix(target.suffix + ".tmp")
+
+        def encoded_clip(value):
+            return np.asarray(np.nan if value is None else float(value))
+
+        try:
+            with temporary.open("wb") as stream:
+                np.savez_compressed(
+                    stream,
+                    snapshot_version=np.asarray(
+                        REWARD_NORMALIZER_SNAPSHOT_VERSION
+                    ),
+                    reward_profile_fingerprint=np.asarray(
+                        self.normalizer_profile_fingerprint
+                    ),
+                    reward_config_json=np.asarray(json.dumps(
+                        asdict(self.config),
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    )),
+                    reward_version=np.asarray(self.reward_version),
+                    reward_contract_version=np.asarray(
+                        self.reward_contract_version
+                    ),
+                    reward_tat_version=np.asarray(self.reward_tat_version),
+                    reward_normalization_version=np.asarray(
+                        self.reward_normalization_version
+                    ),
+                    topology_hash=np.asarray(self.topology.topology_hash),
+                    mapping_hash=np.asarray(self.topology.mapping_hash),
+                    reward_steps=np.asarray(self.reward_steps),
+                    local_enabled=np.asarray(
+                        self.config.local_normalization_enabled
+                    ),
+                    local_mean=local["mean"],
+                    local_m2=local["m2"],
+                    local_count=np.asarray(local["count"]),
+                    local_update_calls=np.asarray(local["update_calls"]),
+                    local_frozen=np.asarray(local["frozen"]),
+                    local_epsilon=np.asarray(local["epsilon"]),
+                    local_clip=encoded_clip(local["clip"]),
+                    global_enabled=np.asarray(
+                        self.config.global_normalization_enabled
+                    ),
+                    global_mean=global_state["mean"],
+                    global_m2=global_state["m2"],
+                    global_count=np.asarray(global_state["count"]),
+                    global_update_calls=np.asarray(
+                        global_state["update_calls"]
+                    ),
+                    global_frozen=np.asarray(global_state["frozen"]),
+                    global_epsilon=np.asarray(global_state["epsilon"]),
+                    global_clip=encoded_clip(global_state["clip"]),
+                )
+            temporary.replace(target)
+        finally:
+            if temporary.exists():
+                temporary.unlink()
         return target
 
-    def load_normalizers(self, path: str | Path) -> None:
+    def load_normalizers(
+        self, path: str | Path, *, require_frozen: bool = False
+    ) -> None:
+        required = {
+            "snapshot_version", "reward_profile_fingerprint",
+            "reward_config_json", "reward_version",
+            "reward_contract_version", "reward_tat_version",
+            "reward_normalization_version", "topology_hash", "mapping_hash",
+            "reward_steps", "local_enabled", "global_enabled",
+        }
+        for prefix in ("local", "global"):
+            required.update({
+                f"{prefix}_mean", f"{prefix}_m2", f"{prefix}_count",
+                f"{prefix}_update_calls", f"{prefix}_frozen",
+                f"{prefix}_epsilon", f"{prefix}_clip",
+            })
         with np.load(path, allow_pickle=False) as saved:
-            saved_reward_version = (
-                str(saved["reward_version"].item())
-                if "reward_version" in saved.files else None
+            missing = sorted(required.difference(saved.files))
+            if missing:
+                version_fields = {
+                    "reward_version",
+                    "reward_contract_version",
+                    "reward_tat_version",
+                    "reward_normalization_version",
+                }
+                missing_versions = sorted(version_fields.intersection(missing))
+                if missing_versions:
+                    raise ContextualRewardError(
+                        "reward normalizer version mismatch: missing="
+                        + ",".join(missing_versions)
+                    )
+                raise ContextualRewardError(
+                    "reward normalizer snapshot is incomplete: missing="
+                    + ",".join(missing)
+                )
+            snapshot_version = str(saved["snapshot_version"].item())
+            if snapshot_version != REWARD_NORMALIZER_SNAPSHOT_VERSION:
+                raise ContextualRewardError(
+                    "reward normalizer snapshot version mismatch: "
+                    f"saved={snapshot_version!r}, "
+                    f"runtime={REWARD_NORMALIZER_SNAPSHOT_VERSION!r}"
+                )
+            saved_reward_version = str(saved["reward_version"].item())
+            saved_reward_contract = str(
+                saved["reward_contract_version"].item()
             )
-            saved_reward_contract = (
-                str(saved["reward_contract_version"].item())
-                if "reward_contract_version" in saved.files else None
-            )
-            saved_reward_tat = (
-                str(saved["reward_tat_version"].item())
-                if "reward_tat_version" in saved.files else None
-            )
-            saved_reward_normalization = (
-                str(saved["reward_normalization_version"].item())
-                if "reward_normalization_version" in saved.files else None
+            saved_reward_tat = str(saved["reward_tat_version"].item())
+            saved_reward_normalization = str(
+                saved["reward_normalization_version"].item()
             )
             if (
                 saved_reward_version != self.reward_version
@@ -3232,24 +3361,84 @@ class ContextualRewardBuilder:
                     f"runtime={self.reward_version!r}/"
                     f"{self.reward_contract_version!r}/"
                     f"{self.reward_tat_version!r}/"
-                    f"{self.reward_normalization_version!r}. A fresh normalizer is "
-                    "required because statistics from another reward contract "
-                    "are incompatible."
+                    f"{self.reward_normalization_version!r}. A fresh "
+                    "normalizer is required because statistics from another "
+                    "reward contract are incompatible."
+                )
+            saved_fingerprint = str(
+                saved["reward_profile_fingerprint"].item()
+            )
+            saved_config_json = str(saved["reward_config_json"].item())
+            encoded_saved_fingerprint = hashlib.sha256(
+                saved_config_json.encode("utf-8")
+            ).hexdigest()
+            if encoded_saved_fingerprint != saved_fingerprint:
+                raise ContextualRewardError(
+                    "reward normalizer snapshot profile fingerprint is corrupt"
+                )
+            if saved_fingerprint != self.normalizer_profile_fingerprint:
+                raise ContextualRewardError(
+                    "reward normalizer profile fingerprint mismatch; reward "
+                    "terms or coefficients changed and fresh statistics are "
+                    "required"
                 )
             if str(saved["topology_hash"].item()) != self.topology.topology_hash:
-                raise ContextualRewardError("reward normalizer topology hash mismatch")
+                raise ContextualRewardError(
+                    "reward normalizer topology hash mismatch"
+                )
             if str(saved["mapping_hash"].item()) != self.topology.mapping_hash:
-                raise ContextualRewardError("reward normalizer mapping hash mismatch")
-            for prefix, normalizer in (
-                ("local", self.local_normalizer),
-                ("global", self.global_normalizer),
-            ):
-                normalizer.load_state_dict({
+                raise ContextualRewardError(
+                    "reward normalizer mapping hash mismatch"
+                )
+            enabled = {
+                "local": self.config.local_normalization_enabled,
+                "global": self.config.global_normalization_enabled,
+            }
+            candidates = {}
+            for prefix, expected_enabled in enabled.items():
+                if bool(saved[f"{prefix}_enabled"].item()) != expected_enabled:
+                    raise ContextualRewardError(
+                        f"reward {prefix} normalizer enablement mismatch"
+                    )
+                saved_clip = float(saved[f"{prefix}_clip"].item())
+                saved_clip = None if np.isnan(saved_clip) else saved_clip
+                candidate = RunningFeatureNormalizer(
+                    1,
+                    epsilon=float(saved[f"{prefix}_epsilon"].item()),
+                    clip=saved_clip,
+                )
+                candidate.load_state_dict({
                     "dim": 1,
+                    "epsilon": float(saved[f"{prefix}_epsilon"].item()),
+                    "clip": saved_clip,
                     "mean": saved[f"{prefix}_mean"],
                     "m2": saved[f"{prefix}_m2"],
                     "count": int(saved[f"{prefix}_count"].item()),
-                    "update_calls": int(saved[f"{prefix}_update_calls"].item()),
+                    "update_calls": int(
+                        saved[f"{prefix}_update_calls"].item()
+                    ),
                     "frozen": bool(saved[f"{prefix}_frozen"].item()),
                 })
-            self.reward_steps = int(saved["reward_steps"].item())
+                if require_frozen and expected_enabled and (
+                    not candidate.frozen or int(candidate.count) <= 0
+                ):
+                    raise ContextualRewardError(
+                        f"reward {prefix} normalizer must be populated and frozen"
+                    )
+                candidates[prefix] = candidate
+            reward_steps = int(saved["reward_steps"].item())
+            if reward_steps < 0 or (
+                require_frozen
+                and any(enabled.values())
+                and reward_steps < self.config.freeze_after_env_steps
+            ):
+                raise ContextualRewardError(
+                    "reward normalizer snapshot has invalid reward_steps"
+                )
+        self.local_normalizer.load_state_dict(
+            candidates["local"].state_dict()
+        )
+        self.global_normalizer.load_state_dict(
+            candidates["global"].state_dict()
+        )
+        self.reward_steps = reward_steps

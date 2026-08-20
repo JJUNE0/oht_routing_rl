@@ -10,28 +10,41 @@ from cocel_rl.algorithms.contextual_td7 import (
     CRITIC_INITIALIZATION,
     LAP_VERSION,
     REPLAY_SAMPLING_VERSION,
+    RESUME_DETERMINISTIC_EPISODE_VERSION,
+    RESUME_REPLAY_REFILL_VERSION,
     SALE_VERSION,
     STACK_VERSION,
     contextual_algorithm_variant,
 )
 from contextual_action import (
+    ACTION_SCALE_SCHEDULE_VERSION,
     EXPLORATION_SCHEDULE_VERSION,
     REGION_B_RL,
     action_version,
 )
 from contextual_dispatch import DISPATCH_SELECTION_VERSION
-from contextual_observation import OBSERVATION_VERSION
-from contextual_reward import ContextualRewardConfig
-from contextual_reward_version_cfg import (
-    REWARD_CONTRACT_VERSION,
-    REWARD_NORMALIZATION_VERSION,
-    REWARD_TAT_VERSION,
-    REWARD_VERSION,
+from contextual_observation import (
+    OBSERVATION_NORMALIZER_SNAPSHOT_VERSION,
+    OBSERVATION_VERSION,
 )
+from contextual_reward import (
+    REWARD_NORMALIZER_SNAPSHOT_VERSION,
+    ContextualRewardConfig,
+)
+from contextual_reward_version_cfg import (
+    reward_contract,
+)
+from contextual_termination import (
+    TAT_TERMINATION_POLICY_VERSION,
+    WARMUP_EPISODE_TRANSITION_VERSION,
+)
+
+_EXP_REWARD_VERSION = "N"
+_EXP_REWARD_CONTRACT = reward_contract(_EXP_REWARD_VERSION)
 
 EXP_META = {
     "cost_structure": "b_rl",
-    "action_range": "b_rl_0.0-1.0",
+    "action_range": "b_rl_0.0-1.0_resume_curriculum_0.05-1",
     "topology": "directed_10in_10out_controlled_centers_v2",
     "observation": "contextual_obs_previous_applied_action_v3",
     "observation_version": OBSERVATION_VERSION,
@@ -42,23 +55,23 @@ EXP_META = {
     "stack_version": STACK_VERSION,
     "num_stacks": 1,
     "stack_interval": 1,
-    "reward_version": REWARD_VERSION,
-    "reward_contract_version": REWARD_CONTRACT_VERSION,
-    "reward_tat_version": REWARD_TAT_VERSION,
-    "reward_normalization_version": REWARD_NORMALIZATION_VERSION,
-    "tat_signal": "actual_new_completion_cmd_tat_event",
-    "marginal_tat_enabled": False,
+    "reward_version": _EXP_REWARD_VERSION,
+    "reward_contract_version": _EXP_REWARD_CONTRACT.contract_version,
+    "reward_tat_version": _EXP_REWARD_CONTRACT.tat_version,
+    "reward_normalization_version": _EXP_REWARD_CONTRACT.normalization_version,
+    "tat_signal": _EXP_REWARD_CONTRACT.tat_signal_description,
+    "marginal_tat_enabled": True,
     "tat_one_sided": False,
-    "calibration_status": "reward_t_completion_tat_ablation",
+    "calibration_status": "reward_n_checkpoint_resume_deterministic_episode",
     "reward_global_alpha": 0.5,
     "reward_local_alpha": 0.5,
     "tat_reference": 165.0,
-    "tat_weight": 2.3,
+    "tat_weight": 11.0,
     "tat_raw_clip": None,
     "op_reference": 0.80,
-    "op_weight": 0.0,
+    "op_weight": 5.0,
     "use_op": False,
-    "backlog_weight": 0.0025,
+    "backlog_weight": 0.01,
     "backlog_growth_enabled": False,
     "backlog_growth_horizon": 300,
     "backlog_growth_scale": 30.0,
@@ -71,22 +84,40 @@ EXP_META = {
     "local_stop_weight": 0.3,
     "local_idle_weight": 0.1,
     "local_capacity_weight": 0.1,
-    "local_fixed_scale_enabled": False,
-    "local_reward_scale": 1.0,
-    "reward_normalizer_freeze_steps": 30_000,
+    "local_fixed_scale_enabled": True,
+    "local_reward_scale": 2.0,
+    "reward_normalizer_freeze_steps": 10_000,
+    "reward_normalizer_snapshot_version": REWARD_NORMALIZER_SNAPSHOT_VERSION,
+    "reward_normalizer_snapshot_policy": (
+        "auto_versioned_atomic_local_global_save"
+    ),
     "global_normalization_enabled": False,
-    "local_normalization_enabled": True,
-    "rail_reward_mode": "fixed_tat_reference",
+    "local_normalization_enabled": False,
+    "rail_reward_mode": "free_flow_neutral_2",
     "rail_free_flow_neutral_ratio": 2.0,
-    "rail_tat_weight": 1.0,
-    "rail_tat_clip": None,
+    "rail_tat_weight": 30.0,
+    "rail_tat_clip": 1.0,
     "tat_confidence_ramp": False,
     "action_scale": 0.05,
+    "action_scale_schedule_version": ACTION_SCALE_SCHEDULE_VERSION,
+    "curriculum_scale_start": 0.05,
+    "curriculum_scale_end": 1.0,
+    "curriculum_shape": "geometric",
+    "warmup_steps": 10_000,
+    "state_normalizer_snapshot_version": (
+        OBSERVATION_NORMALIZER_SNAPSHOT_VERSION
+    ),
+    "state_normalizer_reuse": (
+        "exact_contract_load_sets_effective_warmup_to_zero"
+    ),
     "exploration_noise_std": 0.10,
     "exploration_noise_final_std": 0.02,
     "exploration_noise_anneal_steps": 100_000,
     "exploration_schedule_version": EXPLORATION_SCHEDULE_VERSION,
-    "resume_refill_version": "global_step_v2",
+    "resume_refill_version": RESUME_REPLAY_REFILL_VERSION,
+    "resume_deterministic_episode_version": (
+        RESUME_DETERMINISTIC_EPISODE_VERSION
+    ),
     "checkpoint_rng_version": "exploration_rng_v2",
     "checkpoint_directory_version": "contextual_checkpoint_dir_slug_v1",
     "episode_burnin_version": "deterministic_policy_burnin_v1",
@@ -97,7 +128,7 @@ EXP_META = {
         "contextual_reward_diagnostic_v23_reward_profiles_e_u"
     ),
     "wandb_metric_schema_version": (
-        "contextual_wandb_compact_v8_reward_profiles_e_u"
+        "contextual_wandb_compact_v9_warmup_episode_boundary"
     ),
     "reward_budget_version": (
         "tat_backlog_final_abs_contribution_v2_reward_profile"
@@ -119,17 +150,30 @@ EXP_META = {
     ),
     "centering": False,
     "replay_sampling_version": REPLAY_SAMPLING_VERSION,
+    "replay_capacity_env_steps": 100_000,
+    "batch_size": 2_048,
+    "seed": 0,
     "tat_early_termination": True,
+    "tat_termination_policy": "reward_profile",
+    "tat_termination_policy_version": TAT_TERMINATION_POLICY_VERSION,
+    "warmup_episode_transition_version": WARMUP_EPISODE_TRANSITION_VERSION,
+    "tat_termination_configured_start_episode": 1,
+    "tat_termination_start_episode": 1,
     "tat_termination_grace_steps": 10_000,
     "early_stop_tat_threshold": 200.0,
     "tat_above_threshold_patience": 300,
     "terminal_tat_penalty": -20.0,
-    "note": "rewardprofiles",
+    "note": "resumeNdetep1b2048",
     "description": (
-        "Runtime reward selection uses a locked historical E-U profile. The selected "
-        "version controls the complete reward formula and reward-normalizer "
-        "contract; Reward U remains the default. Actor/critic previous-action "
-        "inputs and all non-reward training contracts are unchanged."
+        "Resume the cross-machine Reward N step-220000 checkpoint with its "
+        "actor, critics, optimizers, RNG, and state/reward normalizers. Use "
+        "batch 2048 and a fresh replay. Run the first resumed episode with "
+        "the deterministic actor, zero action noise, and no learner updates; "
+        "retain that episode in replay. From the next episode, restore the "
+        "saved final exploration noise and resume learning as soon as the "
+        "ordinary 100-environment-step replay gate is satisfied. Preserve the "
+        "saved Reward N formula, curriculum history, seed, and reward-profile "
+        "TAT termination settings."
     ),
 }
 
@@ -150,6 +194,7 @@ WANDB_METRIC_KEYS = (
     "burnin/active", "burnin/remaining_steps",
     "burnin/has_trained_policy", "burnin/action_source",
     "termination/done", "termination/by_queue", "termination/by_tat",
+    "termination/by_warmup", "warmup/episode_boundary_sent",
     "protocol/stale_sim_time_ticks",
     "action/policy_mean", "action/policy_std", "action/policy_min",
     "action/policy_max", "action/policy_saturation_ratio",
@@ -469,6 +514,8 @@ WANDB_METRIC_KEYS = (
     "oht/idle_count",
     "termination/done",
     "termination/by_tat",
+    "termination/by_warmup",
+    "warmup/episode_boundary_sent",
     "env/termination_reason",
     # Actor / applied control.
     "action/policy_mean",
@@ -622,7 +669,10 @@ def runtime_exp_meta(config) -> dict:
     meta["reward_tat_version"] = contract.tat_version
     meta["reward_normalization_version"] = contract.normalization_version
     meta["tat_signal"] = contract.tat_signal_description
-    meta["calibration_status"] = f"locked_reward_{contract.version.lower()}"
+    meta["calibration_status"] = (
+        f"{EXP_META['calibration_status']}_"
+        f"locked_reward_{contract.version.lower()}"
+    )
     sale = bool(config.sale_enabled)
     lap = bool(config.lap_enabled)
     action_mode = str(config.action_mode)
@@ -640,7 +690,11 @@ def runtime_exp_meta(config) -> dict:
     meta["note"] = (
         f"{meta['note']}_r{contract.version}_s{int(config.num_stacks)}i"
         f"{int(config.stack_interval)}_dispatch_"
-        f"{str(config.dispatch_mode).replace('-', '_')}"
+        f"{str(config.dispatch_mode).replace('-', '_')}_normreuse"
+        f"{int(config.state_normalizer_warmup_bypass)}_rewardnormreuse"
+        f"{int(config.reward_normalizer_reuse)}_b{int(config.batch_size)}_"
+        f"fullrefill{int(config.resume_inference_until_replay_full)}_"
+        f"detfirst{int(config.resume_deterministic_first_episode)}"
     )
     meta["sale"] = sale
     meta["lap"] = lap
@@ -652,11 +706,42 @@ def runtime_exp_meta(config) -> dict:
     meta["num_stacks"] = int(config.num_stacks)
     meta["stack_interval"] = int(config.stack_interval)
     meta["critic_loss_mode"] = config.critic_loss_mode
-    meta["action_scale"] = float(config.action_scale)
+    meta["residual_action_scale"] = float(config.action_scale)
+    meta["action_scale"] = float(
+        config.curriculum_scale_start
+        if action_mode == REGION_B_RL else config.action_scale
+    )
+    meta["effective_action_scale_start"] = float(
+        config.curriculum_scale_start
+        if action_mode == REGION_B_RL else config.action_scale
+    )
+    meta["effective_action_scale_end"] = float(
+        config.curriculum_scale_end
+        if action_mode == REGION_B_RL else config.action_scale
+    )
+    meta["action_scale_schedule_version"] = ACTION_SCALE_SCHEDULE_VERSION
     meta["reward_global_alpha"] = float(reward_config.global_alpha)
     meta["reward_local_alpha"] = float(reward_config.local_alpha)
     meta["reward_normalizer_freeze_steps"] = int(
         reward_config.freeze_after_env_steps
+    )
+    meta["reward_normalizer_snapshot_version"] = (
+        REWARD_NORMALIZER_SNAPSHOT_VERSION
+    )
+    meta["reward_normalizer_load_requested"] = bool(
+        config.load_reward_normalizer_path
+    )
+    meta["reward_normalizer_reuse"] = bool(
+        config.reward_normalizer_reuse
+    )
+    meta["reward_normalizer_save_requested"] = bool(
+        config.save_reward_normalizer_path
+    )
+    meta["load_reward_normalizer_path"] = (
+        config.load_reward_normalizer_path
+    )
+    meta["save_reward_normalizer_path"] = (
+        config.save_reward_normalizer_path
     )
     meta["global_normalization_enabled"] = bool(
         reward_config.global_normalization_enabled
@@ -727,6 +812,16 @@ def runtime_exp_meta(config) -> dict:
     meta["idle_reserve_scale"] = float(reward_config.idle_reserve_scale)
     meta["idle_reserve_weight"] = float(reward_config.idle_reserve_weight)
     meta["tat_early_termination"] = bool(config.tat_termination_enabled)
+    meta["tat_termination_policy_version"] = (
+        TAT_TERMINATION_POLICY_VERSION
+    )
+    meta["tat_termination_policy"] = str(config.tat_termination_policy)
+    meta["tat_termination_configured_start_episode"] = int(
+        config.tat_termination_start_episode
+    )
+    meta["tat_termination_start_episode"] = int(
+        config.effective_tat_termination_start_episode
+    )
     meta["early_stop_tat_threshold"] = float(
         config.early_stop_tat_threshold
     )
@@ -741,6 +836,52 @@ def runtime_exp_meta(config) -> dict:
     )
     meta["terminal_tat_penalty"] = float(config.terminal_tat_penalty)
     meta["curriculum_end_step"] = int(config.curriculum_end_step)
+    meta["curriculum_scale_start"] = float(
+        config.curriculum_scale_start
+    )
+    meta["curriculum_scale_end"] = float(config.curriculum_scale_end)
+    meta["curriculum_shape"] = str(config.curriculum_shape)
+    meta["curriculum_enabled"] = bool(
+        config.curriculum_scale_start != config.curriculum_scale_end
+    )
+    meta["configured_warmup_steps"] = int(config.warmup_steps)
+    meta["warmup_steps"] = int(config.effective_warmup_steps)
+    meta["effective_warmup_steps"] = int(config.effective_warmup_steps)
+    meta["warmup_episode_transition_version"] = (
+        WARMUP_EPISODE_TRANSITION_VERSION
+    )
+    meta["terminate_on_warmup_complete"] = bool(
+        config.terminate_on_warmup_complete
+    )
+    meta["state_normalizer_snapshot_version"] = (
+        OBSERVATION_NORMALIZER_SNAPSHOT_VERSION
+    )
+    meta["state_normalizer_load_requested"] = bool(
+        config.load_state_normalizer_path
+    )
+    meta["state_normalizer_save_requested"] = bool(
+        config.save_state_normalizer_path
+    )
+    meta["state_normalizer_warmup_bypass"] = bool(
+        config.state_normalizer_warmup_bypass
+    )
+    meta["batch_size"] = int(config.batch_size)
+    meta["resume_replay_refill_version"] = (
+        RESUME_REPLAY_REFILL_VERSION
+    )
+    meta["resume_inference_until_replay_full"] = bool(
+        config.resume_inference_until_replay_full
+    )
+    meta["resume_refill_target_env_steps"] = int(
+        config.resume_refill_target_env_steps
+    )
+    meta["resume_deterministic_episode_version"] = (
+        RESUME_DETERMINISTIC_EPISODE_VERSION
+    )
+    meta["resume_deterministic_first_episode"] = bool(
+        config.resume_deterministic_first_episode
+    )
+    meta["seed"] = int(config.seed)
     meta["replay_capacity_env_steps"] = int(
         config.replay_capacity_env_steps
     )
@@ -762,9 +903,12 @@ def runtime_exp_meta(config) -> dict:
         config.exploration_noise_anneal_steps
     )
     meta["episode_burnin_steps"] = int(config.episode_burnin_steps)
-    meta["exploration_noise_anneal_start_step"] = int(config.warmup_steps)
+    meta["exploration_noise_anneal_start_step"] = int(
+        config.effective_warmup_steps
+    )
     meta["exploration_noise_anneal_end_step"] = int(
-        config.warmup_steps + config.exploration_noise_anneal_steps
+        config.effective_warmup_steps
+        + config.exploration_noise_anneal_steps
     )
     meta["exploration_schedule_version"] = EXPLORATION_SCHEDULE_VERSION
     replay_mode = "lap" if lap else "uniform"
@@ -786,17 +930,34 @@ def runtime_exp_meta(config) -> dict:
         "reward_normalizer="
         f"global_{'running' if reward_config.global_normalization_enabled else 'off'}_"
         f"local_{'running' if reward_config.local_normalization_enabled else 'off'}, "
+        "reward_normalizer_snapshot="
+        f"{'reused' if config.reward_normalizer_reuse else 'collected'}, "
         f"tat_signal={contract.tat_signal_description}, "
         f"fixed_scale={'on' if reward_config.local_fixed_scale_enabled else 'off'}, "
         f"marginal_tat={'on' if meta['marginal_tat_enabled'] else 'off'}, "
         "completion_ema=off, "
         f"replay_capacity={int(config.replay_capacity_env_steps)}, "
-        f"curriculum_end_step={int(config.curriculum_end_step)}, "
+        "action_scale="
+        f"{float(config.curriculum_scale_start):g}->"
+        f"{float(config.curriculum_scale_end):g}, "
+        "tat_termination="
+        f"{config.tat_termination_policy} from episode "
+        f"{int(config.effective_tat_termination_start_episode)} at "
+        f"{float(config.early_stop_tat_threshold):g}, "
         f"exploration={float(config.exploration_noise_std):g}->"
         f"{meta['exploration_noise_final_std']:g} over global steps "
-        f"{int(config.warmup_steps)}.."
-        f"{int(config.warmup_steps + config.exploration_noise_anneal_steps)}, "
+        f"{int(config.effective_warmup_steps)}.."
+        f"{int(config.effective_warmup_steps + config.exploration_noise_anneal_steps)}, "
+        "state_normalizer="
+        f"{'reused' if config.state_normalizer_warmup_bypass else 'collected'}, "
+        "warmup_episode_boundary="
+        f"{bool(config.terminate_on_warmup_complete)}, "
         f"episode_burnin_steps={int(config.episode_burnin_steps)}, "
+        "resume_refill="
+        f"{'full_capacity' if config.resume_inference_until_replay_full else 'minimum'}_"
+        f"{int(config.resume_refill_target_env_steps)}, "
+        "resume_deterministic_first_episode="
+        f"{bool(config.resume_deterministic_first_episode)}, "
         "control-space smoothing, "
         "single-field simulator end-time handshake, and fail-closed SimTime "
         "progress validation."
@@ -814,7 +975,11 @@ class ContextualWandbLogger:
         import wandb
 
         meta = runtime_exp_meta(config)
-        assert meta["action_scale"] == float(config.action_scale)
+        expected_action_scale = (
+            config.curriculum_scale_start
+            if config.action_mode == REGION_B_RL else config.action_scale
+        )
+        assert meta["action_scale"] == float(expected_action_scale)
         assert meta["exploration_noise_std"] == float(
             config.exploration_noise_std
         )

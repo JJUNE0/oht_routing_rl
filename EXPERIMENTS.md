@@ -1247,3 +1247,192 @@ architectural stabilization change is selected.
 - This is a code-organization-only change: reward formulas, reward identities,
   W&B metric/schema keys, checkpoints, and replay compatibility are unchanged.
   No simulator or W&B run was launched.
+
+## 2026-08-19 - Reward E fixed action-scale ablation
+
+- Active launch profile is Reward `E` with the existing actor and critic
+  previous-applied-action inputs unchanged. The Reward E formula, reward
+  normalizers, and terminal reward penalty are unchanged, so
+  `reward_version=E` remains valid.
+- Removed the effective action curriculum by setting
+  `curriculum_scale_start=1.0` and `curriculum_scale_end=1.0`. Action mapping is
+  still `applied_action = scale * exploratory_action` and
+  `b_rl = 0.5 + 0.5 * applied_action`. Schedule version is
+  `contextual_action_scale_schedule_v2`.
+- Training launch defaults are replay capacity `100,000`, batch `1,024`,
+  warm-up `10,000`, exploration `0.10 -> 0.02`, and seed `0`. Replay is not
+  restored; `--resume-checkpoint` remains unset.
+- TAT early termination is now a separate named runtime policy rather than a
+  Reward E formula change. Policy `episode2_tat175` exempts episode 1 and,
+  from episode 2 onward, terminates on `TotalTat > 175` immediately (grace `0`,
+  patience `1`, strict comparator). Policy version is
+  `tat_termination_episode_gate_v2`; `reward_profile` remains available for
+  historical Reward E termination (`TotalTat > 500` after 101 episode steps).
+- The action-scale schedule and termination policy are included in the runtime
+  checkpoint identity and metadata, producing a fresh default checkpoint
+  directory and rejecting incompatible resumes. `EXP_META.note=fixedscale1`.
+  No simulator or W&B run was launched for this configuration change.
+
+## 2026-08-19 - Episode-2 TAT gate off-by-one fix
+
+- Fixed the `episode2_tat175` runtime policy against the live protocol's
+  initial `command=2`: `Reset()` already changes runtime `episode_id` from 0
+  to 1 before the first active tick, so the termination gate must treat
+  `episode_id=1` as episode 1 instead of adding one again.
+- Episode 1 is now unconditionally exempt from TAT termination; episode 2 and
+  later terminate on strict `TotalTat > 175`. Policy version is
+  `tat_termination_episode_gate_v3_runtime_episode_number`, which isolates the
+  corrected checkpoint directory from the invalid v2 run.
+- Reward E and all reward terms remain unchanged. No new run was launched.
+
+## 2026-08-19 - Reusable frozen state normalizer
+
+- Added standalone observation/state-normalizer collection and reuse through
+  `--save-state-normalizer` and `--load-state-normalizer`. Saving occurs once,
+  atomically, after both local and global observation normalizers are populated
+  and frozen.
+- Snapshot contract
+  `contextual_observation_normalizer_snapshot_v2_feature_contract` stores and
+  strictly validates the observation/topology versions, topology and mapping
+  hashes, local/global/relation feature names in exact order, dimensions,
+  epsilon/clip settings, Welford statistics, sample/update counts, environment
+  steps, and frozen flags. Missing, legacy, malformed, mismatched, empty, or
+  unfrozen snapshots fail before training begins.
+- A valid standalone load restores observation normalizers only and sets the
+  effective action/exploration warm-up to `0`. Actor/critic parameters, replay,
+  checkpoint state, and reward normalizers remain fresh. Minimum replay and
+  action-enabled-transition gates are unchanged. Full checkpoint resume and a
+  standalone load are mutually exclusive because checkpoint resume already
+  restores normalizers.
+- Runtime/checkpoint identities and W&B config record the snapshot contract and
+  warm-up-bypass state. `EXP_META.note=fixedscale1normreuse`; Reward E and its
+  reward formula are unchanged. No simulator or W&B run was launched.
+
+## 2026-08-19 - State-normalizer reuse starts TAT termination at episode 1
+
+- When a verified state-normalizer snapshot is reused, the effective
+  `episode2_tat175` gate now starts at episode 1 because the action warm-up is
+  also skipped. Thus `TotalTat > 175` terminates the first episode immediately
+  under the existing strict comparator, zero grace, and patience one settings.
+- A collection run without `--load-state-normalizer` retains the configured
+  episode-2 start and the complete episode-1 exemption. W&B and checkpoints now
+  record both configured and effective termination start episodes.
+- Termination-policy version is
+  `tat_termination_episode_gate_v4_state_normalizer_episode1`, producing a new
+  fresh checkpoint identity. Reward E and its terminal reward remain unchanged.
+  `EXP_META.note=fixedscale1normreuseep1`; no simulator or W&B run was launched.
+
+## 2026-08-19 - Named TAT-180 termination policy
+
+- Added `episode2_tat180` without changing or reinterpreting the existing
+  `episode2_tat175` policy. The new policy uses strict `TotalTat > 180`, zero
+  grace, and patience one, configured from episode 2.
+- As with the existing state-normalizer reuse rule, a verified loaded state
+  normalizer changes the effective start to episode 1 while retaining the
+  strict 180 threshold. Reward E and its terminal reward remain unchanged.
+- Termination policy version is
+  `tat_termination_episode_gate_v5_named_tat180`, producing a fresh checkpoint
+  identity. `EXP_META.note=fixedscale1normreuseep1tat180`; no run was launched.
+
+## 2026-08-19 - Clean episode boundary after normalizer warm-up
+
+- Added the default `--terminate-on-warmup-complete` lifecycle. After exactly
+  the configured number of warm-up transitions have been staged and their
+  terminal observation arrives, the runtime sends `SendIsEnd(1)` with
+  termination reason `4`, completes the final baseline transition, and does
+  not evaluate or apply the actor on that boundary tick.
+- The next simulator reset clears episode-local observation/action/reward
+  history while preserving frozen normalization statistics and replay. A
+  forced latest checkpoint is written at the boundary so both state and Reward
+  E global/local normalizer states are captured after the final warm-up reward.
+- A verified state-normalizer load has effective warm-up zero and therefore
+  skips this forced boundary; policy control and TAT termination can begin in
+  episode 1 as configured. Version is
+  `warmup_episode_boundary_v1_terminal_observation`, included in checkpoint and
+  W&B metadata. Reward E's formula and coefficients are unchanged; no run was
+  launched.
+
+## 2026-08-19 - Versioned standalone reward-normalizer snapshot
+
+- Added `--save-reward-normalizer [PATH]` and
+  `--load-reward-normalizer [PATH]`. Omitting `PATH` selects an automatic name
+  under `normalizers/` containing Reward version, exact profile fingerprint,
+  topology/mapping hashes, and seed. One atomic `.npz` contains both local and
+  global Welford states plus `reward_steps`.
+- Snapshot contract
+  `contextual_reward_normalizer_snapshot_v2_profile_fingerprint` validates the
+  Reward/contract/TAT/normalization versions, a SHA-256 fingerprint over every
+  `ContextualRewardConfig` term and coefficient, local/global enablement,
+  epsilon/clipping, topology/mapping hashes, populated counts, and frozen
+  state. Mismatch fails before learner initialization instead of silently
+  reusing incompatible reward scale.
+- Saving occurs once all enabled Reward E normalizers are populated and frozen;
+  at the clean warm-up episode boundary this happens after the final warm-up
+  reward and before the forced latest checkpoint. Standalone reward load does
+  not restore actor/critic/replay/checkpoint state and, by itself, does not
+  bypass state warm-up. Reward E formula and coefficients are unchanged; no
+  run was launched.
+
+## 2026-08-20 - Full-checkpoint normalizer resume compatibility
+
+- Full checkpoint resume now explicitly treats its restored observation and
+  reward normalizers as reused state: effective warm-up is zero and the
+  effective TAT termination gate starts at episode 1.
+- Checkpoints written before the standalone-normalizer, warm-up-boundary, and
+  named-TAT metadata were added may upgrade only those additive/resume-only
+  fields. Learner/network configuration, action and observation versions,
+  reward profile/contract/normalization, topology/mapping hashes, curriculum
+  values, and concrete TAT threshold/grace/patience remain strict.
+- Legacy unnamed TAT settings are interpreted as their saved reward profile;
+  this allows the existing Reward N `step_220000.pt` to resume without
+  changing its reward formula. Replay is still intentionally not restored and
+  must refill. No simulator or W&B run was launched.
+
+## 2026-08-20 - Reward N resume with full replay inference refill
+
+- `EXP_META.note=resumeNfullbufferb2048`: continue the cross-machine Reward N
+  `step_220000.pt` state with batch size 2048 while preserving its actor,
+  critics, optimizers, RNG, normalizers, reward contract, seed, and historical
+  action curriculum.
+- Added `--resume-inference-until-replay-full`. On resume, learner parameters
+  remain frozen while the restored actor plus the saved exploration schedule
+  collects a fresh replay up to the configured 100000-environment-step
+  capacity. Learner updates become eligible on the following tick.
+- Batch size is now an explicit resume-time launch override and is the only
+  learner-config field allowed to differ from the source checkpoint. All
+  architecture, optimizer-bearing model state, reward/observation contracts,
+  topology/mapping, action mode, and concrete termination settings remain
+  strict.
+- Replay remains intentionally absent from checkpoints. Interrupting the
+  full-refill phase therefore restarts replay collection from zero. Version is
+  `contextual_resume_replay_refill_v3_optional_full_capacity`; no simulator or
+  training run was launched.
+
+## 2026-08-20 - Reward N deterministic first resume episode
+
+- `EXP_META.note=resumeNdetep1b2048`: the selected continuation experiment no
+  longer waits for all 100000 replay slots. The first episode after loading the
+  Reward N `step_220000.pt` checkpoint runs the restored deterministic actor
+  with zero exploration noise and frozen learner parameters.
+- First-episode transitions remain in the fresh replay. At the next simulator
+  reset, the saved exploration schedule resumes (0.02 at global step 220000)
+  and learner updates start immediately if the ordinary 100-environment-step
+  minimum is already present. If the first episode is shorter, collection
+  continues in episode 2 until that minimum is reached.
+- Batch size remains the explicit resume override at 2048. Replay capacity
+  remains 100000, Reward N and its TAT termination contract remain unchanged,
+  and replay is still not checkpoint-persistent. Version is
+  `contextual_resume_deterministic_first_episode_v1`; no simulator or training
+  run was launched.
+
+## 2026-08-20 - Legacy Reward N TAT metadata compatibility fix
+
+- Fixed resume of `step_220000.pt`, whose complete `runtime_config` contains
+  the locked Reward N TAT settings but whose older `runtime_metadata` omitted
+  those same fields. The loader now accepts a missing metadata value only when
+  the checkpoint's saved runtime config independently equals the requested
+  enabled/grace/threshold/patience/inclusive value.
+- Concrete Reward N settings remain `enabled=True`, grace 10000, threshold
+  200, patience 300, and inclusive comparison. A changed or absent runtime
+  config value still fails closed. Reward, model, observation, topology, and
+  optimizer compatibility checks are unchanged. No training run was launched.

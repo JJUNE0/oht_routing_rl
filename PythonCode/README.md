@@ -56,7 +56,7 @@ conda activate aicc
 python .\PythonCode\main_contextual.py `
   --mode training `
   --action-enabled `
-  --reward-version U `
+  --reward-version E `
   --action-mode region_b_rl `
   --sale `
   --lap `
@@ -67,27 +67,82 @@ python .\PythonCode\main_contextual.py `
   --exploration-noise-anneal-steps 100000 `
   --exploration-noise-clip 0.20 `
   --warmup-steps 10000 `
+  --terminate-on-warmup-complete `
   --normalizer-freeze-steps 10000 `
-  --reward-diagnostic-dir .\diagnostics\reward_u `
+  --save-state-normalizer .\normalizers\contextual_state_e_seed0.npz `
+  --save-reward-normalizer `
+  --reward-diagnostic-dir .\diagnostics\reward_e_fixedscale1 `
   --curriculum-end-step 20000 `
-  --curriculum-scale-start 0.05 `
+  --curriculum-scale-start 1.0 `
   --curriculum-scale-end 1.0 `
   --curriculum-shape geometric `
   --smooth-b-rl-weight 0.05 `
   --minimum-replay-env-steps 100 `
   --minimum-action-enabled-env-steps 100 `
-  --replay-capacity-env-steps 10000 `
+  --replay-capacity-env-steps 100000 `
   --batch-size 1024 `
   --updates-per-env-step 1 `
   --learn-every-env-steps 1 `
   --sim-end-time 45000 `
+  --tat-termination-policy episode2_tat180 `
   --wandb `
-  --smoke-report .\contextual_training_noiseanneal_seed0.json `
-  --checkpoint-root .\checkpoints\contextual_noiseanneal_seed0
+  --smoke-report .\contextual_reward_e_fixedscale1_seed0.json `
+  --checkpoint-root .\checkpoints\contextual_reward_e_fixedscale1_seed0
 ```
 
-The Reward I predecessor uses the fixed-scale contextual reward directly; reward normalizers
-are inactive and there is no reward-normalizer CLI switch. Observation/state
+### Reusing only the state normalizer
+
+The collection run above atomically saves the local/global observation
+normalizer once both statistics reach `--normalizer-freeze-steps` and freeze.
+At the next terminal observation after the 10,000 warm-up transitions, the
+runtime sends `SendIsEnd(1)`, stores the final warm-up reward transition, and
+forces a latest checkpoint. The actor is not evaluated on that boundary tick;
+after the simulator reset, policy control starts in the next clean episode.
+For a later run with a fresh actor, critic, replay, and checkpoint, replace the
+state save option and the automatic reward save option with:
+
+```powershell
+--load-state-normalizer .\normalizers\contextual_state_e_seed0.npz
+--load-reward-normalizer
+```
+
+A successful load automatically changes the effective action warm-up from the
+configured `10000` to `0`; do not also pass `--warmup-steps 0`. Loading is
+also an exact bypass of the warm-up episode boundary, so it does not force an
+extra reset before first-episode policy control. Loading is
+fail-fast unless the observation version, local/global/relation feature names
+and order, dimensions, topology hash, mapping hash, epsilon, clip, and frozen
+state all match. This restores observation/state statistics only. It does not
+restore actor/critic weights, replay, checkpoints, or Reward E's separate
+reward normalizers; `--load-reward-normalizer` restores those separately.
+The replay-size and action-enabled-transition gates still
+apply before the first learner update. With the current `episode2_tat180`
+policy, a loaded state normalizer also changes the effective TAT-termination
+start to episode 1; a collection run without a loaded snapshot retains the
+episode-1 exemption and starts TAT termination from episode 2.
+
+`--save-reward-normalizer` with no path atomically saves both Reward E local
+and global normalizers in one file under `.\normalizers`. The generated name
+contains the reward version, exact reward-profile fingerprint, topology and
+mapping hashes, and seed. The console prints the resolved path. An explicit
+path is also accepted:
+
+```powershell
+--save-reward-normalizer .\normalizers\reward_e_seed0.npz
+```
+
+Use `--load-reward-normalizer` with no path to resolve the same automatic
+filename, or pass the explicit saved path. Loading rejects snapshots unless
+the snapshot format, reward/contract/TAT/normalization versions, every reward
+term and coefficient, enabled local/global normalizers, epsilon/clipping,
+topology, mapping, populated counts, and frozen state all match. State and
+reward normalizer loads are standalone from actor, critic, replay, and
+checkpoint state. For a true zero-warm-up fresh-agent run, load both state and
+reward snapshots.
+
+The Reward I predecessor uses the fixed-scale contextual reward directly, so
+its reward normalizers are inactive even though the generic snapshot CLI is
+available. Observation/state
 normalization is unchanged. `--reward-diagnostic-dir` is optional; when it is
 omitted, no Reward I JSONL records or free-flow occurrence diagnostics are
 created. The default diagnostic windows are
@@ -222,7 +277,8 @@ in `contextual_reward_version_cfg.py`. Add or revise a reward version there;
 calculation/runtime state only. Existing imports from `contextual_reward` are
 re-exported for compatibility.
 
-The runtime defaults to `U` and accepts these unique locked profiles:
+The current CLI experiment defaults to `E` and accepts these unique locked
+reward profiles:
 
 `E`, `F_RAMP`, `F_NO_RAMP`, `G`, `H`, `I`, `J`, `K`, `L`, `M`, `N`,
 `O`, `P`, `Q`, `R`, `S_REBALANCE`, `S_EHYBRID`, `T`, and `U`.
@@ -239,7 +295,12 @@ This selects a complete locked profile, not only a TAT formula. The profile
 also selects global/local coefficients, local raw terms, backlog, rail and
 smooth rewards, global/local reward-normalizer enablement, normalization
 ordering/freeze, clipping, TAT confidence, and TAT termination/terminal
-penalty. Reward E-G restore the historical marginal-TAT EMA path; I through
+penalty defaults for historical reproduction. Named runtime termination
+policies `episode2_tat175` and `episode2_tat180` override only the environment
+`done` condition; they do not change Reward E's formula. Select the current
+TAT-180 experiment with
+`--tat-termination-policy episode2_tat180`. Reward
+E-G restore the historical marginal-TAT EMA path; I through
 `S_REBALANCE` use fixed reward scale; `S_EHYBRID` restores both running reward
 normalizers; T keeps only the local normalizer; U uses newly completed
 commands' actual `CmdTat`. Replay, checkpoints, standalone reward-normalizer
@@ -312,6 +373,17 @@ checkpoints/<algorithm_variant>_<action_version>/
 - action/reward/network/config 버전이 정확히 같아야 로드됨
 - replay buffer는 checkpoint에 저장되지 않음
 - 재시작 후 로드한 policy로 replay를 다시 채운 뒤 학습 재개
+- `--batch-size`는 resume 시 안전하게 덮어쓸 수 있음
+- `--resume-inference-until-replay-full`을 주면 새 replay가
+  `--replay-capacity-env-steps`에 도달할 때까지 actor+exploration 추론과
+  transition 수집만 하고, 다음 tick부터 learner update를 재개함
+- `--resume-deterministic-first-episode`을 주면 첫 resume 에피소드는
+  action noise와 learner update 없이 deterministic actor로 끝까지 수집함.
+  해당 replay를 유지하고 다음 에피소드부터 저장된 exploration schedule과
+  learner update를 재개하며, 첫 에피소드가 100 env steps보다 짧으면 다음
+  에피소드에서 일반 minimum replay gate를 채운 뒤 학습함
+- full-refill 도중 프로세스를 재시작하면 replay는 저장되지 않으므로 다시
+  0부터 채워야 함
 - action mode 변경 시 기존 checkpoint 사용 금지
 - crash checkpoint는 진단용이며 재개 불가
 

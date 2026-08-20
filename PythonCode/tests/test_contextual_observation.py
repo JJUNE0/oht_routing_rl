@@ -7,7 +7,9 @@ import numpy as np
 
 from contextual_observation import (
     GLOBAL_DIM,
+    LOCAL_FEATURE_NAMES,
     LOCAL_DIM,
+    OBSERVATION_NORMALIZER_SNAPSHOT_VERSION,
     RELATION_DIM,
     ContextualObservationBuilder,
     ObservationContractError,
@@ -150,12 +152,40 @@ class ContextualObservationTests(unittest.TestCase):
             "incoming_relation": (4996, 10, 2),
             "outgoing_relation": (4996, 10, 2),
             "global_state": (6,),
+            "previous_applied_action": (4996, 1),
         }
         for name, shape in expected.items():
             array = getattr(batch, name)
             self.assertEqual(array.shape, shape)
             self.assertTrue(np.isfinite(array).all())
             self.assertTrue(array.flags.c_contiguous)
+
+    def test_previous_applied_action_is_bounded_separate_model_input(self):
+        builder = self.builder()
+        pclient = FakePClient(make_rails())
+        previous = np.linspace(
+            -0.5, 0.5, CONTROLLED_COUNT, dtype=np.float32
+        )[:, None]
+        batch = builder.build(
+            pclient,
+            parameter_dw=self.parameter_dw,
+            parameter_c=self.parameter_c,
+            previous_applied_action=previous,
+        )
+
+        np.testing.assert_array_equal(batch.previous_applied_action, previous)
+        self.assertEqual(builder.local_normalizer.dim, LOCAL_DIM)
+        with self.assertRaisesRegex(
+            ObservationContractError, "previous_applied_action"
+        ):
+            builder.build(
+                pclient,
+                parameter_dw=self.parameter_dw,
+                parameter_c=self.parameter_c,
+                previous_applied_action=np.full(
+                    (CONTROLLED_COUNT, 1), 1.5, np.float32
+                ),
+            )
 
     def test_boundary_is_not_center_but_can_be_neighbor(self):
         _, _, batch = self.build()
@@ -279,6 +309,77 @@ class ContextualObservationTests(unittest.TestCase):
             np.testing.assert_array_equal(
                 getattr(first_result, name), getattr(second_result, name)
             )
+
+    def test_frozen_normalizer_snapshot_supports_strict_warmup_bypass(self):
+        first = self.builder(
+            normalizer_config=ObservationNormalizerConfig(
+                freeze_after_env_steps=1
+            )
+        )
+        self.build(builder=first)
+        path = Path(self.directory.name) / "frozen_normalizers.npz"
+        first.save_normalizers(path, require_frozen=True)
+
+        with np.load(path, allow_pickle=False) as saved:
+            self.assertEqual(
+                str(saved["snapshot_version"].item()),
+                OBSERVATION_NORMALIZER_SNAPSHOT_VERSION,
+            )
+            self.assertEqual(
+                tuple(str(value) for value in saved["local_feature_names"]),
+                LOCAL_FEATURE_NAMES,
+            )
+
+        second = self.builder()
+        second.load_normalizers(path, require_frozen=True)
+        self.assertTrue(second.local_normalizer.frozen)
+        self.assertTrue(second.global_normalizer.frozen)
+        self.assertGreater(second.local_normalizer.count, 0)
+        self.assertGreater(second.global_normalizer.count, 0)
+        np.testing.assert_array_equal(
+            second.local_normalizer.mean,
+            first.local_normalizer.mean,
+        )
+        np.testing.assert_array_equal(
+            second.global_normalizer.mean,
+            first.global_normalizer.mean,
+        )
+
+    def test_warmup_bypass_rejects_unfrozen_normalizer_snapshot(self):
+        first = self.builder()
+        self.build(builder=first)
+        path = Path(self.directory.name) / "unfrozen_normalizers.npz"
+        first.save_normalizers(path)
+
+        with self.assertRaisesRegex(
+            ObservationContractError, "populated, frozen"
+        ):
+            self.builder().load_normalizers(path, require_frozen=True)
+        with self.assertRaisesRegex(
+            ObservationContractError, "before both"
+        ):
+            first.save_normalizers(path, require_frozen=True)
+
+    def test_state_normalizer_feature_order_mismatch_fails_fast(self):
+        first = self.builder(
+            normalizer_config=ObservationNormalizerConfig(
+                freeze_after_env_steps=1
+            )
+        )
+        self.build(builder=first)
+        path = Path(self.directory.name) / "reordered_normalizers.npz"
+        first.save_normalizers(path, require_frozen=True)
+        with np.load(path, allow_pickle=False) as saved:
+            payload = {key: saved[key].copy() for key in saved.files}
+        payload["local_feature_names"] = np.asarray(
+            tuple(reversed(LOCAL_FEATURE_NAMES))
+        )
+        np.savez_compressed(path, **payload)
+
+        with self.assertRaisesRegex(
+            ObservationContractError, "feature_names order mismatch"
+        ):
+            self.builder().load_normalizers(path, require_frozen=True)
 
     def _write_identity_cache(self, *, topology_hash=None, mapping_hash=None):
         path = Path(self.directory.name) / "mismatch.npz"

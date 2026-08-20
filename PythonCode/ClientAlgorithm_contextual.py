@@ -29,6 +29,8 @@ from cocel_rl.algorithms.contextual_td7 import (
     REPLAY_SAMPLING_RAIL,
     REPLAY_SAMPLING_SNAPSHOT,
     REPLAY_SAMPLING_VERSION,
+    RESUME_DETERMINISTIC_EPISODE_VERSION,
+    RESUME_REPLAY_REFILL_VERSION,
     STACK_VERSION,
     contextual_algorithm_variant,
     encode_observation_stack,
@@ -38,6 +40,7 @@ from cocel_rl.algorithms.contextual_td7 import (
     save_contextual_checkpoint,
 )
 from contextual_action import (
+    ACTION_SCALE_SCHEDULE_VERSION,
     ACTION_MODES,
     EXP_RESIDUAL,
     EXPLORATION_SCHEDULE_VERSION,
@@ -53,10 +56,21 @@ from contextual_dispatch import (
 )
 from contextual_observation import (
     ContextualObservationBuilder,
+    OBSERVATION_NORMALIZER_SNAPSHOT_VERSION,
     ObservationNormalizerConfig,
 )
 from contextual_topology import load_cached_contextual_topology
-from contextual_reward import ContextualRewardBuilder, ContextualRewardConfig
+from contextual_termination import (
+    TAT_TERMINATION_POLICY_VERSION,
+    TAT_TERMINATION_REWARD_PROFILE,
+    WARMUP_EPISODE_TRANSITION_VERSION,
+    tat_termination_profile,
+)
+from contextual_reward import (
+    REWARD_NORMALIZER_SNAPSHOT_VERSION,
+    ContextualRewardBuilder,
+    ContextualRewardConfig,
+)
 from contextual_reward_version_cfg import (
     RAIL_REWARD_MODES,
     REWARD_VERSION,
@@ -82,6 +96,7 @@ class ContextualTrainingFailure(RuntimeError):
 
 
 CHECKPOINT_DIRECTORY_VERSION = "contextual_checkpoint_dir_slug_v1"
+AUTO_REWARD_NORMALIZER_PATH = "auto"
 
 
 @dataclass(frozen=True)
@@ -100,8 +115,15 @@ class ContextualRuntimeConfig:
     smooth_b_rl_weight: float | None = None
     smooth_exp_residual_weight: float | None = None
     warmup_steps: int = 10_000
+    terminate_on_warmup_complete: bool = True
     episode_burnin_steps: int = 0
     normalizer_freeze_steps: int = 10_000
+    load_state_normalizer_path: str | None = None
+    save_state_normalizer_path: str | None = None
+    state_normalizer_warmup_bypass: bool = False
+    load_reward_normalizer_path: str | None = None
+    save_reward_normalizer_path: str | None = None
+    reward_normalizer_reuse: bool = False
     reward_normalizer_freeze_steps: int | None = None
     global_normalization_enabled: bool | None = None
     local_normalization_enabled: bool | None = None
@@ -158,6 +180,8 @@ class ContextualRuntimeConfig:
     periodic_checkpoint_interval: int = 5_000
     checkpoint_root: str | None = None
     resume_checkpoint_path: str | None = None
+    resume_inference_until_replay_full: bool = False
+    resume_deterministic_first_episode: bool = False
     rail_tat_diagnostic_path: str | None = None
     rail_tat_diagnostic_max_step: int = 1_000
     wandb_enabled: bool = False
@@ -166,6 +190,8 @@ class ContextualRuntimeConfig:
     lap_enabled: bool = True
     critic_loss_mode: str = "auto"
     early_stop_queued_threshold: float = 500.0
+    tat_termination_policy: str = TAT_TERMINATION_REWARD_PROFILE
+    tat_termination_start_episode: int | None = None
     tat_termination_enabled: bool | None = None
     tat_termination_grace_steps: int | None = None
     early_stop_tat_threshold: float | None = None
@@ -175,6 +201,31 @@ class ContextualRuntimeConfig:
     max_stale_sim_time_ticks: int = 5
     dispatch_mode: str = DISPATCH_FIRST_MATCH
     minimum_sign_sample_count: int = 100
+
+    @property
+    def effective_warmup_steps(self) -> int:
+        return (
+            0
+            if self.state_normalizer_warmup_bypass
+            or self.load_state_normalizer_path is not None
+            else int(self.warmup_steps)
+        )
+
+    @property
+    def resume_refill_target_env_steps(self) -> int:
+        return int(
+            self.replay_capacity_env_steps
+            if self.resume_inference_until_replay_full
+            else self.minimum_replay_env_steps
+        )
+
+    @property
+    def effective_tat_termination_start_episode(self) -> int:
+        return (
+            1
+            if self.state_normalizer_warmup_bypass
+            else int(self.tat_termination_start_episode)
+        )
 
     @staticmethod
     def _runtime_to_reward_fields():
@@ -239,20 +290,41 @@ class ContextualRuntimeConfig:
             elif actual != expected:
                 incompatible.append((runtime_name, actual, expected))
         contract = reward_contract(canonical_version)
-        termination_profile = {
-            "tat_termination_enabled": contract.tat_termination_enabled,
-            "tat_termination_grace_steps": contract.tat_termination_grace_steps,
-            "early_stop_tat_threshold": contract.tat_termination_threshold,
-            "tat_above_threshold_patience": contract.tat_termination_patience,
-            "tat_termination_inclusive": contract.tat_termination_inclusive,
-            "terminal_tat_penalty": contract.terminal_tat_penalty,
-        }
+        termination_profile = tat_termination_profile(
+            self.tat_termination_policy, contract
+        )
+        termination_incompatible = []
         for name, expected in termination_profile.items():
             actual = getattr(self, name)
             if actual is None:
                 object.__setattr__(self, name, expected)
             elif actual != expected:
-                incompatible.append((name, actual, expected))
+                target = (
+                    incompatible
+                    if self.tat_termination_policy
+                    == TAT_TERMINATION_REWARD_PROFILE
+                    else termination_incompatible
+                )
+                target.append((name, actual, expected))
+        if self.terminal_tat_penalty is None:
+            object.__setattr__(
+                self, "terminal_tat_penalty", contract.terminal_tat_penalty
+            )
+        elif self.terminal_tat_penalty != contract.terminal_tat_penalty:
+            incompatible.append((
+                "terminal_tat_penalty",
+                self.terminal_tat_penalty,
+                contract.terminal_tat_penalty,
+            ))
+        if termination_incompatible:
+            details = ", ".join(
+                f"{name}={actual!r} (expected {expected!r})"
+                for name, actual, expected in termination_incompatible
+            )
+            raise ValueError(
+                f"TAT termination policy {self.tat_termination_policy} is "
+                f"locked; incompatible overrides: {details}"
+            )
         if incompatible:
             details = ", ".join(
                 f"{name}={actual!r} (expected {expected!r})"
@@ -311,10 +383,84 @@ class ContextualRuntimeConfig:
             or self.reward_normalizer_freeze_steps < 0
         ):
             raise ValueError("warmup/burn-in/freeze steps must be non-negative")
+        for name in (
+            "load_state_normalizer_path",
+            "save_state_normalizer_path",
+            "load_reward_normalizer_path",
+            "save_reward_normalizer_path",
+        ):
+            value = getattr(self, name)
+            if value is not None and (
+                not isinstance(value, str) or not value.strip()
+            ):
+                raise ValueError(f"{name} must be a non-empty path string")
+        if not isinstance(self.state_normalizer_warmup_bypass, bool):
+            raise ValueError("state_normalizer_warmup_bypass must be bool")
+        if not isinstance(self.terminate_on_warmup_complete, bool):
+            raise ValueError("terminate_on_warmup_complete must be bool")
+        if not isinstance(self.reward_normalizer_reuse, bool):
+            raise ValueError("reward_normalizer_reuse must be bool")
+        if not isinstance(self.resume_inference_until_replay_full, bool):
+            raise ValueError(
+                "resume_inference_until_replay_full must be bool"
+            )
+        if not isinstance(self.resume_deterministic_first_episode, bool):
+            raise ValueError(
+                "resume_deterministic_first_episode must be bool"
+            )
+        if self.load_state_normalizer_path is not None:
+            object.__setattr__(
+                self, "state_normalizer_warmup_bypass", True
+            )
+        if self.load_reward_normalizer_path is not None:
+            object.__setattr__(self, "reward_normalizer_reuse", True)
+        if self.resume_checkpoint_path is not None and (
+            self.load_state_normalizer_path is not None
+            or self.load_reward_normalizer_path is not None
+        ):
+            raise ValueError(
+                "standalone normalizer loads and --resume-checkpoint are "
+                "mutually exclusive; checkpoint resume already restores "
+                "state and reward normalizers"
+            )
+        if (
+            self.state_normalizer_warmup_bypass
+            and self.load_state_normalizer_path is None
+            and self.resume_checkpoint_path is None
+        ):
+            raise ValueError(
+                "state_normalizer_warmup_bypass requires a standalone "
+                "normalizer load or checkpoint resume"
+            )
+        if (
+            self.reward_normalizer_reuse
+            and self.load_reward_normalizer_path is None
+            and self.resume_checkpoint_path is None
+        ):
+            raise ValueError(
+                "reward_normalizer_reuse requires a standalone normalizer "
+                "load or checkpoint resume"
+            )
+        if (
+            self.resume_inference_until_replay_full
+            and self.resume_checkpoint_path is None
+        ):
+            raise ValueError(
+                "resume_inference_until_replay_full requires checkpoint "
+                "resume"
+            )
+        if (
+            self.resume_deterministic_first_episode
+            and self.resume_checkpoint_path is None
+        ):
+            raise ValueError(
+                "resume_deterministic_first_episode requires checkpoint "
+                "resume"
+            )
         if self.mode == "training" and self.action_scale <= 0:
             raise ValueError("training mode requires positive action_scale")
         if (
-            self.curriculum_end_step <= self.warmup_steps
+            self.curriculum_end_step <= self.effective_warmup_steps
             or not 0 < self.curriculum_scale_start <= 1
             or not 0 < self.curriculum_scale_end <= 1
             or self.curriculum_scale_start > self.curriculum_scale_end
@@ -421,6 +567,9 @@ class ContextualRuntimeConfig:
             isinstance(self.tat_termination_grace_steps, bool)
             or not isinstance(self.tat_termination_grace_steps, Integral)
             or self.tat_termination_grace_steps < 0
+            or isinstance(self.tat_termination_start_episode, bool)
+            or not isinstance(self.tat_termination_start_episode, Integral)
+            or self.tat_termination_start_episode <= 0
             or isinstance(self.tat_above_threshold_patience, bool)
             or not isinstance(self.tat_above_threshold_patience, Integral)
             or self.tat_above_threshold_patience <= 0
@@ -534,6 +683,13 @@ class ClientAlgorithm:
         self.replay_buffer = None
         self.learner = None
         self.action_enabled_env_steps = 0
+        self.state_normalizer_loaded = False
+        self.state_normalizer_saved = False
+        self.reward_normalizer_loaded = False
+        self.reward_normalizer_saved = False
+        self.resolved_load_reward_normalizer_path = None
+        self.resolved_save_reward_normalizer_path = None
+        self.warmup_episode_boundary_sent = False
         self.exploration_rng = np.random.default_rng(self.config.seed)
         self.wandb_logger = ContextualWandbLogger(self.config)
         self.training_failed = False
@@ -547,6 +703,7 @@ class ClientAlgorithm:
         self._last_replay_summary: dict[str, float] = {}
         self._last_replay_push_ms = 0.0
         self._resume_requires_refill = False
+        self._resume_deterministic_episode_active = False
         self._last_sim_time: float | None = None
         self._stale_sim_time_ticks = 0
         self._burnin_last_applied_action = None
@@ -590,7 +747,26 @@ class ClientAlgorithm:
             f"{self.action_version}_{PARAMETER_DW_STATE_VERSION}_"
             f"reward_{self.config.reward_version}_"
             f"{STACK_VERSION}_s{self.config.num_stacks}_"
-            f"i{self.config.stack_interval}"
+            f"i{self.config.stack_interval}_"
+            f"{ACTION_SCALE_SCHEDULE_VERSION}_"
+            f"curr{self.config.curriculum_scale_start:g}-"
+            f"{self.config.curriculum_scale_end:g}-"
+            f"{self.config.curriculum_end_step}-"
+            f"{self.config.curriculum_shape}_"
+            f"{WARMUP_EPISODE_TRANSITION_VERSION}_"
+            f"warmterm{int(self.config.terminate_on_warmup_complete)}_"
+            f"{REWARD_NORMALIZER_SNAPSHOT_VERSION}_"
+            f"rewardnormreuse{int(self.config.reward_normalizer_reuse)}_"
+            f"{TAT_TERMINATION_POLICY_VERSION}_"
+            f"{self.config.tat_termination_policy}_"
+            f"ep{self.config.effective_tat_termination_start_episode}_"
+            f"tat{self.config.early_stop_tat_threshold:g}_"
+            f"{OBSERVATION_NORMALIZER_SNAPSHOT_VERSION}_"
+            f"normreuse{int(self.config.state_normalizer_warmup_bypass)}_"
+            f"{RESUME_REPLAY_REFILL_VERSION}_fullrefill"
+            f"{int(self.config.resume_inference_until_replay_full)}_"
+            f"{RESUME_DETERMINISTIC_EPISODE_VERSION}_detfirst"
+            f"{int(self.config.resume_deterministic_first_episode)}"
         )
         if self.config.replay_sampling_mode == REPLAY_SAMPLING_RAIL:
             return base
@@ -618,8 +794,93 @@ class ClientAlgorithm:
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
 
+    def _maybe_load_state_normalizer(self) -> None:
+        source = self.config.load_state_normalizer_path
+        if source is None or self.state_normalizer_loaded:
+            return
+        if self.observation_builder is None:
+            raise ContextualTrainingFailure(
+                "state normalizer load requested before observation builder "
+                "initialization"
+            )
+        self.observation_builder.load_normalizers(
+            source, require_frozen=True
+        )
+        self.state_normalizer_loaded = True
+        print(
+            "[state-normalizer] loaded compatible frozen snapshot: "
+            f"path={source}, effective_warmup_steps="
+            f"{self.config.effective_warmup_steps}",
+            flush=True,
+        )
+
+    def _maybe_save_state_normalizer(self) -> None:
+        target = self.config.save_state_normalizer_path
+        if target is None or self.state_normalizer_saved:
+            return
+        if not self._state_normalizers_ready_for_bypass():
+            return
+        saved = self.observation_builder.save_normalizers(
+            target, require_frozen=True
+        )
+        self.state_normalizer_saved = True
+        print(
+            "[state-normalizer] saved populated frozen snapshot: "
+            f"path={saved}, env_steps={self.observation_builder.env_steps}",
+            flush=True,
+        )
+
+    def _resolve_reward_normalizer_path(self, configured: str) -> Path:
+        if configured == AUTO_REWARD_NORMALIZER_PATH:
+            return self.reward_builder.default_normalizer_snapshot_path(
+                seed=self.config.seed
+            )
+        return Path(configured)
+
+    def _maybe_load_reward_normalizer(self) -> None:
+        source = self.config.load_reward_normalizer_path
+        if source is None or self.reward_normalizer_loaded:
+            return
+        if self.reward_builder is None:
+            raise ContextualTrainingFailure(
+                "reward normalizer load requested before reward builder "
+                "initialization"
+            )
+        resolved = self._resolve_reward_normalizer_path(source)
+        self.reward_builder.load_normalizers(resolved, require_frozen=True)
+        self.reward_normalizer_loaded = True
+        self.resolved_load_reward_normalizer_path = str(resolved)
+        print(
+            "[reward-normalizer] loaded compatible frozen local/global "
+            f"snapshot: path={resolved}, "
+            f"reward_steps={self.reward_builder.reward_steps}",
+            flush=True,
+        )
+
+    def _maybe_save_reward_normalizer(self) -> None:
+        target = self.config.save_reward_normalizer_path
+        if target is None or self.reward_normalizer_saved:
+            return
+        if self.reward_builder is None:
+            return
+        if not self.reward_builder.normalizers_ready_for_snapshot():
+            return
+        resolved = self._resolve_reward_normalizer_path(target)
+        saved = self.reward_builder.save_normalizers(
+            resolved, require_frozen=True
+        )
+        self.reward_normalizer_saved = True
+        self.resolved_save_reward_normalizer_path = str(saved)
+        print(
+            "[reward-normalizer] saved populated frozen local/global "
+            f"snapshot: path={saved}, "
+            f"reward_steps={self.reward_builder.reward_steps}",
+            flush=True,
+        )
+
     def _ensure_initialized(self, pclient):
         if self.topology is not None:
+            self._maybe_load_state_normalizer()
             if self.reward_builder is None:
                 self.reward_builder = ContextualRewardBuilder(
                     self.topology,
@@ -635,6 +896,7 @@ class ClientAlgorithm:
                     self.topology, self.reward_builder
                 )
                 self.transition_aligner.episode_id = self.episode_id
+            self._maybe_load_reward_normalizer()
             if self.config.mode == "training" and self.learner is None:
                 self._initialize_training()
             return
@@ -650,6 +912,7 @@ class ClientAlgorithm:
                 freeze_after_env_steps=self.config.normalizer_freeze_steps
             ),
         )
+        self._maybe_load_state_normalizer()
         self.reward_builder = ContextualRewardBuilder(
             self.topology,
             self.config.make_reward_config(),
@@ -660,6 +923,7 @@ class ClientAlgorithm:
             ),
             reward_diagnostic_writer=self.reward_diagnostic_writer,
         )
+        self._maybe_load_reward_normalizer()
         self.transition_aligner = ContextualTransitionAligner(
             self.topology, self.reward_builder
         )
@@ -741,11 +1005,79 @@ class ClientAlgorithm:
                     ),
                     "curriculum_scale_end": self.config.curriculum_scale_end,
                     "curriculum_shape": self.config.curriculum_shape,
+                    "action_scale_schedule_version": (
+                        ACTION_SCALE_SCHEDULE_VERSION
+                    ),
+                    "state_normalizer_snapshot_version": (
+                        OBSERVATION_NORMALIZER_SNAPSHOT_VERSION
+                    ),
+                    "state_normalizer_warmup_bypass": (
+                        self.config.state_normalizer_warmup_bypass
+                    ),
+                    "effective_warmup_steps": (
+                        self.config.effective_warmup_steps
+                    ),
+                    "warmup_episode_transition_version": (
+                        WARMUP_EPISODE_TRANSITION_VERSION
+                    ),
+                    "terminate_on_warmup_complete": (
+                        self.config.terminate_on_warmup_complete
+                    ),
+                    "reward_normalizer_snapshot_version": (
+                        REWARD_NORMALIZER_SNAPSHOT_VERSION
+                    ),
+                    "reward_normalizer_reuse": (
+                        self.config.reward_normalizer_reuse
+                    ),
+                    "tat_termination_policy_version": (
+                        TAT_TERMINATION_POLICY_VERSION
+                    ),
+                    "tat_termination_policy": (
+                        self.config.tat_termination_policy
+                    ),
+                    "tat_termination_configured_start_episode": (
+                        self.config.tat_termination_start_episode
+                    ),
+                    "tat_termination_start_episode": (
+                        self.config.effective_tat_termination_start_episode
+                    ),
+                    "tat_termination_enabled": (
+                        self.config.tat_termination_enabled
+                    ),
+                    "tat_termination_grace_steps": (
+                        self.config.tat_termination_grace_steps
+                    ),
+                    "early_stop_tat_threshold": (
+                        self.config.early_stop_tat_threshold
+                    ),
+                    "tat_above_threshold_patience": (
+                        self.config.tat_above_threshold_patience
+                    ),
+                    "tat_termination_inclusive": (
+                        self.config.tat_termination_inclusive
+                    ),
                     "exploration_noise_std": self.config.exploration_noise_std,
                     "episode_burnin_steps": self.config.episode_burnin_steps,
                     "num_stacks": self.config.num_stacks,
                     "stack_interval": self.config.stack_interval,
+                    "resume_replay_refill_version": (
+                        RESUME_REPLAY_REFILL_VERSION
+                    ),
+                    "resume_inference_until_replay_full": (
+                        self.config.resume_inference_until_replay_full
+                    ),
+                    "resume_refill_target_env_steps": (
+                        self.config.resume_refill_target_env_steps
+                    ),
+                    "resume_deterministic_episode_version": (
+                        RESUME_DETERMINISTIC_EPISODE_VERSION
+                    ),
+                    "resume_deterministic_first_episode": (
+                        self.config.resume_deterministic_first_episode
+                    ),
                 },
+                allow_resume_metadata_upgrade=True,
+                allowed_learner_config_overrides={"batch_size"},
                 exploration_rng=self.exploration_rng,
                 exploration_seed=self.config.seed,
             )
@@ -757,7 +1089,24 @@ class ClientAlgorithm:
             )
             self.transition_aligner.episode_id = self.episode_id
             self.checkpoint_loaded = True
+            self.warmup_episode_boundary_sent = bool(
+                runtime_metadata.get(
+                    "warmup_episode_boundary_sent",
+                    self.warmup_episode_boundary_sent,
+                )
+            )
+            if (
+                self.config.state_normalizer_warmup_bypass
+                and not self._state_normalizers_ready_for_bypass()
+            ):
+                raise ContextualTrainingFailure(
+                    "checkpoint warm-up bypass requires populated, frozen "
+                    "observation state normalizers"
+                )
             self._resume_requires_refill = True
+            self._resume_deterministic_episode_active = bool(
+                self.config.resume_deterministic_first_episode
+            )
             self.action_enabled_env_steps = 0
 
     def _on_completed_transition(self, transition):
@@ -769,14 +1118,14 @@ class ClientAlgorithm:
         # `transition.env_step` is episode-local and restarts at zero after a
         # process resume. `total_steps` is restored from the checkpoint, so it
         # correctly identifies transitions produced by the resumed policy.
-        if self.total_steps > self.config.warmup_steps:
+        if self.total_steps > self.config.effective_warmup_steps:
             self.action_enabled_env_steps += 1
         if (
             self._resume_requires_refill
             and self.action_enabled_env_steps
             >= self.config.minimum_action_enabled_env_steps
             and self.replay_buffer.size_env_steps
-            >= self.config.minimum_replay_env_steps
+            >= self.config.resume_refill_target_env_steps
         ):
             self._resume_requires_refill = False
         self._last_replay_summary = {
@@ -795,6 +1144,21 @@ class ClientAlgorithm:
             and getattr(
                 self.observation_builder.global_normalizer, "frozen", False
             )
+        )
+
+    def _state_normalizers_ready_for_bypass(self):
+        return bool(
+            self._normalizers_frozen()
+            and int(
+                getattr(
+                    self.observation_builder.local_normalizer, "count", 0
+                )
+            ) > 0
+            and int(
+                getattr(
+                    self.observation_builder.global_normalizer, "count", 0
+                )
+            ) > 0
         )
 
     def _training_gate(self):
@@ -817,6 +1181,12 @@ class ClientAlgorithm:
             "gate/minimum_action_enabled": (
                 self.action_enabled_env_steps
                 >= self.config.minimum_action_enabled_env_steps
+            ),
+            "gate/resume_refill_complete": (
+                not self._resume_requires_refill
+            ),
+            "gate/resume_deterministic_episode_complete": (
+                not self._resume_deterministic_episode_active
             ),
             "gate/not_failed": not self.training_failed,
         }
@@ -852,6 +1222,30 @@ class ClientAlgorithm:
             "curriculum_scale_start": self.config.curriculum_scale_start,
             "curriculum_scale_end": self.config.curriculum_scale_end,
             "curriculum_shape": self.config.curriculum_shape,
+            "action_scale_schedule_version": ACTION_SCALE_SCHEDULE_VERSION,
+            "tat_termination_policy_version": (
+                TAT_TERMINATION_POLICY_VERSION
+            ),
+            "tat_termination_policy": self.config.tat_termination_policy,
+            "tat_termination_configured_start_episode": (
+                self.config.tat_termination_start_episode
+            ),
+            "tat_termination_start_episode": (
+                self.config.effective_tat_termination_start_episode
+            ),
+            "tat_termination_enabled": self.config.tat_termination_enabled,
+            "tat_termination_grace_steps": (
+                self.config.tat_termination_grace_steps
+            ),
+            "early_stop_tat_threshold": (
+                self.config.early_stop_tat_threshold
+            ),
+            "tat_above_threshold_patience": (
+                self.config.tat_above_threshold_patience
+            ),
+            "tat_termination_inclusive": (
+                self.config.tat_termination_inclusive
+            ),
             "episode_burnin_steps": self.config.episode_burnin_steps,
             "exploration_noise_std": self.config.exploration_noise_std,
             "exploration_noise_final_std": (
@@ -860,10 +1254,49 @@ class ClientAlgorithm:
             "exploration_noise_anneal_steps": (
                 self.config.exploration_noise_anneal_steps
             ),
-            "exploration_noise_anneal_start_step": self.config.warmup_steps,
+            "exploration_noise_anneal_start_step": (
+                self.config.effective_warmup_steps
+            ),
             "exploration_noise_anneal_end_step": (
-                self.config.warmup_steps
+                self.config.effective_warmup_steps
                 + self.config.exploration_noise_anneal_steps
+            ),
+            "configured_warmup_steps": self.config.warmup_steps,
+            "effective_warmup_steps": self.config.effective_warmup_steps,
+            "warmup_episode_transition_version": (
+                WARMUP_EPISODE_TRANSITION_VERSION
+            ),
+            "terminate_on_warmup_complete": (
+                self.config.terminate_on_warmup_complete
+            ),
+            "warmup_episode_boundary_sent": (
+                self.warmup_episode_boundary_sent
+            ),
+            "state_normalizer_snapshot_version": (
+                OBSERVATION_NORMALIZER_SNAPSHOT_VERSION
+            ),
+            "state_normalizer_warmup_bypass": (
+                self.config.state_normalizer_warmup_bypass
+            ),
+            "state_normalizer_loaded": self.state_normalizer_loaded,
+            "state_normalizer_saved": self.state_normalizer_saved,
+            "reward_normalizer_snapshot_version": (
+                REWARD_NORMALIZER_SNAPSHOT_VERSION
+            ),
+            "reward_normalizer_load_requested": bool(
+                self.config.load_reward_normalizer_path
+            ),
+            "reward_normalizer_reuse": self.config.reward_normalizer_reuse,
+            "reward_normalizer_save_requested": bool(
+                self.config.save_reward_normalizer_path
+            ),
+            "reward_normalizer_loaded": self.reward_normalizer_loaded,
+            "reward_normalizer_saved": self.reward_normalizer_saved,
+            "load_reward_normalizer_path": (
+                self.resolved_load_reward_normalizer_path
+            ),
+            "save_reward_normalizer_path": (
+                self.resolved_save_reward_normalizer_path
             ),
             "exploration_schedule_version": (
                 EXPLORATION_SCHEDULE_VERSION
@@ -871,6 +1304,24 @@ class ClientAlgorithm:
             "runtime_env_step": self.total_steps,
             "episode_id": self.episode_id,
             "action_enabled_env_steps": self.action_enabled_env_steps,
+            "resume_replay_refill_version": (
+                RESUME_REPLAY_REFILL_VERSION
+            ),
+            "resume_inference_until_replay_full": (
+                self.config.resume_inference_until_replay_full
+            ),
+            "resume_refill_target_env_steps": (
+                self.config.resume_refill_target_env_steps
+            ),
+            "resume_deterministic_episode_version": (
+                RESUME_DETERMINISTIC_EPISODE_VERSION
+            ),
+            "resume_deterministic_first_episode": (
+                self.config.resume_deterministic_first_episode
+            ),
+            "resume_deterministic_episode_active": (
+                self._resume_deterministic_episode_active
+            ),
             "normalizers_frozen": self._normalizers_frozen(),
             "checkpoint_kind": str(checkpoint_kind),
             "training_failed": bool(self.training_failed),
@@ -906,11 +1357,12 @@ class ClientAlgorithm:
         )
         return self.last_checkpoint_path
 
-    def _maybe_checkpoint(self):
+    def _maybe_checkpoint(self, *, force_latest=False):
         if self.training_failed:
             return
-        if self.total_steps and (
-            self.total_steps % self.config.latest_checkpoint_interval == 0
+        if force_latest or (
+            self.total_steps
+            and self.total_steps % self.config.latest_checkpoint_interval == 0
         ):
             self._save_runtime_checkpoint("latest")
         if self.total_steps and (
@@ -1057,6 +1509,17 @@ class ClientAlgorithm:
         )
 
     def Reset(self, pclient):
+        if (
+            getattr(self, "_resume_deterministic_episode_active", False)
+            and self.episode_steps > 0
+        ):
+            self._resume_deterministic_episode_active = False
+            print(
+                "[checkpoint-resume] deterministic collection episode "
+                "complete; learner updates and saved exploration resume "
+                "from this episode",
+                flush=True,
+            )
         self.episode_id += 1
         self.episode_steps = 0
         self.tat_above_threshold_count = 0
@@ -1144,7 +1607,7 @@ class ClientAlgorithm:
     def _action_scale(self) -> float:
         if self.config.action_mode == EXP_RESIDUAL:
             return float(self.config.action_scale)
-        start = int(self.config.warmup_steps)
+        start = int(self.config.effective_warmup_steps)
         end = int(self.config.curriculum_end_step)
         scale_start = float(self.config.curriculum_scale_start)
         scale_end = float(self.config.curriculum_scale_end)
@@ -1166,7 +1629,7 @@ class ClientAlgorithm:
             return 0.0
         final = min(start, float(self.config.exploration_noise_final_std))
         post_warmup_step = max(
-            0, self.total_steps - self.config.warmup_steps
+            0, self.total_steps - self.config.effective_warmup_steps
         )
         progress = np.clip(
             post_warmup_step / self.config.exploration_noise_anneal_steps,
@@ -1591,6 +2054,20 @@ class ClientAlgorithm:
         if not self.config.tat_termination_enabled:
             self.tat_above_threshold_count = 0
             return False
+        # The live protocol sends command=2 before the first active tick, and
+        # Reset() advances episode_id from 0 to 1. Therefore episode_id=1 is
+        # already the first human-numbered episode; adding one here enables an
+        # episode-2 policy one episode too early. Direct unit/smoke runtimes
+        # can omit that initial reset, so clamp their initial id 0 to episode 1.
+        # A verified state-normalizer reuse run intentionally changes the
+        # effective gate to episode 1 because its action warm-up is skipped.
+        current_episode = max(1, int(self.episode_id))
+        if (
+            current_episode
+            < self.config.effective_tat_termination_start_episode
+        ):
+            self.tat_above_threshold_count = 0
+            return False
         if self.episode_steps < self.config.tat_termination_grace_steps:
             self.tat_above_threshold_count = 0
             return False
@@ -1608,6 +2085,19 @@ class ClientAlgorithm:
             >= self.config.tat_above_threshold_patience
         )
 
+    def _update_warmup_episode_boundary(self) -> bool:
+        """End the one collection episode before any policy action is applied."""
+        if (
+            self.config.mode != "training"
+            or not self.config.terminate_on_warmup_complete
+            or self.config.effective_warmup_steps <= 0
+            or self.warmup_episode_boundary_sent
+            or self.total_steps < self.config.effective_warmup_steps
+        ):
+            return False
+        self.warmup_episode_boundary_sent = True
+        return True
+
     def _algorithm_impl(self, pclient):
         total_start = time.perf_counter()
         self._ensure_initialized(pclient)
@@ -1618,14 +2108,21 @@ class ClientAlgorithm:
         total_tat = float(getattr(pclient, "TotalTat", 0.0) or 0.0)
         done_by_queue = queued > self.config.early_stop_queued_threshold
         done_by_tat = self._update_tat_termination(total_tat)
+        done_by_warmup = self._update_warmup_episode_boundary()
         protocol_stalled = (
             self.config.mode == "training" and protocol_stalled
         )
-        done = done_by_queue or done_by_tat or protocol_stalled
+        done = (
+            done_by_queue
+            or done_by_tat
+            or done_by_warmup
+            or protocol_stalled
+        )
         termination_reason = (
             3.0 if protocol_stalled
             else 1.0 if done_by_queue
             else 2.0 if done_by_tat
+            else 4.0 if done_by_warmup
             else 0.0
         )
         # Every active-data tick expects exactly one fixed-width termination
@@ -1663,6 +2160,7 @@ class ClientAlgorithm:
                 else self.last_applied_action.reshape(-1, 1)
             ),
         )
+        self._maybe_save_state_normalizer()
         observation_calls += 1
         observation_build_ms = (time.perf_counter() - t0) * 1000.0
         self.last_observation = observation
@@ -1730,11 +2228,13 @@ class ClientAlgorithm:
             self.config.mode == "actor_inference"
             or (
                 self.config.mode == "training"
+                and not done_by_warmup
                 and (
                     (burnin_active and has_trained_policy)
                     or (
                         not burnin_active
-                        and self.total_steps >= self.config.warmup_steps
+                        and self.total_steps
+                        >= self.config.effective_warmup_steps
                     )
                 )
             )
@@ -1752,7 +2252,9 @@ class ClientAlgorithm:
         raw_exploration_noise = np.zeros_like(deterministic_policy)
         preclip_action = deterministic_policy.copy()
         exploration_noise_std = (
-            0.0 if burnin_active else self._exploration_noise_std()
+            0.0
+            if burnin_active or self._resume_deterministic_episode_active
+            else self._exploration_noise_std()
         )
         should_apply = (
             self.config.action_enabled
@@ -1760,7 +2262,8 @@ class ClientAlgorithm:
                 (burnin_active and has_trained_policy)
                 or (
                     not burnin_active
-                    and self.total_steps >= self.config.warmup_steps
+                    and self.total_steps
+                    >= self.config.effective_warmup_steps
                 )
             )
             and not self.training_failed
@@ -1770,6 +2273,7 @@ class ClientAlgorithm:
             self.config.mode == "training"
             and should_apply
             and not burnin_active
+            and not self._resume_deterministic_episode_active
         ):
             raw_exploration_noise = self.exploration_rng.normal(
                 0.0,
@@ -2096,6 +2600,10 @@ class ClientAlgorithm:
             "termination/done": float(done),
             "termination/by_queue": float(done_by_queue),
             "termination/by_tat": float(done_by_tat),
+            "termination/by_warmup": float(done_by_warmup),
+            "warmup/episode_boundary_sent": float(
+                self.warmup_episode_boundary_sent
+            ),
             "protocol/stale_sim_time_ticks": float(stale_sim_time_ticks),
             "curriculum/action_scale": current_action_scale,
             "global/tat": float(getattr(pclient, "TotalTat", 0.0)),
@@ -2160,9 +2668,10 @@ class ClientAlgorithm:
                 self.reward_builder.config.rail_free_flow_neutral_ratio
             )
             self.last_diagnostics.update(cycle_summary)
+        self._maybe_save_reward_normalizer()
         checkpoint_started = time.perf_counter()
         if self.config.mode == "training" and not self.training_failed:
-            self._maybe_checkpoint()
+            self._maybe_checkpoint(force_latest=done_by_warmup)
         checkpoint_ms = (time.perf_counter() - checkpoint_started) * 1000.0
         total_algorithm_ms = (time.perf_counter() - total_start) * 1000.0
         self.last_diagnostics.update({

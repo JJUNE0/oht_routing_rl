@@ -15,10 +15,11 @@ from cocel_rl.algorithms.contextual_td7.checkpoint import (
     CHECKPOINT_VERSION,
     ContextualCheckpointError,
     load_contextual_checkpoint,
+    read_contextual_runtime_config,
     save_contextual_checkpoint,
 )
 from contextual_observation import RunningFeatureNormalizer
-from contextual_reward import ContextualRewardBuilder
+from contextual_reward import ContextualRewardBuilder, ContextualRewardConfig
 from test_contextual_learner import SMALL_NETWORK
 from test_contextual_observation import make_topology
 from test_contextual_replay import FakeObservationBuilder, make_snapshot
@@ -39,27 +40,40 @@ class CheckpointObservationBuilder(FakeObservationBuilder):
         self.global_normalizer.freeze()
 
 
-def components(seed=17, *, sale=False, lap=False):
+def components(
+    seed=17, *, sale=False, lap=False, reward_version="U", batch_size=16
+):
     topology = make_topology()
     builder = CheckpointObservationBuilder(topology)
     replay = ContextualStepReplayBuffer(
         topology, builder, capacity_env_steps=8, seed=seed,
         lap_enabled=lap,
+        reward_version=reward_version,
     )
     for step in range(8):
         snapshot = make_snapshot(topology, step)
         policy = np.sin(
             np.arange(4996, dtype=np.float32) + step
         )[:, None]
+        applied = 0.1 * policy
+        previous_applied = 0.1 * np.sin(
+            np.arange(4996, dtype=np.float32) + max(step - 1, 0)
+        )[:, None]
         replay.push(replace(
             snapshot,
+            reward_version=reward_version,
+            previous_applied_action=previous_applied,
             policy_action=policy,
-            applied_action=0.1 * policy,
+            applied_action=applied,
+            next_previous_applied_action=applied,
             reward=np.tanh(snapshot.reward / 1000),
         ))
-    reward_builder = ContextualRewardBuilder(topology)
+    reward_builder = ContextualRewardBuilder(
+        topology,
+        ContextualRewardConfig.for_version(reward_version),
+    )
     config = ContextualLearnerConfig(
-        batch_size=16, target_noise=0.01,
+        batch_size=batch_size, target_noise=0.01,
         target_update_interval=4, policy_update_delay=2,
         minimum_replay_env_steps=1,
         minimum_action_enabled_env_steps=1,
@@ -76,6 +90,252 @@ def components(seed=17, *, sale=False, lap=False):
 
 
 class ContextualCheckpointTests(unittest.TestCase):
+    def test_reward_normalizer_step_state_round_trips(self):
+        learner, obs, reward = components()
+        reward.reward_steps = 12_345
+        with tempfile.TemporaryDirectory() as directory:
+            path = save_contextual_checkpoint(
+                Path(directory) / "reward_steps.pt",
+                learner,
+                observation_builder=obs,
+                reward_builder=reward,
+            )
+            target, target_obs, target_reward = components(seed=99)
+            self.assertEqual(target_reward.reward_steps, 0)
+            load_contextual_checkpoint(
+                path,
+                target,
+                observation_builder=target_obs,
+                reward_builder=target_reward,
+            )
+            self.assertEqual(target_reward.reward_steps, 12_345)
+
+    def test_checkpoint_rejects_cross_reward_profile_and_normalizers(self):
+        learner_u, obs_u, reward_u = components(reward_version="U")
+        with tempfile.TemporaryDirectory() as directory:
+            path = save_contextual_checkpoint(
+                Path(directory) / "reward_u.pt",
+                learner_u,
+                observation_builder=obs_u,
+                reward_builder=reward_u,
+            )
+            learner_t, obs_t, reward_t = components(
+                seed=99, reward_version="T"
+            )
+            with self.assertRaisesRegex(
+                ContextualCheckpointError, "reward_version mismatch"
+            ):
+                load_contextual_checkpoint(
+                    path,
+                    learner_t,
+                    observation_builder=obs_t,
+                    reward_builder=reward_t,
+                )
+
+    def test_resume_only_runtime_metadata_upgrade_is_narrow(self):
+        learner, obs, reward = components()
+        legacy_metadata = {
+            "algorithm_version": "algorithm_core",
+            "state_normalizer_warmup_bypass": False,
+            "effective_warmup_steps": 10_000,
+            "reward_normalizer_reuse": False,
+            "tat_termination_start_episode": 2,
+            "early_stop_tat_threshold": 180.0,
+        }
+        expected = {
+            "algorithm_version": (
+                "algorithm_core_action_scale_schedule_v1_"
+                "rewardnormreuse1_ep1_normreuse1"
+            ),
+            "action_scale_schedule_version": "action_scale_schedule_v1",
+            "state_normalizer_snapshot_version": "state_snapshot_v1",
+            "state_normalizer_warmup_bypass": True,
+            "effective_warmup_steps": 0,
+            "warmup_episode_transition_version": "warmup_boundary_v1",
+            "terminate_on_warmup_complete": True,
+            "reward_normalizer_snapshot_version": "reward_snapshot_v1",
+            "reward_normalizer_reuse": True,
+            "tat_termination_policy_version": "tat_policy_v1",
+            "tat_termination_policy": "episode2_tat180",
+            "tat_termination_configured_start_episode": 2,
+            "tat_termination_start_episode": 1,
+            "early_stop_tat_threshold": 180.0,
+            "resume_inference_until_replay_full": False,
+            "resume_refill_target_env_steps": 100,
+            "resume_deterministic_first_episode": True,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = save_contextual_checkpoint(
+                Path(directory) / "legacy_lifecycle.pt",
+                learner,
+                observation_builder=obs,
+                reward_builder=reward,
+                runtime_metadata=legacy_metadata,
+            )
+            load_contextual_checkpoint(
+                path,
+                learner,
+                observation_builder=obs,
+                reward_builder=reward,
+                expected_runtime_metadata=expected,
+                allow_resume_metadata_upgrade=True,
+            )
+            incompatible = dict(expected)
+            incompatible["early_stop_tat_threshold"] = 175.0
+            with self.assertRaisesRegex(
+                ContextualCheckpointError,
+                "early_stop_tat_threshold mismatch",
+            ):
+                load_contextual_checkpoint(
+                    path,
+                    learner,
+                    observation_builder=obs,
+                    reward_builder=reward,
+                    expected_runtime_metadata=incompatible,
+                    allow_resume_metadata_upgrade=True,
+                )
+
+    def test_resume_can_override_only_batch_size_in_learner_config(self):
+        learner, obs, reward = components(batch_size=16)
+        with tempfile.TemporaryDirectory() as directory:
+            path = save_contextual_checkpoint(
+                Path(directory) / "batch16.pt",
+                learner,
+                observation_builder=obs,
+                reward_builder=reward,
+            )
+            target, target_obs, target_reward = components(
+                seed=99, batch_size=32
+            )
+            with self.assertRaisesRegex(
+                ContextualCheckpointError, "learner_config mismatch"
+            ):
+                load_contextual_checkpoint(
+                    path,
+                    target,
+                    observation_builder=target_obs,
+                    reward_builder=target_reward,
+                )
+            load_contextual_checkpoint(
+                path,
+                target,
+                observation_builder=target_obs,
+                reward_builder=target_reward,
+                allowed_learner_config_overrides={"batch_size"},
+            )
+
+    def test_legacy_tat_metadata_may_be_proven_by_runtime_config(self):
+        learner, obs, reward = components()
+        tat_config = {
+            "tat_termination_enabled": True,
+            "tat_termination_grace_steps": 10_000,
+            "early_stop_tat_threshold": 200.0,
+            "tat_above_threshold_patience": 300,
+            "tat_termination_inclusive": True,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = save_contextual_checkpoint(
+                Path(directory) / "legacy_tat_metadata.pt",
+                learner,
+                observation_builder=obs,
+                reward_builder=reward,
+                runtime_config=tat_config,
+                runtime_metadata={},
+            )
+            load_contextual_checkpoint(
+                path,
+                learner,
+                observation_builder=obs,
+                reward_builder=reward,
+                expected_runtime_metadata=tat_config,
+                allow_resume_metadata_upgrade=True,
+            )
+            incompatible = dict(tat_config)
+            incompatible["early_stop_tat_threshold"] = 180.0
+            with self.assertRaisesRegex(
+                ContextualCheckpointError,
+                "early_stop_tat_threshold mismatch",
+            ):
+                load_contextual_checkpoint(
+                    path,
+                    learner,
+                    observation_builder=obs,
+                    reward_builder=reward,
+                    expected_runtime_metadata=incompatible,
+                    allow_resume_metadata_upgrade=True,
+                )
+
+    def test_full_runtime_config_round_trip_and_v3_partial_compatibility(self):
+        learner, obs, reward = components()
+        runtime_config = {
+            "warmup_steps": 12_345,
+            "exploration_noise_std": 0.17,
+            "exploration_noise_final_std": 0.03,
+            "exploration_noise_anneal_steps": 87_654,
+            "exploration_noise_clip": 0.19,
+            "smooth_b_rl_weight": 0.07,
+            "updates_per_env_step": 3,
+        }
+        metadata = {
+            "action_mode": "region_b_rl",
+            "action_scale": 0.05,
+            "exploration_noise_std": 0.17,
+            "exploration_noise_final_std": 0.03,
+            "exploration_noise_anneal_steps": 87_654,
+            "exploration_noise_anneal_start_step": 12_345,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = save_contextual_checkpoint(
+                Path(directory) / "checkpoint.pt",
+                learner,
+                observation_builder=obs,
+                reward_builder=reward,
+                runtime_metadata=metadata,
+                runtime_config=runtime_config,
+            )
+            restored, complete = read_contextual_runtime_config(path)
+            self.assertTrue(complete)
+            self.assertEqual(restored, runtime_config)
+
+            payload = torch.load(path, weights_only=False)
+            payload["checkpoint_version"] = (
+                "contextual_td7_checkpoint_v3_independent_twin_critic"
+            )
+            payload.pop("runtime_config")
+            legacy_path = Path(directory) / "v3.pt"
+            torch.save(payload, legacy_path)
+            restored, complete = read_contextual_runtime_config(legacy_path)
+            self.assertFalse(complete)
+            self.assertEqual(restored["action_mode"], "region_b_rl")
+            self.assertEqual(restored["action_scale"], 0.05)
+            self.assertEqual(restored["warmup_steps"], 12_345)
+            self.assertNotIn("exploration_noise_clip", restored)
+            load_contextual_checkpoint(
+                legacy_path,
+                learner,
+                observation_builder=obs,
+                reward_builder=reward,
+            )
+
+            payload = torch.load(path, weights_only=False)
+            for reward_version in (
+                "contextual_controlled_reward_v4_balanced_global_local",
+                "contextual_controlled_reward_v5_completion_dedup",
+                "contextual_controlled_reward_v6_oht_state_cycle",
+                "contextual_controlled_reward_v7_oht_cycle_segments_boundary_delta",
+            ):
+                payload["reward_version"] = reward_version
+                torch.save(payload, legacy_path)
+                with self.assertRaisesRegex(
+                    ContextualCheckpointError, "reward_version mismatch"
+                ):
+                    load_contextual_checkpoint(
+                        legacy_path,
+                        learner,
+                        observation_builder=obs,
+                        reward_builder=reward,
+                    )
+
     def test_exploration_rng_round_trip_and_legacy_fallback(self):
         learner, obs, reward = components()
         source_rng = np.random.default_rng(123)
@@ -155,8 +415,16 @@ class ContextualCheckpointTests(unittest.TestCase):
                 ).state
                 torch.testing.assert_close(source_z, restored_z, rtol=0, atol=0)
                 torch.testing.assert_close(
-                    source.actor(source_z).action,
-                    restored.actor(restored_z).action, rtol=0, atol=0,
+                    source.actor(
+                        source_z,
+                        previous_action=fixed.previous_applied_action,
+                    ).action,
+                    restored.actor(
+                        restored_z,
+                        previous_action=fixed.previous_applied_action,
+                    ).action,
+                    rtol=0,
+                    atol=0,
                 )
 
             # Restore once more because the fixed sample advanced source replay
@@ -253,6 +521,7 @@ class ContextualCheckpointTests(unittest.TestCase):
                 ("topology_hash", "wrong"),
                 ("mapping_hash", "wrong"),
                 ("learner_version", "wrong"),
+                ("reward_version", "wrong"),
                 ("action_version", "wrong"),
                 ("action_scale", 0.9),
             ):

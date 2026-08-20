@@ -18,6 +18,7 @@ ACTION_VERSIONS = {
     EXP_RESIDUAL: "contextual_exp_residual_v2",
 }
 EXPLORATION_SCHEDULE_VERSION = "contextual_exploration_linear_anneal_v1"
+ACTION_SCALE_SCHEDULE_VERSION = "contextual_action_scale_schedule_v2"
 # Default contract for standalone replay/test construction.
 ACTION_VERSION = ACTION_VERSIONS[REGION_B_RL]
 

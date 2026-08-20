@@ -3,7 +3,7 @@ import unittest
 import numpy as np
 
 from contextual_observation import ContextualObservationBatch
-from contextual_reward import ContextualRewardBuilder
+from contextual_reward import ContextualRewardBuilder, ContextualRewardConfig
 from contextual_transition import (
     ContextualTransitionAligner,
     ContextualTransitionError,
@@ -20,6 +20,7 @@ def observation(topology, suffix=0):
         incoming_relation=np.zeros((CONTROLLED_COUNT, 10, 2), np.float32),
         outgoing_relation=np.zeros((CONTROLLED_COUNT, 10, 2), np.float32),
         global_state=np.zeros(6, np.float32),
+        previous_applied_action=np.zeros((CONTROLLED_COUNT, 1), np.float32),
         controlled_rail_ids=topology.controlled_rail_ids.copy(),
         topology_hash=topology.topology_hash,
         mapping_hash=topology.mapping_hash,
@@ -33,7 +34,10 @@ def observation(topology, suffix=0):
 class ContextualTransitionTests(unittest.TestCase):
     def setUp(self):
         self.topology = make_topology()
-        self.builder = ContextualRewardBuilder(self.topology)
+        self.builder = ContextualRewardBuilder(
+            self.topology,
+            ContextualRewardConfig(rail_reward_mode="fixed_tat_reference"),
+        )
         self.items = []
         self.aligner = ContextualTransitionAligner(
             self.topology, self.builder, self.items.append

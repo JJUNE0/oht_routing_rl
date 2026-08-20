@@ -40,10 +40,16 @@ def replay_100():
     for step in range(100):
         snapshot = make_snapshot(topology, step, done=(step == 99))
         policy = np.sin(rows * 0.013 + step * 0.07)[:, None]
+        applied = 0.1 * policy
+        previous_applied = 0.1 * np.sin(
+            rows * 0.013 + max(step - 1, 0) * 0.07
+        )[:, None]
         replay.push(replace(
             snapshot,
+            previous_applied_action=previous_applied,
             policy_action=policy,
-            applied_action=0.1 * policy,
+            applied_action=applied,
+            next_previous_applied_action=applied,
             reward=np.tanh(rows * 0.001 + step * 0.01),
         ))
     return replay

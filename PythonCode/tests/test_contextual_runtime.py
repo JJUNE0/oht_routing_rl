@@ -1,4 +1,8 @@
+import json
+import tempfile
 import unittest
+from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -14,6 +18,7 @@ from ClientAlgorithm_contextual import (
     ClientAlgorithm,
     ContextualRuntimeConfig,
 )
+from contextual_dispatch import DISPATCH_COST
 from contextual_action import EXP_RESIDUAL
 from contextual_observation import ContextualObservationBatch
 from test_contextual_observation import (
@@ -44,14 +49,27 @@ class CountingObservationBuilder:
                 (CONTROLLED_COUNT, 10, 2), dtype=np.float32
             ),
             global_state=np.zeros(6, dtype=np.float32),
+            previous_applied_action=np.zeros(
+                (CONTROLLED_COUNT, 1), dtype=np.float32
+            ),
             controlled_rail_ids=topology.controlled_rail_ids.copy(),
             topology_hash=topology.topology_hash,
             mapping_hash=topology.mapping_hash,
         )
 
-    def build(self, pclient, *, parameter_dw, parameter_c):
+    def build(
+        self, pclient, *, parameter_dw, parameter_c,
+        previous_applied_action=None,
+    ):
         self.calls += 1
-        return self.batch
+        if previous_applied_action is None:
+            return self.batch
+        return replace(
+            self.batch,
+            previous_applied_action=np.ascontiguousarray(
+                np.asarray(previous_applied_action, np.float32).reshape(-1, 1)
+            ),
+        )
 
 
 def make_runtime_pclient(reverse=False):
@@ -110,6 +128,107 @@ class ContextualRuntimeTests(unittest.TestCase):
         self.assertTrue(np.isfinite(costs).all())
         np.testing.assert_array_equal(costs, result.final_cost)
 
+    def test_runtime_wires_reward_u_completion_global_raw_local_normalized(self):
+        runtime = self.runtime()
+        runtime._ensure_initialized(make_runtime_pclient())
+        reward = runtime.reward_builder.config
+
+        self.assertEqual(reward.tat_reference, 165.0)
+        self.assertEqual(reward.tat_weight, 2.3)
+        self.assertFalse(reward.tat_one_sided)
+        self.assertEqual(reward.op_weight, 0.0)
+        self.assertFalse(reward.use_op)
+        self.assertEqual(reward.backlog_weight, 0.0025)
+        self.assertFalse(reward.backlog_growth_enabled)
+        self.assertEqual(reward.backlog_growth_weight, 0.0)
+        self.assertEqual(reward.idle_reserve_weight, 0.0)
+        self.assertEqual(reward.local_oht_weight, 0.3)
+        self.assertEqual(reward.local_predicted_oht_weight, 0.2)
+        self.assertEqual(reward.local_stop_weight, 0.3)
+        self.assertEqual(reward.local_idle_weight, 0.1)
+        self.assertEqual(reward.local_capacity_weight, 0.1)
+        self.assertFalse(reward.global_normalization_enabled)
+        self.assertTrue(reward.local_normalization_enabled)
+        self.assertFalse(reward.local_fixed_scale_enabled)
+        self.assertEqual(reward.freeze_after_env_steps, 30_000)
+        self.assertEqual(reward.rail_tat_weight, 1.0)
+        self.assertIsNone(reward.rail_tat_clip)
+        self.assertEqual(reward.rail_free_flow_neutral_ratio, 2.0)
+        self.assertIsNone(reward.tat_raw_clip)
+        self.assertEqual(reward.smooth_b_rl_weight, 0.05)
+        self.assertIsNone(runtime.reward_diagnostic_writer)
+        self.assertIsNone(runtime.rail_tat_diagnostic_path)
+
+    def test_runtime_writes_bounded_reward_step_jsonl_only_when_opted_in(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = self.runtime(
+                reward_diagnostic_dir=directory,
+                reward_diagnostic_windows="0:10",
+            )
+            pclient = make_runtime_pclient()
+            pclient.SimTime = 1.0
+            runtime.Algorithm(pclient)
+            pclient.SimTime = 2.0
+            runtime.Algorithm(pclient)
+
+            path = Path(directory) / "reward_step_window_00000_00010.jsonl"
+            records = [
+                json.loads(line)
+                for line in path.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(len(records), 1)
+            record = records[0]
+            self.assertEqual(record["global_step"], 1)
+            self.assertEqual(record["episode_step"], 0)
+            self.assertEqual(record["tat_weight"], 2.3)
+            self.assertEqual(record["backlog_weight"], 0.0025)
+            self.assertEqual(record["local_predicted_oht_weight"], 0.2)
+            self.assertEqual(record["local_reward_scale"], 1.0)
+            self.assertEqual(record["rail_tat_weight"], 1.0)
+            self.assertIsNone(record["rail_tat_clip"])
+            for field in (
+                "global_normalized",
+                "completion_tat_raw_abs",
+                "backlog_raw_abs",
+                "global_component_abs",
+                "completion_tat_contribution_abs",
+                "backlog_contribution_abs",
+                "local_component_abs_mean",
+                "rail_component_abs_mean",
+                "smooth_component_abs_mean",
+                "reward_budget_shares",
+                "leading_indicator_snapshot",
+            ):
+                self.assertIn(field, record)
+            self.assertEqual(
+                set(record["reward_budget_shares"]),
+                {"completion_tat", "backlog", "local", "rail", "smooth"},
+            )
+            self.assertAlmostEqual(
+                record["completion_tat_contribution_abs"],
+                0.5 * record["completion_tat_raw_abs"],
+            )
+            self.assertAlmostEqual(
+                record["backlog_contribution_abs"],
+                0.5 * record["backlog_raw_abs"],
+            )
+            self.assertIn("rail_tat_top_abs", record)
+            self.assertFalse(record["learner_available"])
+            self.assertIsNone(record["q1_mean"])
+
+    def test_cost_dispatch_snapshots_exact_command_zero_final_cost(self):
+        runtime = self.runtime(dispatch_mode=DISPATCH_COST)
+        pclient = make_runtime_pclient()
+
+        result = runtime.Algorithm(pclient)
+
+        expected = {
+            int(rail_id): float(result.final_cost[row])
+            for row, rail_id in enumerate(runtime.topology.all_rail_ids)
+        }
+        self.assertTrue(runtime.dispatch_cost_ready)
+        self.assertEqual(runtime.latest_dispatch_live_cost_by_rail, expected)
+
     def test_rail_dictionary_order_does_not_change_cost_alignment(self):
         first = self.runtime()
         second = self.runtime()
@@ -129,10 +248,10 @@ class ContextualRuntimeTests(unittest.TestCase):
         original_actor_forward = runtime.actor.forward
         original_encoder_forward = runtime.encoder.forward
 
-        def actor_forward(state):
+        def actor_forward(state, *args, **kwargs):
             captured["inference_mode"] = torch.is_inference_mode_enabled()
             captured["actor_training"] = runtime.actor.training
-            return original_actor_forward(state)
+            return original_actor_forward(state, *args, **kwargs)
 
         def encoder_forward(*args, **kwargs):
             captured["return_attention"] = kwargs.get("return_attention")
@@ -212,12 +331,18 @@ class ContextualRuntimeTests(unittest.TestCase):
         runtime = self.runtime()
         pclient = make_runtime_pclient()
         runtime.Algorithm(pclient)
+        runtime.parameterDw = {0: 7.0}
+        runtime.parameterPassTimes = {0: [3.0]}
+        runtime.parameterC = {0: 5.0}
         self.assertEqual(runtime.episode_steps, 1)
         runtime.Reset(pclient)
         self.assertEqual(runtime.episode_steps, 0)
         self.assertIsNone(runtime.last_observation)
         self.assertIsNone(runtime.last_controlled_action)
         self.assertEqual(runtime.last_diagnostics, {})
+        self.assertEqual(runtime.parameterDw, {})
+        self.assertEqual(runtime.parameterPassTimes, {})
+        self.assertEqual(runtime.parameterC, {})
         self.assertEqual(runtime.total_steps, 1)
 
     def test_boundary_invariant_holds_for_100_consecutive_ticks(self):

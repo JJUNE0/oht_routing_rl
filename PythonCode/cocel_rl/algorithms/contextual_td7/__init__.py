@@ -39,6 +39,8 @@ from .targets import bellman_target, scale_policy_action, target_applied_action
 from .checkpoint import (
     CHECKPOINT_VERSION,
     CRITIC_INITIALIZATION,
+    RESUME_DETERMINISTIC_EPISODE_VERSION,
+    RESUME_REPLAY_REFILL_VERSION,
     ContextualCheckpointError,
     load_contextual_checkpoint,
     read_contextual_runtime_config,
@@ -98,6 +100,8 @@ __all__ = [
     "target_applied_action",
     "CHECKPOINT_VERSION",
     "CRITIC_INITIALIZATION",
+    "RESUME_DETERMINISTIC_EPISODE_VERSION",
+    "RESUME_REPLAY_REFILL_VERSION",
     "ContextualCheckpointError",
     "load_contextual_checkpoint",
     "read_contextual_runtime_config",

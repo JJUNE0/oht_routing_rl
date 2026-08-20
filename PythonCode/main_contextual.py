@@ -15,9 +15,16 @@ import PClient
 import numpy as np
 import torch
 from ClientAlgorithm_contextual import (
+    AUTO_REWARD_NORMALIZER_PATH,
     ClientAlgorithm,
     ContextualRuntimeConfig,
     ContextualTrainingFailure,
+)
+from contextual_termination import (
+    TAT_TERMINATION_EPISODE2_TAT180,
+    TAT_TERMINATION_POLICIES,
+    TAT_TERMINATION_REWARD_PROFILE,
+    tat_termination_profile,
 )
 from contextual_dispatch import (
     DISPATCH_FIRST_MATCH,
@@ -33,7 +40,6 @@ from contextual_action import ACTION_MODES, REGION_B_RL
 from contextual_reward import ContextualRewardConfig
 from contextual_reward_version_cfg import (
     RAIL_REWARD_MODES,
-    REWARD_VERSION,
     REWARD_VERSIONS,
     canonical_reward_version,
     reward_contract,
@@ -51,6 +57,10 @@ RESUME_LAUNCH_CONTROL_FIELDS = {
     "device",
     "topology_cache_path",
     "topology_audit_path",
+    "load_state_normalizer_path",
+    "save_state_normalizer_path",
+    "load_reward_normalizer_path",
+    "save_reward_normalizer_path",
     "checkpoint_root",
     "resume_checkpoint_path",
     "rail_tat_diagnostic_path",
@@ -60,6 +70,9 @@ RESUME_LAUNCH_CONTROL_FIELDS = {
     "wandb_enabled",
     "dispatch_mode",
     "tat_confidence_ramp",
+    "batch_size",
+    "resume_inference_until_replay_full",
+    "resume_deterministic_first_episode",
 }
 
 
@@ -95,6 +108,18 @@ def restore_checkpoint_runtime_config(config_kwargs, checkpoint_path):
             continue
         config_kwargs[key] = value
         restored.append(key)
+    if "tat_termination_policy" not in saved:
+        # Checkpoints created before named termination policies stored the
+        # reward profile's concrete threshold/grace/patience fields.
+        config_kwargs[
+            "tat_termination_policy"
+        ] = TAT_TERMINATION_REWARD_PROFILE
+        config_kwargs["tat_termination_start_episode"] = 1
+    # A full checkpoint always restores both normalizer states. Treat that as
+    # normalizer reuse: no collection warm-up is repeated, and the effective
+    # TAT episode gate starts at episode 1.
+    config_kwargs["state_normalizer_warmup_bypass"] = True
+    config_kwargs["reward_normalizer_reuse"] = True
     source = "full" if complete else "legacy-partial"
     print(
         "[checkpoint-config] "
@@ -122,7 +147,7 @@ def parse_args():
         "--reward-version",
         type=canonical_reward_version,
         choices=REWARD_VERSIONS,
-        default=REWARD_VERSION,
+        default="E",
         help=(
             "Select the complete locked reward profile, including global/"
             "local formulas, rail/smooth terms, and reward normalizers."
@@ -160,7 +185,7 @@ def parse_args():
         help="Environment-step spacing between stacked frames.",
     )
     parser.add_argument("--curriculum-end-step", type=int, default=20_000)
-    parser.add_argument("--curriculum-scale-start", type=float, default=0.05)
+    parser.add_argument("--curriculum-scale-start", type=float, default=1.0)
     parser.add_argument("--curriculum-scale-end", type=float, default=1.0)
     parser.add_argument(
         "--curriculum-shape",
@@ -191,8 +216,61 @@ def parse_args():
     )
     parser.add_argument("--exploration-noise-clip", type=float, default=0.20)
     parser.add_argument("--warmup-steps", type=int, default=10_000)
+    parser.add_argument(
+        "--terminate-on-warmup-complete",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "End the collection episode at the warm-up transition boundary "
+            "so policy control starts from a clean next episode."
+        ),
+    )
     parser.add_argument("--episode-burnin-steps", type=int, default=0)
     parser.add_argument("--normalizer-freeze-steps", type=int, default=10_000)
+    parser.add_argument(
+        "--load-state-normalizer",
+        type=Path,
+        default=None,
+        help=(
+            "Load only a populated, frozen observation/state normalizer "
+            "snapshot. Exact observation feature order, dimensions, topology, "
+            "mapping, epsilon, and clip compatibility is required; a valid "
+            "load makes effective action warm-up zero without restoring the "
+            "actor, critic, reward normalizer, replay, or checkpoint."
+        ),
+    )
+    parser.add_argument(
+        "--save-state-normalizer",
+        type=Path,
+        default=None,
+        help=(
+            "Atomically save the observation/state normalizer once both local "
+            "and global statistics are populated and frozen."
+        ),
+    )
+    parser.add_argument(
+        "--load-reward-normalizer",
+        nargs="?",
+        const=AUTO_REWARD_NORMALIZER_PATH,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Load one compatible frozen local/global reward-normalizer "
+            "snapshot. With no PATH, resolve the versioned automatic path."
+        ),
+    )
+    parser.add_argument(
+        "--save-reward-normalizer",
+        nargs="?",
+        const=AUTO_REWARD_NORMALIZER_PATH,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Atomically save local/global reward normalizers in one snapshot "
+            "after freeze. With no PATH, use a reward-version/profile/"
+            "topology/seed-specific path under .\\normalizers."
+        ),
+    )
     parser.add_argument(
         "--reward-normalizer-freeze-steps", type=int, default=None,
         help=(
@@ -235,7 +313,7 @@ def parse_args():
     )
     parser.add_argument("--device", default=None)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--replay-capacity-env-steps", type=int, default=50_000)
+    parser.add_argument("--replay-capacity-env-steps", type=int, default=100_000)
     replay_sampling = parser.add_mutually_exclusive_group()
     replay_sampling.add_argument(
         "--replay-buffer-rail",
@@ -290,12 +368,45 @@ def parse_args():
     parser.add_argument("--wandb-log-interval", type=int, default=10)
     parser.add_argument("--console-log-interval", type=int, default=100)
     parser.add_argument("--early-stop-queued-threshold", type=float, default=500.0)
+    parser.add_argument(
+        "--tat-termination-policy",
+        choices=TAT_TERMINATION_POLICIES,
+        default=TAT_TERMINATION_EPISODE2_TAT180,
+        help=(
+            "Select a named episode-gated TAT policy, or restore the selected "
+            "reward profile's historical termination settings."
+        ),
+    )
+    parser.add_argument(
+        "--tat-termination-start-episode", type=int, default=None
+    )
     parser.add_argument("--early-stop-tat-threshold", type=float, default=None)
     parser.add_argument("--tat-termination-grace-steps", type=int, default=None)
     parser.add_argument("--tat-above-threshold-patience", type=int, default=None)
     parser.add_argument("--max-stale-sim-time-ticks", type=int, default=5)
     parser.add_argument("--checkpoint-root", default=None)
     parser.add_argument("--resume-checkpoint", default=None)
+    parser.add_argument(
+        "--resume-inference-until-replay-full",
+        action="store_true",
+        help=(
+            "After checkpoint resume, keep the restored actor/critic frozen "
+            "and collect actor-plus-exploration transitions until the new "
+            "replay reaches replay-capacity-env-steps; enable learner updates "
+            "on the following tick."
+        ),
+    )
+    parser.add_argument(
+        "--resume-deterministic-first-episode",
+        action="store_true",
+        help=(
+            "After checkpoint resume, run the first resumed episode with the "
+            "restored deterministic actor, zero exploration noise, and no "
+            "learner updates. Keep its transitions in replay and resume the "
+            "saved exploration schedule plus learner updates from the next "
+            "episode once the ordinary minimum replay gate is satisfied."
+        ),
+    )
     parser.add_argument(
         "--rail-tat-diagnostic",
         default=None,
@@ -349,10 +460,22 @@ def parse_args():
         "use_tat_cofidence": reward_profile.tat_confidence_ramp,
     }
     contract = reward_contract(args.reward_version)
+    termination_defaults = tat_termination_profile(
+        args.tat_termination_policy, contract
+    )
     reward_defaults.update({
-        "early_stop_tat_threshold": contract.tat_termination_threshold,
-        "tat_termination_grace_steps": contract.tat_termination_grace_steps,
-        "tat_above_threshold_patience": contract.tat_termination_patience,
+        "tat_termination_start_episode": termination_defaults[
+            "tat_termination_start_episode"
+        ],
+        "early_stop_tat_threshold": termination_defaults[
+            "early_stop_tat_threshold"
+        ],
+        "tat_termination_grace_steps": termination_defaults[
+            "tat_termination_grace_steps"
+        ],
+        "tat_above_threshold_patience": termination_defaults[
+            "tat_above_threshold_patience"
+        ],
     })
     for name, value in reward_defaults.items():
         if getattr(args, name) is None:
@@ -448,7 +571,9 @@ def send_active_data(pclient, client, reporter=None, log_interval=100):
     client.AlgorithmAfter(pclient)
     diagnostics = client.last_diagnostics
     step = int(diagnostics.get("env/step", client.total_steps))
-    warmup_remaining = max(0, int(client.config.warmup_steps) - step)
+    warmup_remaining = max(
+        0, int(client.config.effective_warmup_steps) - step
+    )
     replay_steps = int(diagnostics.get("replay/size_env_steps", 0))
     learner_updates = int(diagnostics.get("update/learner_count", 0))
     action_state = (
@@ -552,8 +677,23 @@ def main():
         "smooth_b_rl_weight": args.smooth_b_rl_weight,
         "smooth_exp_residual_weight": args.smooth_exp_residual_weight,
         "warmup_steps": args.warmup_steps,
+        "terminate_on_warmup_complete": (
+            args.terminate_on_warmup_complete
+        ),
         "episode_burnin_steps": args.episode_burnin_steps,
         "normalizer_freeze_steps": args.normalizer_freeze_steps,
+        "load_state_normalizer_path": (
+            None
+            if args.load_state_normalizer is None
+            else str(args.load_state_normalizer)
+        ),
+        "save_state_normalizer_path": (
+            None
+            if args.save_state_normalizer is None
+            else str(args.save_state_normalizer)
+        ),
+        "load_reward_normalizer_path": args.load_reward_normalizer,
+        "save_reward_normalizer_path": args.save_reward_normalizer,
         "reward_normalizer_freeze_steps": (
             args.reward_normalizer_freeze_steps
         ),
@@ -585,12 +725,22 @@ def main():
         "critic_loss_mode": args.critic_loss_mode,
         "wandb_log_interval": args.wandb_log_interval,
         "early_stop_queued_threshold": args.early_stop_queued_threshold,
+        "tat_termination_policy": args.tat_termination_policy,
+        "tat_termination_start_episode": (
+            args.tat_termination_start_episode
+        ),
         "early_stop_tat_threshold": args.early_stop_tat_threshold,
         "tat_termination_grace_steps": args.tat_termination_grace_steps,
         "tat_above_threshold_patience": args.tat_above_threshold_patience,
         "max_stale_sim_time_ticks": args.max_stale_sim_time_ticks,
         "checkpoint_root": args.checkpoint_root,
         "resume_checkpoint_path": args.resume_checkpoint,
+        "resume_inference_until_replay_full": (
+            args.resume_inference_until_replay_full
+        ),
+        "resume_deterministic_first_episode": (
+            args.resume_deterministic_first_episode
+        ),
         "rail_tat_diagnostic_path": args.rail_tat_diagnostic,
         "rail_tat_diagnostic_max_step": (
             args.rail_tat_diagnostic_max_step
@@ -620,7 +770,16 @@ def main():
         f"action_scale={client._action_scale()}, "
         f"num_stacks={client.config.num_stacks}, "
         f"stack_interval={client.config.stack_interval}, "
-        f"warmup_steps={client.config.warmup_steps}, "
+        f"warmup_steps={client.config.warmup_steps}->"
+        f"{client.config.effective_warmup_steps}, "
+        "terminate_on_warmup_complete="
+        f"{client.config.terminate_on_warmup_complete}, "
+        "state_normalizer="
+        f"load:{client.config.load_state_normalizer_path},"
+        f"save:{client.config.save_state_normalizer_path}, "
+        "reward_normalizer="
+        f"load:{client.config.load_reward_normalizer_path},"
+        f"save:{client.config.save_reward_normalizer_path}, "
         f"episode_burnin_steps={client.config.episode_burnin_steps}, "
         "reward_normalizer_freeze_steps="
         f"{client.config.reward_normalizer_freeze_steps}, "
@@ -639,17 +798,25 @@ def main():
         f"rail_tat_weight={client.config.reward_rail_tat_weight}, "
         f"rail_tat_clip={client.config.reward_rail_tat_clip}, "
         "tat_termination="
+        f"{client.config.tat_termination_policy}:"
         f"{client.config.early_stop_tat_threshold:g}x"
         f"{client.config.tat_above_threshold_patience} after "
-        f"{client.config.tat_termination_grace_steps}, "
+        f"{client.config.tat_termination_grace_steps}, from_episode="
+        f"{client.config.tat_termination_start_episode}->"
+        f"{client.config.effective_tat_termination_start_episode}, "
         f"terminal_tat_penalty={client.config.terminal_tat_penalty:g}, "
         f"use_tat_confidence={client.config.tat_confidence_ramp}, "
         f"replay_sampling={client.config.replay_sampling_mode}, "
         f"batch_size={client.config.batch_size}, "
+        "resume_refill="
+        f"{'full_capacity' if client.config.resume_inference_until_replay_full else 'minimum'},"
+        f"target={client.config.resume_refill_target_env_steps}, "
+        "resume_deterministic_first_episode="
+        f"{client.config.resume_deterministic_first_episode}, "
         f"exploration_noise={client.config.exploration_noise_std}->"
         f"{min(client.config.exploration_noise_std, client.config.exploration_noise_final_std)}"
-        f"@global[{client.config.warmup_steps},"
-        f"{client.config.warmup_steps + client.config.exploration_noise_anneal_steps}], "
+        f"@global[{client.config.effective_warmup_steps},"
+        f"{client.config.effective_warmup_steps + client.config.exploration_noise_anneal_steps}], "
         f"seed={client.config.seed}, "
         f"device={client.device}"
     )

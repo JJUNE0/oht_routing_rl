@@ -44,6 +44,9 @@ LOCAL_DIM = len(LOCAL_FEATURE_NAMES)
 GLOBAL_DIM = len(GLOBAL_FEATURE_NAMES)
 RELATION_DIM = len(RELATION_FEATURE_NAMES)
 OBSERVATION_VERSION = "physical_raw_contextual_previous_applied_action_v2"
+OBSERVATION_NORMALIZER_SNAPSHOT_VERSION = (
+    "contextual_observation_normalizer_snapshot_v2_feature_contract"
+)
 
 
 class ObservationContractError(RuntimeError):
@@ -152,16 +155,37 @@ class RunningFeatureNormalizer:
             raise ObservationContractError(
                 f"normalizer dim mismatch: saved={state['dim']}, current={self.dim}"
             )
+        saved_epsilon = float(state.get("epsilon", self.epsilon))
+        saved_clip = state.get("clip", self.clip)
+        saved_clip = None if saved_clip is None else float(saved_clip)
+        if saved_epsilon != self.epsilon:
+            raise ObservationContractError(
+                "normalizer epsilon mismatch: "
+                f"saved={saved_epsilon}, current={self.epsilon}"
+            )
+        if saved_clip != self.clip:
+            raise ObservationContractError(
+                "normalizer clip mismatch: "
+                f"saved={saved_clip}, current={self.clip}"
+            )
         mean = np.asarray(state["mean"], dtype=np.float64)
         m2 = np.asarray(state["m2"], dtype=np.float64)
         if mean.shape != (self.dim,) or m2.shape != (self.dim,):
             raise ObservationContractError("invalid saved normalizer vector shape")
         if not np.isfinite(mean).all() or not np.isfinite(m2).all():
             raise ObservationContractError("saved normalizer contains NaN or Inf")
+        if (m2 < 0.0).any():
+            raise ObservationContractError("saved normalizer m2 must be non-negative")
+        count = int(state["count"])
+        update_calls = int(state.get("update_calls", 0))
+        if count < 0 or update_calls < 0:
+            raise ObservationContractError(
+                "saved normalizer counts must be non-negative"
+            )
         self.mean = mean.copy()
         self.m2 = m2.copy()
-        self.count = int(state["count"])
-        self.update_calls = int(state.get("update_calls", 0))
+        self.count = count
+        self.update_calls = update_calls
         self.frozen = bool(state["frozen"])
 
 
@@ -489,62 +513,195 @@ class ContextualObservationBuilder:
                     f"{name} must be finite and C-contiguous"
                 )
 
-    def save_normalizers(self, path: str | Path) -> Path:
+    def save_normalizers(
+        self, path: str | Path, *, require_frozen: bool = False
+    ) -> Path:
         target = Path(path)
+        if require_frozen and not (
+            self.local_normalizer.frozen
+            and self.global_normalizer.frozen
+            and self.local_normalizer.count > 0
+            and self.global_normalizer.count > 0
+        ):
+            raise ObservationContractError(
+                "refusing to save a warm-up bypass snapshot before both "
+                "state normalizers are populated and frozen"
+            )
         target.parent.mkdir(parents=True, exist_ok=True)
         local = self.local_normalizer.state_dict()
         global_state = self.global_normalizer.state_dict()
-        np.savez_compressed(
-            target,
-            topology_hash=np.asarray(self.topology.topology_hash),
-            mapping_hash=np.asarray(self.topology.mapping_hash),
-            env_steps=np.asarray(self.env_steps, dtype=np.int64),
-            local_mean=local["mean"],
-            local_m2=local["m2"],
-            local_count=np.asarray(local["count"], dtype=np.int64),
-            local_update_calls=np.asarray(local["update_calls"], dtype=np.int64),
-            local_frozen=np.asarray(local["frozen"]),
-            global_mean=global_state["mean"],
-            global_m2=global_state["m2"],
-            global_count=np.asarray(global_state["count"], dtype=np.int64),
-            global_update_calls=np.asarray(
-                global_state["update_calls"], dtype=np.int64
-            ),
-            global_frozen=np.asarray(global_state["frozen"]),
-        )
+        temporary = target.with_suffix(target.suffix + ".tmp")
+        with temporary.open("wb") as stream:
+            np.savez_compressed(
+                stream,
+                snapshot_version=np.asarray(
+                    OBSERVATION_NORMALIZER_SNAPSHOT_VERSION
+                ),
+                observation_version=np.asarray(OBSERVATION_VERSION),
+                topology_version=np.asarray(TOPOLOGY_VERSION),
+                topology_hash=np.asarray(self.topology.topology_hash),
+                mapping_hash=np.asarray(self.topology.mapping_hash),
+                local_feature_names=np.asarray(LOCAL_FEATURE_NAMES),
+                global_feature_names=np.asarray(GLOBAL_FEATURE_NAMES),
+                relation_feature_names=np.asarray(RELATION_FEATURE_NAMES),
+                local_dim=np.asarray(LOCAL_DIM, dtype=np.int64),
+                global_dim=np.asarray(GLOBAL_DIM, dtype=np.int64),
+                relation_dim=np.asarray(RELATION_DIM, dtype=np.int64),
+                env_steps=np.asarray(self.env_steps, dtype=np.int64),
+                local_epsilon=np.asarray(local["epsilon"], dtype=np.float64),
+                local_clip_is_none=np.asarray(local["clip"] is None),
+                local_clip=np.asarray(
+                    0.0 if local["clip"] is None else local["clip"],
+                    dtype=np.float64,
+                ),
+                local_mean=local["mean"],
+                local_m2=local["m2"],
+                local_count=np.asarray(local["count"], dtype=np.int64),
+                local_update_calls=np.asarray(
+                    local["update_calls"], dtype=np.int64
+                ),
+                local_frozen=np.asarray(local["frozen"]),
+                global_epsilon=np.asarray(
+                    global_state["epsilon"], dtype=np.float64
+                ),
+                global_clip_is_none=np.asarray(
+                    global_state["clip"] is None
+                ),
+                global_clip=np.asarray(
+                    0.0
+                    if global_state["clip"] is None
+                    else global_state["clip"],
+                    dtype=np.float64,
+                ),
+                global_mean=global_state["mean"],
+                global_m2=global_state["m2"],
+                global_count=np.asarray(
+                    global_state["count"], dtype=np.int64
+                ),
+                global_update_calls=np.asarray(
+                    global_state["update_calls"], dtype=np.int64
+                ),
+                global_frozen=np.asarray(global_state["frozen"]),
+            )
+        temporary.replace(target)
         return target
 
-    def load_normalizers(self, path: str | Path) -> None:
+    def load_normalizers(
+        self, path: str | Path, *, require_frozen: bool = False
+    ) -> None:
         source = Path(path)
-        with np.load(source, allow_pickle=False) as saved:
-            topology_hash = str(saved["topology_hash"].item())
-            mapping_hash = str(saved["mapping_hash"].item())
-            if topology_hash != self.topology.topology_hash:
-                raise ObservationContractError(
-                    "saved normalizer topology hash mismatch"
+        if not source.is_file():
+            raise ObservationContractError(
+                f"state normalizer snapshot does not exist: {source}"
+            )
+        try:
+            with np.load(source, allow_pickle=False) as saved:
+                expected_scalars = {
+                    "snapshot_version": OBSERVATION_NORMALIZER_SNAPSHOT_VERSION,
+                    "observation_version": OBSERVATION_VERSION,
+                    "topology_version": TOPOLOGY_VERSION,
+                    "topology_hash": self.topology.topology_hash,
+                    "mapping_hash": self.topology.mapping_hash,
+                }
+                for key, expected in expected_scalars.items():
+                    actual = str(saved[key].item())
+                    if actual != expected:
+                        raise ObservationContractError(
+                            f"saved state normalizer {key} mismatch: "
+                            f"saved={actual!r}, current={expected!r}"
+                        )
+                expected_features = {
+                    "local_feature_names": LOCAL_FEATURE_NAMES,
+                    "global_feature_names": GLOBAL_FEATURE_NAMES,
+                    "relation_feature_names": RELATION_FEATURE_NAMES,
+                }
+                for key, expected in expected_features.items():
+                    actual = tuple(str(value) for value in saved[key].tolist())
+                    if actual != tuple(expected):
+                        raise ObservationContractError(
+                            f"saved state normalizer {key} order mismatch: "
+                            f"saved={actual!r}, current={tuple(expected)!r}"
+                        )
+                expected_dims = {
+                    "local_dim": LOCAL_DIM,
+                    "global_dim": GLOBAL_DIM,
+                    "relation_dim": RELATION_DIM,
+                }
+                for key, expected in expected_dims.items():
+                    actual = int(saved[key].item())
+                    if actual != expected:
+                        raise ObservationContractError(
+                            f"saved state normalizer {key} mismatch: "
+                            f"saved={actual}, current={expected}"
+                        )
+
+                local_clip = (
+                    None
+                    if bool(saved["local_clip_is_none"].item())
+                    else float(saved["local_clip"].item())
                 )
-            if mapping_hash != self.topology.mapping_hash:
-                raise ObservationContractError(
-                    "saved normalizer mapping hash mismatch"
+                global_clip = (
+                    None
+                    if bool(saved["global_clip_is_none"].item())
+                    else float(saved["global_clip"].item())
                 )
-            self.local_normalizer.load_state_dict(
-                {
+                local_state = {
                     "dim": LOCAL_DIM,
-                    "mean": saved["local_mean"],
-                    "m2": saved["local_m2"],
+                    "epsilon": float(saved["local_epsilon"].item()),
+                    "clip": local_clip,
+                    "mean": saved["local_mean"].copy(),
+                    "m2": saved["local_m2"].copy(),
                     "count": int(saved["local_count"].item()),
                     "update_calls": int(saved["local_update_calls"].item()),
                     "frozen": bool(saved["local_frozen"].item()),
                 }
-            )
-            self.global_normalizer.load_state_dict(
-                {
+                global_state = {
                     "dim": GLOBAL_DIM,
-                    "mean": saved["global_mean"],
-                    "m2": saved["global_m2"],
+                    "epsilon": float(saved["global_epsilon"].item()),
+                    "clip": global_clip,
+                    "mean": saved["global_mean"].copy(),
+                    "m2": saved["global_m2"].copy(),
                     "count": int(saved["global_count"].item()),
-                    "update_calls": int(saved["global_update_calls"].item()),
+                    "update_calls": int(
+                        saved["global_update_calls"].item()
+                    ),
                     "frozen": bool(saved["global_frozen"].item()),
                 }
+                env_steps = int(saved["env_steps"].item())
+        except ObservationContractError:
+            raise
+        except (KeyError, OSError, TypeError, ValueError) as error:
+            raise ObservationContractError(
+                f"invalid state normalizer snapshot: path={source}, error={error}"
+            ) from error
+
+        local_candidate = RunningFeatureNormalizer(
+            LOCAL_DIM,
+            epsilon=self.local_normalizer.epsilon,
+            clip=self.local_normalizer.clip,
+        )
+        global_candidate = RunningFeatureNormalizer(
+            GLOBAL_DIM,
+            epsilon=self.global_normalizer.epsilon,
+            clip=self.global_normalizer.clip,
+        )
+        local_candidate.load_state_dict(local_state)
+        global_candidate.load_state_dict(global_state)
+        if env_steps < 0:
+            raise ObservationContractError(
+                "saved state normalizer env_steps must be non-negative"
             )
-            self.env_steps = int(saved["env_steps"].item())
+        if require_frozen and not (
+            local_candidate.frozen
+            and global_candidate.frozen
+            and local_candidate.count > 0
+            and global_candidate.count > 0
+        ):
+            raise ObservationContractError(
+                "warm-up bypass requires populated, frozen local and global "
+                "state normalizers"
+            )
+
+        self.local_normalizer.load_state_dict(local_state)
+        self.global_normalizer.load_state_dict(global_state)
+        self.env_steps = env_steps

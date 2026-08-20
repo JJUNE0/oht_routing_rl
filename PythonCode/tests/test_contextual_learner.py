@@ -33,12 +33,20 @@ def make_replay(count=12, seed=3):
             + step
         )[:, None]
         applied = 0.1 * policy
+        previous_policy = np.sin(
+            np.arange(len(topology.controlled_rail_ids), dtype=np.float32)
+            + max(step - 1, 0)
+        )[:, None]
         reward = np.tanh(
             np.arange(len(topology.controlled_rail_ids), dtype=np.float32)
             / 100 + step
         )
         replay.push(replace(
-            snapshot, policy_action=policy, applied_action=applied,
+            snapshot,
+            previous_applied_action=0.1 * previous_policy,
+            policy_action=policy,
+            applied_action=applied,
+            next_previous_applied_action=applied,
             reward=reward,
         ))
     return replay
@@ -138,6 +146,52 @@ class ContextualLearnerTests(unittest.TestCase):
         self.assertEqual(len(captured), 1)
         torch.testing.assert_close(captured[0], batch.applied_action)
         self.assertFalse(torch.equal(captured[0], batch.policy_action))
+
+    def test_actor_and_critics_receive_aligned_previous_applied_action(self):
+        learner = ContextualTD7Learner(
+            make_replay(),
+            network_config=SMALL_NETWORK,
+            config=replace(self.config(), policy_update_delay=1),
+            seed=41,
+        )
+        batch = learner.replay.sample(16)
+        online_actor_previous = []
+        online_critic_previous = []
+        target_actor_previous = []
+
+        def capture(target):
+            def hook(module, args, kwargs):
+                target.append(kwargs["previous_action"].detach().clone())
+            return hook
+
+        handles = (
+            learner.actor.register_forward_pre_hook(
+                capture(online_actor_previous), with_kwargs=True
+            ),
+            learner.critic.register_forward_pre_hook(
+                capture(online_critic_previous), with_kwargs=True
+            ),
+            learner.target_actor.register_forward_pre_hook(
+                capture(target_actor_previous), with_kwargs=True
+            ),
+        )
+        try:
+            learner.update(batch)
+        finally:
+            for handle in handles:
+                handle.remove()
+
+        self.assertEqual(len(online_actor_previous), 1)
+        self.assertGreaterEqual(len(online_critic_previous), 2)
+        self.assertEqual(len(target_actor_previous), 1)
+        torch.testing.assert_close(
+            online_actor_previous[0], batch.previous_applied_action
+        )
+        for value in online_critic_previous:
+            torch.testing.assert_close(value, batch.previous_applied_action)
+        torch.testing.assert_close(
+            target_actor_previous[0], batch.next_previous_applied_action
+        )
 
     def test_target_critic_receives_scaled_policy_action(self):
         learner = ContextualTD7Learner(

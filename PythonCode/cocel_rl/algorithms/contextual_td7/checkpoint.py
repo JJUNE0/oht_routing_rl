@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import random
+import re
 from dataclasses import asdict
 from pathlib import Path
 
@@ -21,6 +22,12 @@ from .stacking import STACK_VERSION
 CHECKPOINT_VERSION = (
     "contextual_td7_checkpoint_v7_locked_reward_profile"
 )
+RESUME_REPLAY_REFILL_VERSION = (
+    "contextual_resume_replay_refill_v3_optional_full_capacity"
+)
+RESUME_DETERMINISTIC_EPISODE_VERSION = (
+    "contextual_resume_deterministic_first_episode_v1"
+)
 LEGACY_CHECKPOINT_VERSIONS = {
     "contextual_td7_checkpoint_v3_independent_twin_critic",
 }
@@ -29,6 +36,75 @@ CRITIC_INITIALIZATION = "independent"
 
 class ContextualCheckpointError(RuntimeError):
     pass
+
+
+_ADDITIVE_RESUME_RUNTIME_METADATA = {
+    "action_scale_schedule_version",
+    "state_normalizer_snapshot_version",
+    "warmup_episode_transition_version",
+    "terminate_on_warmup_complete",
+    "reward_normalizer_snapshot_version",
+    "tat_termination_policy_version",
+    "tat_termination_policy",
+    "tat_termination_configured_start_episode",
+    "resume_replay_refill_version",
+    "resume_deterministic_episode_version",
+}
+_RUNTIME_CONFIG_BACKED_RESUME_METADATA = {
+    "tat_termination_enabled",
+    "tat_termination_grace_steps",
+    "early_stop_tat_threshold",
+    "tat_above_threshold_patience",
+    "tat_termination_inclusive",
+}
+
+
+def _resume_algorithm_versions_compatible(saved, runtime) -> bool:
+    """Accept only known resume-lifecycle changes to an algorithm identity."""
+    if not isinstance(saved, str) or not isinstance(runtime, str):
+        return False
+    # Checkpoints written before the lifecycle fields were added end at the
+    # stack identity. All model/reward/observation contracts are still checked
+    # independently below.
+    if runtime.startswith(saved + "_"):
+        return True
+
+    def normalize(value):
+        value = re.sub(
+            r"rewardnormreuse[01]", "rewardnormreuse*", value
+        )
+        value = re.sub(r"_ep\d+_", "_ep*_", value)
+        value = re.sub(r"normreuse[01]", "normreuse*", value)
+        value = re.sub(r"detfirst[01]", "detfirst*", value)
+        return re.sub(r"fullrefill[01]", "fullrefill*", value)
+
+    return normalize(saved) == normalize(runtime)
+
+
+def _resume_runtime_metadata_transition_allowed(key, saved, runtime) -> bool:
+    """Allow additive metadata and intentional normalizer-resume transitions."""
+    if key == "algorithm_version":
+        return _resume_algorithm_versions_compatible(saved, runtime)
+    if key in {
+        "resume_inference_until_replay_full",
+        "resume_deterministic_first_episode",
+    }:
+        return isinstance(runtime, bool) and (
+            saved is None or isinstance(saved, bool)
+        )
+    if key == "resume_refill_target_env_steps":
+        return runtime > 0 and (saved is None or int(saved) > 0)
+    if key in _ADDITIVE_RESUME_RUNTIME_METADATA:
+        return saved is None
+    if key == "state_normalizer_warmup_bypass":
+        return runtime is True and saved in (None, False)
+    if key == "effective_warmup_steps":
+        return runtime == 0 and (saved is None or int(saved) >= 0)
+    if key == "reward_normalizer_reuse":
+        return runtime is True and saved in (None, False)
+    if key == "tat_termination_start_episode":
+        return runtime == 1 and (saved is None or int(saved) >= 1)
+    return False
 
 
 def read_contextual_runtime_config(path) -> tuple[dict, bool]:
@@ -240,6 +316,8 @@ def load_contextual_checkpoint(
     observation_builder,
     reward_builder,
     expected_runtime_metadata=None,
+    allow_resume_metadata_upgrade=False,
+    allowed_learner_config_overrides=(),
     exploration_rng=None,
     exploration_seed=0,
 ) -> None:
@@ -291,12 +369,32 @@ def load_contextual_checkpoint(
             "resume_requires_replay_refill": True,
         },
     }
+    allowed_learner_config_overrides = frozenset(
+        allowed_learner_config_overrides
+    )
     for key, value in expected.items():
-        if payload.get(key) != value:
-            raise ContextualCheckpointError(
-                f"checkpoint {key} mismatch: saved={payload.get(key)!r}, "
-                f"runtime={value!r}"
-            )
+        saved = payload.get(key)
+        if saved == value:
+            continue
+        if key == "learner_config" and allowed_learner_config_overrides:
+            saved_config = dict(saved or {})
+            runtime_config = dict(value)
+            differing = {
+                name
+                for name in set(saved_config) | set(runtime_config)
+                if saved_config.get(name) != runtime_config.get(name)
+            }
+            if differing and differing <= allowed_learner_config_overrides:
+                print(
+                    "[checkpoint-compat] accepted learner config override: "
+                    + ",".join(sorted(differing)),
+                    flush=True,
+                )
+                continue
+        raise ContextualCheckpointError(
+            f"checkpoint {key} mismatch: saved={saved!r}, "
+            f"runtime={value!r}"
+        )
     expected_reward = {
         "reward_version": reward_builder.reward_version,
         "reward_contract_version": reward_builder.reward_contract_version,
@@ -319,13 +417,35 @@ def load_contextual_checkpoint(
                 "symmetric twin-critic checkpoint resume refused: "
                 f"{state_key} has identical Q1/Q2 parameters"
             )
+    upgraded_runtime_metadata = []
+    saved_runtime_config = dict(payload.get("runtime_config", {}) or {})
     for key, value in dict(expected_runtime_metadata or {}).items():
         saved = payload.get("runtime_metadata", {}).get(key)
-        if saved != value:
-            raise ContextualCheckpointError(
-                f"checkpoint runtime metadata {key} mismatch: "
-                f"saved={saved!r}, runtime={value!r}"
-            )
+        if saved == value:
+            continue
+        if (
+            allow_resume_metadata_upgrade
+            and saved is None
+            and key in _RUNTIME_CONFIG_BACKED_RESUME_METADATA
+            and saved_runtime_config.get(key) == value
+        ):
+            upgraded_runtime_metadata.append(key)
+            continue
+        if allow_resume_metadata_upgrade and (
+            _resume_runtime_metadata_transition_allowed(key, saved, value)
+        ):
+            upgraded_runtime_metadata.append(key)
+            continue
+        raise ContextualCheckpointError(
+            f"checkpoint runtime metadata {key} mismatch: "
+            f"saved={saved!r}, runtime={value!r}"
+        )
+    if upgraded_runtime_metadata:
+        print(
+            "[checkpoint-compat] accepted resume-only metadata upgrade: "
+            + ",".join(upgraded_runtime_metadata),
+            flush=True,
+        )
     learner.encoder.load_state_dict(payload["online_encoder"])
     learner.actor.load_state_dict(payload["online_actor"])
     learner.critic.load_state_dict(payload["online_critic"])

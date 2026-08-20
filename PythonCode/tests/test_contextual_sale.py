@@ -31,9 +31,16 @@ def sale_replay(lap=False):
     for step in range(8):
         snapshot = make_snapshot(topology, step)
         policy = np.sin(rows + step)[:, None]
+        applied = 0.05 * policy
+        previous_applied = 0.05 * np.sin(
+            rows + max(step - 1, 0)
+        )[:, None]
         replay.push(replace(
-            snapshot, policy_action=policy,
-            applied_action=0.05 * policy,
+            snapshot,
+            previous_applied_action=previous_applied,
+            policy_action=policy,
+            applied_action=applied,
+            next_previous_applied_action=applied,
             reward=np.tanh(rows / 1000 + step),
         ))
     return replay
