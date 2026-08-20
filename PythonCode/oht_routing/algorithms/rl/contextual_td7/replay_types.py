@@ -25,9 +25,8 @@ class ContextualStepSnapshot:
     episode_id: int
     topology_hash: str
     mapping_hash: str
-    observation_version: str
+    version: str
     reward_version: str
-    action_version: str
 
 
 @dataclass(frozen=True)

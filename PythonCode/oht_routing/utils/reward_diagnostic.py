@@ -9,8 +9,8 @@ from pathlib import Path
 
 import numpy as np
 
+from oht_routing.version import CONTEXTUAL_VERSION
 
-DIAGNOSTIC_SCHEMA_VERSION = "contextual_reward_diagnostic_v24_n_only"
 DEFAULT_DIAGNOSTIC_WINDOWS = (
     (0, 1_000, "00000_01000"),
     (10_000, 11_000, "10000_11000"),
@@ -561,7 +561,7 @@ class RewardDiagnosticWriter:
         if window is None:
             return None
         payload = dict(record)
-        payload["schema_version"] = DIAGNOSTIC_SCHEMA_VERSION
+        payload["version"] = CONTEXTUAL_VERSION
         payload["diagnostic_window"] = window
         return self._append("reward_step", window, payload)
 
@@ -570,7 +570,7 @@ class RewardDiagnosticWriter:
         if window is None:
             return None
         payload = dict(record)
-        payload["schema_version"] = DIAGNOSTIC_SCHEMA_VERSION
+        payload["version"] = CONTEXTUAL_VERSION
         payload["diagnostic_window"] = window
         self._cycle_records[window].append(_json_safe(payload))
         return self._append("rail_cycle", window, payload)

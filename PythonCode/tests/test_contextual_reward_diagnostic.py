@@ -8,11 +8,11 @@ import numpy as np
 
 from oht_routing.mdp.reward.builder import ContextualRewardBuilder, ContextualRewardConfig
 from oht_routing.utils.reward_diagnostic import (
-    DIAGNOSTIC_SCHEMA_VERSION,
     RewardDiagnosticWriter,
     diagnostic_window_name,
     parse_diagnostic_windows,
 )
+from oht_routing.version import CONTEXTUAL_VERSION
 from test_contextual_reward import completion, rail_pass, rail_tat_client
 
 
@@ -47,7 +47,7 @@ class ContextualRewardDiagnosticTests(unittest.TestCase):
             self.assertIsNone(records[0]["value"])
             self.assertEqual(records[1]["value"], 2.0)
             self.assertTrue(all(
-                item["schema_version"] == DIAGNOSTIC_SCHEMA_VERSION
+                item["version"] == CONTEXTUAL_VERSION
                 for item in records
             ))
 

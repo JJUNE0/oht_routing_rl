@@ -4,8 +4,9 @@ from unittest.mock import patch
 
 import torch
 
+from oht_dispatching.config import DISPATCH_COST, DISPATCH_FIRST_MATCH
 from oht_routing.runtime.client import ContextualRuntimeConfig
-from oht_routing.routing.dispatch import DISPATCH_COST, DISPATCH_FIRST_MATCH
+from oht_routing.runtime.config_validation import make_reward_config
 from oht_routing.mdp.reward.config import (
     RAIL_REWARD_FREE_FLOW_NEUTRAL_2,
     REWARD_VERSION,
@@ -53,7 +54,7 @@ class ContextualVariantTests(unittest.TestCase):
         self.assertEqual(config.tat_termination_grace_steps, 10_000)
         self.assertEqual(config.tat_above_threshold_patience, 300)
         self.assertEqual(config.terminal_tat_penalty, -20.0)
-        reward = config.make_reward_config()
+        reward = make_reward_config(config)
         self.assertEqual(reward.tat_weight, 11.0)
         self.assertEqual(reward.op_weight, 4.0)
         self.assertEqual(reward.backlog_weight, 0.0004)

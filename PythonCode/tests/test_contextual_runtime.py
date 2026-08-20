@@ -18,7 +18,7 @@ from oht_routing.runtime.client import (
     ClientAlgorithm,
     ContextualRuntimeConfig,
 )
-from oht_routing.routing.dispatch import DISPATCH_COST
+from oht_dispatching.config import DISPATCH_COST
 from oht_routing.mdp.action import EXP_RESIDUAL
 from oht_routing.mdp.observation import ContextualObservationBatch
 from test_contextual_observation import (
@@ -110,6 +110,25 @@ class ContextualRuntimeTests(unittest.TestCase):
                 pclient.RAILLINECOST_DIC[int(rail_id)].FRailLineCost
                 for rail_id in runtime.topology.all_rail_ids
             ]
+        )
+
+    def test_default_runtime_artifact_paths(self):
+        runtime = ClientAlgorithm(ContextualRuntimeConfig(device="cpu"))
+        project_root = Path(__file__).resolve().parents[2]
+        topology_cache_dir = (
+            project_root / "PythonCode" / "oht_routing" / "topology" / "cache"
+        )
+        self.assertEqual(
+            runtime.cache_path,
+            topology_cache_dir / "contextual_topology_cache.npz",
+        )
+        self.assertEqual(
+            runtime.audit_path,
+            topology_cache_dir / "topology_neighbor_audit.json",
+        )
+        self.assertEqual(
+            runtime.checkpoint_root,
+            project_root / "checkpoints" / runtime.checkpoint_variant,
         )
 
     def test_baseline_tick_builds_observation_exactly_once_and_is_finite(self):
@@ -219,8 +238,8 @@ class ContextualRuntimeTests(unittest.TestCase):
             int(rail_id): float(result.final_cost[row])
             for row, rail_id in enumerate(runtime.topology.all_rail_ids)
         }
-        self.assertTrue(runtime.dispatch_cost_ready)
-        self.assertEqual(runtime.latest_dispatch_live_cost_by_rail, expected)
+        self.assertTrue(runtime.dispatcher.costs_ready)
+        self.assertEqual(runtime.dispatcher.rail_costs, expected)
 
     def test_rail_dictionary_order_does_not_change_cost_alignment(self):
         first = self.runtime()

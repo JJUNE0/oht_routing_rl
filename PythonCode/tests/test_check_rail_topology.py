@@ -103,6 +103,17 @@ class FakePClient:
 
 
 class CheckRailTopologyTests(unittest.TestCase):
+    def test_default_output_dir_is_fixed_topology_cache_directory(self):
+        project_root = Path(__file__).resolve().parents[2]
+        self.assertEqual(
+            check_rail_topology.DEFAULT_OUTPUT_DIR,
+            project_root
+            / "PythonCode"
+            / "oht_routing"
+            / "topology"
+            / "cache",
+        )
+
     def run_audit(
         self,
         graph,

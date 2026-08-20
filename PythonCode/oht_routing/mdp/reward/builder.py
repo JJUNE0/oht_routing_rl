@@ -270,18 +270,6 @@ class ContextualRewardBuilder(ContextualRailRewardMixin):
     def reward_version(self) -> str:
         return self.config.contract.version
 
-    @property
-    def reward_contract_version(self) -> str:
-        return self.config.contract.contract_version
-
-    @property
-    def reward_tat_version(self) -> str:
-        return self.config.contract.tat_version
-
-    @property
-    def reward_normalization_version(self) -> str:
-        return self.config.contract.normalization_version
-
     def _reset_temporal(self) -> None:
         self._total_completed_jobs = 0.0
         self._prev_op_rate: float | None = None

@@ -9,11 +9,6 @@ from numbers import Integral
 import torch
 
 
-STACK_VERSION = (
-    "contextual_latent_obs_previous_current_applied_action_stack_v3"
-)
-
-
 def validate_stack_config(num_stacks: int, stack_interval: int) -> tuple[int, int]:
     values = {
         "num_stacks": num_stacks,

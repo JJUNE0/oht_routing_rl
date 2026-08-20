@@ -13,7 +13,7 @@ HOST = "127.0.0.1"
 EXPECTED_SIMULATION_STATES = {0, 1, 2, 3, 4, 5, 6}
 
 
-def _run_session(connection, address, port, args, client, reporter):
+def _run_session(connection, address, port, args, client):
     print(
         "[contextual-runtime] TCP accepted; "
         f"starting PClient initialization handshake: {address}"
@@ -23,11 +23,12 @@ def _run_session(connection, address, port, args, client, reporter):
     pclient = PClient.PClient(connection, sim_end_time=args.sim_end_time)
     client.on_new_connection()
     print(datetime.now().strftime("%Y.%m.%d - %H:%M:%S"))
-    print("[contextual-runtime] PClient initialization completed")
-    print("Socket ??筌먦끉裕?? ???ㅼ뒦???筌???????")
-    print(HOST)
-    print(port)
-    pclient.WriteAdminLog("Socket ??筌먦끉裕?? ???ㅼ뒦???筌??????? ")
+    message = (
+        "[contextual-runtime] PClient initialization completed: "
+        f"peer={address}, listen={HOST}:{port}"
+    )
+    print(message)
+    pclient.WriteAdminLog(message)
 
     command_count = 0
     while True:
@@ -48,22 +49,19 @@ def _run_session(connection, address, port, args, client, reporter):
             command,
             pclient,
             client,
-            reporter,
             sim_end_time=args.sim_end_time,
             console_log_interval=args.console_log_interval,
         )
 
 
-def _accept_sessions(server, port, args, client, reporter):
+def _accept_sessions(server, port, args, client):
     while True:
         print(datetime.now().strftime("%Y.%m.%d - %H:%M:%S"))
         print(f"[contextual-runtime] waiting on {HOST}:{port}")
         connection, address = server.accept()
         with connection:
             try:
-                _run_session(
-                    connection, address, port, args, client, reporter
-                )
+                _run_session(connection, address, port, args, client)
             except ContextualTrainingFailure:
                 raise
             except (ConnectionError, IndexError):
@@ -80,7 +78,7 @@ def _accept_sessions(server, port, args, client, reporter):
                 print("[contextual-runtime] session failed; waiting for reconnect")
 
 
-def serve_contextual(args, client, reporter):
+def serve_contextual(args, client):
     """Serve simulator sessions until interrupted or training fails."""
     port = read_port()
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -88,7 +86,7 @@ def serve_contextual(args, client, reporter):
     server.bind((HOST, port))
     server.listen(1)
     try:
-        _accept_sessions(server, port, args, client, reporter)
+        _accept_sessions(server, port, args, client)
     except ContextualTrainingFailure as error:
         client.wandb_logger.finish_failed(error, client.failure_env_step)
         raise

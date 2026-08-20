@@ -5,7 +5,9 @@ OHT와 job의 할당·선택 로직을 담는 독립 패키지다.
 - `oht_routing`: rail/path 비용과 경로 제어
 - `oht_dispatching`: job-to-OHT 할당과 dispatch 정책
 
-현재 contextual runtime의 command 6 선택 계약은
-`oht_routing/routing/dispatch.py`에 유지한다. 디스패칭 구현을 정리할
-때 이 패키지로 옮기며, 그 전까지는 양쪽 패키지 사이의 순환 import를
-만들지 않는다.
+- `config.py`: dispatch mode와 선택 계약 버전
+- `selector.py`: OHT 후보 생성, first-match/cost 선택, 진단 상태
+
+runtime은 command 0에서 계산한 rail cost snapshot을 dispatcher에
+전달하고, command 6에서는 simulator의 job/OHT 목록을 넘겨 할당 결과만
+받는다.

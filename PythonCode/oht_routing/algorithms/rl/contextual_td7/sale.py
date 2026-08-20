@@ -13,9 +13,6 @@ from .networks import DirectionalContextEncoder
 from .stacking import encode_observation_stack, flatten_state_stack
 
 
-SALE_VERSION = "contextual_sale_stacked_avg_l1_v2"
-
-
 def avg_l1_norm(value: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     scale = value.abs().mean(dim=-1, keepdim=True).clamp_min(eps)
     result = value / scale

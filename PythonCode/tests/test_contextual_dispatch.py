@@ -3,13 +3,14 @@ from types import SimpleNamespace
 
 import numpy as np
 
+from oht_dispatching import (
+    DISPATCH_COST,
+    DISPATCH_FIRST_MATCH,
+    OHTDispatcher,
+)
 from oht_routing.runtime.client import (
     ClientAlgorithm,
     ContextualRuntimeConfig,
-)
-from oht_routing.routing.dispatch import (
-    DISPATCH_COST,
-    DISPATCH_FIRST_MATCH,
 )
 
 
@@ -42,14 +43,11 @@ def make_runtime(dispatch_mode):
         device="cpu", dispatch_mode=dispatch_mode
     )
     runtime.total_steps = 0
-    runtime.latest_dispatch_live_cost_by_rail = {}
-    runtime.latest_dispatch_cost_tick = None
-    runtime.dispatch_cost_ready = False
+    runtime.dispatcher = OHTDispatcher(dispatch_mode)
     runtime.last_diagnostics = {}
     runtime.parameterDw = {}
     runtime.parameterPassTimes = {}
     runtime.parameterC = {}
-    runtime._reset_dispatch_diagnostics()
     return runtime
 
 
@@ -67,10 +65,10 @@ class ContextualDispatchTests(unittest.TestCase):
             10: make_oht([1, 2, 9]),
             20: make_oht([3, 9]),
         })
-        runtime.latest_dispatch_live_cost_by_rail = {
+        runtime.dispatcher.rail_costs = {
             1: 10.0, 2: 10.0, 3: 1.0, 9: 1.0,
         }
-        runtime.dispatch_cost_ready = True
+        runtime.dispatcher.costs_ready = True
 
         assigned = runtime.Assign(pclient, [make_job()])
 
@@ -106,7 +104,7 @@ class ContextualDispatchTests(unittest.TestCase):
             10: make_oht([1, 2, 9, 50]),
             20: make_oht([3, 9, 60]),
         })
-        runtime.latest_dispatch_live_cost_by_rail = {
+        runtime.dispatcher.rail_costs = {
             1: 10.0,
             2: 10.0,
             3: 1.0,
@@ -115,7 +113,7 @@ class ContextualDispatchTests(unittest.TestCase):
             50: 0.0,
             60: 1000.0,
         }
-        runtime.dispatch_cost_ready = True
+        runtime.dispatcher.costs_ready = True
 
         assigned = runtime.Assign(pclient, [make_job()])
 
@@ -178,8 +176,8 @@ class ContextualDispatchTests(unittest.TestCase):
             20: make_oht([9]),
             10: make_oht([9]),
         })
-        runtime.latest_dispatch_live_cost_by_rail = {1: 0.0, 9: 1.0}
-        runtime.dispatch_cost_ready = True
+        runtime.dispatcher.rail_costs = {1: 0.0, 9: 1.0}
+        runtime.dispatcher.costs_ready = True
 
         assigned = runtime.Assign(pclient, [make_job()])
 
@@ -242,10 +240,10 @@ class ContextualDispatchTests(unittest.TestCase):
         for invalid_cost in (None, np.nan, np.inf, -1.0):
             with self.subTest(invalid_cost=invalid_cost):
                 runtime = make_runtime(DISPATCH_COST)
-                runtime.latest_dispatch_live_cost_by_rail = {9: 1.0}
+                runtime.dispatcher.rail_costs = {9: 1.0}
                 if invalid_cost is not None:
-                    runtime.latest_dispatch_live_cost_by_rail[1] = invalid_cost
-                runtime.dispatch_cost_ready = True
+                    runtime.dispatcher.rail_costs[1] = invalid_cost
+                runtime.dispatcher.costs_ready = True
                 pclient = SimpleNamespace(
                     OHT_DIC={10: make_oht([1, 9])}
                 )
@@ -360,23 +358,23 @@ class ContextualDispatchTests(unittest.TestCase):
 
     def test_cost_snapshot_is_frozen_and_reset_clears_it(self):
         runtime = make_runtime(DISPATCH_COST)
-        runtime.topology = SimpleNamespace(
-            all_rail_ids=np.asarray([1, 2], dtype=np.int64)
-        )
         runtime.total_steps = 7
         costs = np.asarray([3.0, 4.0])
-        runtime._capture_dispatch_cost_snapshot(costs)
+        runtime.dispatcher.capture_cost_snapshot(
+            np.asarray([1, 2], dtype=np.int64),
+            costs,
+            runtime.total_steps,
+        )
         costs[:] = 99.0
 
         self.assertEqual(
-            runtime.latest_dispatch_live_cost_by_rail,
+            runtime.dispatcher.rail_costs,
             {1: 3.0, 2: 4.0},
         )
-        self.assertEqual(runtime.latest_dispatch_cost_tick, 7)
-        self.assertEqual(runtime._dispatch_cost_snapshot_step, 7)
+        self.assertEqual(runtime.dispatcher.cost_snapshot_step, 7)
         runtime.total_steps = 9
         self.assertEqual(
-            runtime._dispatch_diagnostics()[
+            runtime.dispatcher.diagnostics(runtime.total_steps)[
                 "dispatch/cost_snapshot_age_steps"
             ],
             2.0,
@@ -396,10 +394,9 @@ class ContextualDispatchTests(unittest.TestCase):
         runtime.reward_builder = None
         runtime.Reset(SimpleNamespace())
 
-        self.assertFalse(runtime.dispatch_cost_ready)
-        self.assertEqual(runtime.latest_dispatch_live_cost_by_rail, {})
-        self.assertIsNone(runtime.latest_dispatch_cost_tick)
-        self.assertIsNone(runtime._dispatch_cost_snapshot_step)
+        self.assertFalse(runtime.dispatcher.costs_ready)
+        self.assertEqual(runtime.dispatcher.rail_costs, {})
+        self.assertIsNone(runtime.dispatcher.cost_snapshot_step)
 
 
 if __name__ == "__main__":

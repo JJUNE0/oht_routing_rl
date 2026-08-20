@@ -1,5 +1,4 @@
 from .config import (
-    ALGORITHM_VERSION,
     ContextualLearnerConfig,
     ContextualNetworkConfig,
     contextual_algorithm_variant,
@@ -25,7 +24,6 @@ from .replay_buffer import (
     REPLAY_SAMPLING_RANDOM_RAIL,
     REPLAY_SAMPLING_RAIL,
     REPLAY_SAMPLING_SNAPSHOT,
-    REPLAY_SAMPLING_VERSION,
     snapshot_from_transition,
 )
 from .replay_types import (
@@ -33,29 +31,24 @@ from .replay_types import (
     ContextualStepSnapshot,
     ReplaySampleKey,
 )
-from .learner import ContextualTD7Learner, LEARNER_VERSION
+from .learner import ContextualTD7Learner
 from .learner_types import ContextualLearnerUpdate
 from .targets import bellman_target, scale_policy_action, target_applied_action
 from .checkpoint import (
-    CHECKPOINT_VERSION,
     CRITIC_INITIALIZATION,
-    RESUME_DETERMINISTIC_EPISODE_VERSION,
-    RESUME_REPLAY_REFILL_VERSION,
+    PROMOTED_CHECKPOINTS,
     ContextualCheckpointError,
     load_contextual_checkpoint,
     read_contextual_runtime_config,
     save_contextual_checkpoint,
 )
-from .replay_buffer import LAP_VERSION
 from .sale import (
-    SALE_VERSION,
     SALEOnline,
     SALEStateActionEncoder,
     SALEStateEncoder,
     avg_l1_norm,
 )
 from .stacking import (
-    STACK_VERSION,
     ContextualObservationHistory,
     encode_observation_stack,
     flatten_action_stack,
@@ -68,7 +61,6 @@ from .stacking import (
 
 __all__ = [
     "ActorOutput",
-    "ALGORITHM_VERSION",
     "ContextualActor",
     "ContextualEncoding",
     "ContextualNetworkConfig",
@@ -88,31 +80,24 @@ __all__ = [
     "REPLAY_SAMPLING_RANDOM_RAIL",
     "REPLAY_SAMPLING_RAIL",
     "REPLAY_SAMPLING_SNAPSHOT",
-    "REPLAY_SAMPLING_VERSION",
     "ReplaySampleKey",
     "snapshot_from_transition",
     "ContextualLearnerConfig",
     "ContextualLearnerUpdate",
     "ContextualTD7Learner",
-    "LEARNER_VERSION",
     "bellman_target",
     "scale_policy_action",
     "target_applied_action",
-    "CHECKPOINT_VERSION",
     "CRITIC_INITIALIZATION",
-    "RESUME_DETERMINISTIC_EPISODE_VERSION",
-    "RESUME_REPLAY_REFILL_VERSION",
+    "PROMOTED_CHECKPOINTS",
     "ContextualCheckpointError",
     "load_contextual_checkpoint",
     "read_contextual_runtime_config",
     "save_contextual_checkpoint",
-    "LAP_VERSION",
-    "SALE_VERSION",
     "SALEOnline",
     "SALEStateActionEncoder",
     "SALEStateEncoder",
     "avg_l1_norm",
-    "STACK_VERSION",
     "ContextualObservationHistory",
     "encode_observation_stack",
     "flatten_action_stack",

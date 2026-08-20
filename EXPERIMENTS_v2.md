@@ -1,11 +1,56 @@
 # Contextual TD7 v2 실험 기록
 
+## 2026-08-21 - v2.0.0 통합 버전 계약
+
+- `PythonCode/oht_routing/version.py`의 `v2.0.0`을 runtime, checkpoint,
+  W&B 실험 메타데이터의 단일 버전으로 정했다.
+- checkpoint에서 observation/action/replay/stack/SALE/LAP 개별 버전과
+  긴 algorithm/runtime lifecycle 문자열 비교를 제거했다.
+- 로드 호환성은 통합 버전, topology/mapping hash, network config,
+  action mode, SALE/LAP 사용 여부, reward version만 검사한다.
+- 기존 `step_400000.pt`는 SHA-256
+  `7c2d6a19184060584efeb69f52be57c3e7fffad33da52c8c1c879ed39db8bc2b`와
+  기존 checkpoint version이 모두 맞을 때만 `v2.0.0`으로 예외 승격한다.
+- 정상·crash checkpoint 구분과 twin-critic 무결성 검사는 안전성
+  검사로 계속 유지한다.
+- 실제 `step_400000.pt`를 현재 topology cache와 전체 로드해
+  env step 400000, episode 8, action scale 1.0 복원을 확인했고,
+  전체 unittest 254개가 통과했다.
+
+## 2026-08-21 - fixed topology cache directory
+
+- Fixed the runtime and topology-audit utility to use
+  `PythonCode/oht_routing/topology/cache/` for both
+  `contextual_topology_cache.npz` and `topology_neighbor_audit.json`.
+- The default checkpoint directory remains the repository-root `checkpoints/`
+  tree.
+- No topology, model, reward, observation, or checkpoint contract changed.
+
+## 2026-08-21 - actor-inference checkpoint load v1
+
+- Added `contextual_actor_inference_checkpoint_load_v1`.
+- Fixed `actor_inference` resume so the checkpoint actor, encoder, optional
+  SALE state, frozen observation normalizers, global environment step, and
+  episode are restored after simulator topology initialization.
+- Evaluation uses a lightweight replay context solely for strict checkpoint
+  validation; replay collection, learner updates, and checkpoint writes remain
+  disabled.
+- Startup output now labels checkpoint loading as deferred and shows the
+  configured action-scale schedule. A second `checkpoint-loaded` summary
+  reports the restored step and actual scale after loading.
+- Reward N, action mapping, observation schema, and checkpoint format remain
+  unchanged; existing v7/v8 Reward N checkpoints remain compatible.
+- Verification: the dedicated checkpoint-evaluation and fixed artifact-path
+  regressions passed, and the full unittest suite passed 255/255.
+
 이 파일은 `contextual-td7-v2` 브랜치의 코드 변경과 실험 결과만 기록한다.
 이전 Reward E~U 구현과 실험 이력은 `contextual-region-brl-v1` 브랜치와
 `EXPERIMENTS.md`에 보존한다.
 
 ## 기록 원칙
 
+- 모든 변경은 `PythonCode/oht_routing/version.py`의
+  `vMAJOR.MINOR.PATCH` 버전으로 분리하고 해당 버전 아래에 기록한다.
 - 실제 실행 전에 `PythonCode/oht_routing/utils/wandb_logging.py`의
   `EXP_META`를 먼저
   갱신한다.
@@ -189,3 +234,45 @@ Reward N run/checkpoint와 맞지 않는 오래된 기록이다. v2 기준값은
   W&B run은 시작하지 않았다.
 - 기본 CLI config build/seed와 `main.py` CLI를 확인했고,
   `test_contextual*.py` 249개가 통과했다.
+
+## 2026-08-21 - runtime config 검증과 smoke reporter 정리
+
+- `ContextualRuntimeConfig`에는 설정 필드와 세 파생 프로퍼티만 남기고,
+  reward/termination 해석, resume 검증, 학습 설정 검증과 reward config
+  생성을 `runtime/config_validation.py`로 분리했다.
+- dataclass 생성 시점의 fail-fast 동작은 얇은 `__post_init__` 연결부로
+  유지했다.
+- 로컬 JSON을 생성하던 `SmokeReporter`, 관련 CLI 옵션과
+  main/server/protocol의 reporter 전달 인자를 제거했다.
+- `cost/all_baseline_abs_error_max`,
+  `runtime/observation_build_calls_per_tick`, `runtime/nonfinite_count`를
+  compact W&B 및 CSV export schema에 추가했다.
+- W&B metric schema를 `contextual_wandb_compact_v11_n_only`로 올렸다.
+- Reward N, action, observation, replay 및 checkpoint 계약은 변경하지
+  않았으며 simulator와 W&B run은 시작하지 않았다.
+- 전체 테스트 252개가 통과했다.
+
+## 2026-08-21 - job-to-OHT dispatching 패키지 이동
+
+- dispatch mode와 선택 계약을 `oht_dispatching/config.py`로 옮겼다.
+- `ClientAlgorithm.Assign()`에 들어 있던 OHT 후보 생성, 호환성 검사,
+  first-match/cost 선택과 dispatch 진단 상태를
+  `oht_dispatching/selector.py`의 `OHTDispatcher`로 분리했다.
+- command 0 rail cost는 `dispatcher.rail_costs` snapshot으로 보관하고,
+  command 6에서만 cost 선택 입력으로 사용하도록 경계를 명시했다.
+- `ClientAlgorithm.Assign()`은 simulator의 OHT/job을 dispatcher에 전달하고
+  할당 결과와 진단값을 연결하는 얇은 adapter로 줄였다.
+- 기본 `first-match` 정책, cost 합산 및 tie-break 순서, assignment payload와
+  dispatch selection version은 변경하지 않았다.
+- 비어 있던 `oht_routing/routing` 패키지는 삭제하고 문서와 import를
+  `oht_dispatching` 기준으로 갱신했다.
+- simulator와 W&B run은 시작하지 않았으며 전체 테스트 252개가 통과했다.
+
+## 2026-08-21 - runtime 로그 인코딩 복구
+
+- `runtime/server.py`에 남아 있던 깨진 socket 연결 한글 문자열을
+  peer와 listen 주소를 포함한 단일 UTF-8 영문 로그로 교체했다.
+- Git 관리 대상과 신규 추가 텍스트 파일을 strict UTF-8 디코딩,
+  replacement character, 의도치 않은 CJK 문자와 mojibake 패턴으로
+  재검사했으며 추가 손상 문자열은 발견되지 않았다.
+- 실행 계약은 변경하지 않았으며 전체 테스트 252개가 통과했다.

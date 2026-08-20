@@ -13,14 +13,6 @@ MAX_SIMULATOR_COST = 16_777_215.99
 REGION_B_RL = "region_b_rl"
 EXP_RESIDUAL = "exp_residual"
 ACTION_MODES = (REGION_B_RL, EXP_RESIDUAL)
-ACTION_VERSIONS = {
-    REGION_B_RL: "contextual_region_b_rl_v1",
-    EXP_RESIDUAL: "contextual_exp_residual_v2",
-}
-EXPLORATION_SCHEDULE_VERSION = "contextual_exploration_linear_anneal_v1"
-ACTION_SCALE_SCHEDULE_VERSION = "contextual_action_scale_schedule_v2"
-# Default contract for standalone replay/test construction.
-ACTION_VERSION = ACTION_VERSIONS[REGION_B_RL]
 
 
 class ContextualActionError(FloatingPointError):
@@ -33,15 +25,6 @@ class ContextualActionResult:
     applied_controlled_action: np.ndarray
     final_cost: np.ndarray
     diagnostics: dict[str, float]
-
-
-def action_version(action_mode: str) -> str:
-    try:
-        return ACTION_VERSIONS[str(action_mode)]
-    except KeyError as error:
-        raise ContextualActionError(
-            f"action_mode must be one of {ACTION_MODES}, got {action_mode!r}"
-        ) from error
 
 
 def _finite_vector(name: str, values, expected_length: int) -> np.ndarray:
@@ -135,7 +118,10 @@ def apply_controlled_action(
     scale = float(action_scale)
     if not np.isfinite(scale) or scale < 0.0:
         raise ContextualActionError("action_scale must be finite and non-negative")
-    version = action_version(action_mode)
+    if action_mode not in ACTION_MODES:
+        raise ContextualActionError(
+            f"action_mode must be one of {ACTION_MODES}, got {action_mode!r}"
+        )
     controlled = _finite_vector(
         "controlled_action",
         np.asarray(controlled_action).reshape(-1),
@@ -218,9 +204,6 @@ def apply_controlled_action(
         "cost/controlled_ratio_mean": float(ratios.mean()),
         "cost/controlled_ratio_std": float(ratios.std()),
         "action/mode_region_b_rl": float(action_mode == REGION_B_RL),
-        "action/version_region_b_rl_v1": float(
-            version == ACTION_VERSIONS[REGION_B_RL]
-        ),
     }
     if b_rl is not None:
         diagnostics.update({

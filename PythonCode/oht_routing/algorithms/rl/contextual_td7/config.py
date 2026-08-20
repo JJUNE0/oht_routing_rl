@@ -5,11 +5,6 @@ from oht_routing.mdp.action import ACTION_MODES, REGION_B_RL
 from .stacking import validate_stack_config
 
 
-ALGORITHM_VERSION = (
-    "contextual_directional_td7_previous_applied_action_v3"
-)
-
-
 def contextual_algorithm_variant(sale_enabled: bool, lap_enabled: bool) -> str:
     return {
         (True, True): "contextual_td7_sale_lap_v3_prevact",

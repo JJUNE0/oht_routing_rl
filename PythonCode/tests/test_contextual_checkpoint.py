@@ -2,6 +2,7 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -12,12 +13,13 @@ from oht_routing.algorithms.rl.contextual_td7 import (
     ContextualTD7Learner,
 )
 from oht_routing.algorithms.rl.contextual_td7.checkpoint import (
-    CHECKPOINT_VERSION,
+    PROMOTED_CHECKPOINTS,
     ContextualCheckpointError,
     load_contextual_checkpoint,
     read_contextual_runtime_config,
     save_contextual_checkpoint,
 )
+from oht_routing.version import CONTEXTUAL_VERSION
 from oht_routing.mdp.observation import RunningFeatureNormalizer
 from oht_routing.mdp.reward.builder import ContextualRewardBuilder, ContextualRewardConfig
 from test_contextual_learner import SMALL_NETWORK
@@ -134,70 +136,7 @@ class ContextualCheckpointTests(unittest.TestCase):
                     reward_builder=target_reward,
                 )
 
-    def test_resume_only_runtime_metadata_upgrade_is_narrow(self):
-        learner, obs, reward = components()
-        legacy_metadata = {
-            "algorithm_version": "algorithm_core",
-            "state_normalizer_warmup_bypass": False,
-            "effective_warmup_steps": 10_000,
-            "reward_normalizer_reuse": False,
-            "tat_termination_start_episode": 2,
-            "early_stop_tat_threshold": 180.0,
-        }
-        expected = {
-            "algorithm_version": (
-                "algorithm_core_action_scale_schedule_v1_"
-                "rewardnormreuse1_ep1_normreuse1"
-            ),
-            "action_scale_schedule_version": "action_scale_schedule_v1",
-            "state_normalizer_snapshot_version": "state_snapshot_v1",
-            "state_normalizer_warmup_bypass": True,
-            "effective_warmup_steps": 0,
-            "warmup_episode_transition_version": "warmup_boundary_v1",
-            "terminate_on_warmup_complete": True,
-            "reward_normalizer_snapshot_version": "reward_snapshot_v1",
-            "reward_normalizer_reuse": True,
-            "tat_termination_policy_version": "tat_policy_v1",
-            "tat_termination_policy": "episode2_tat180",
-            "tat_termination_configured_start_episode": 2,
-            "tat_termination_start_episode": 1,
-            "early_stop_tat_threshold": 180.0,
-            "resume_inference_until_replay_full": False,
-            "resume_refill_target_env_steps": 100,
-            "resume_deterministic_first_episode": True,
-        }
-        with tempfile.TemporaryDirectory() as directory:
-            path = save_contextual_checkpoint(
-                Path(directory) / "legacy_lifecycle.pt",
-                learner,
-                observation_builder=obs,
-                reward_builder=reward,
-                runtime_metadata=legacy_metadata,
-            )
-            load_contextual_checkpoint(
-                path,
-                learner,
-                observation_builder=obs,
-                reward_builder=reward,
-                expected_runtime_metadata=expected,
-                allow_resume_metadata_upgrade=True,
-            )
-            incompatible = dict(expected)
-            incompatible["early_stop_tat_threshold"] = 175.0
-            with self.assertRaisesRegex(
-                ContextualCheckpointError,
-                "early_stop_tat_threshold mismatch",
-            ):
-                load_contextual_checkpoint(
-                    path,
-                    learner,
-                    observation_builder=obs,
-                    reward_builder=reward,
-                    expected_runtime_metadata=incompatible,
-                    allow_resume_metadata_upgrade=True,
-                )
-
-    def test_resume_can_override_only_batch_size_in_learner_config(self):
+    def test_runtime_metadata_and_learner_config_do_not_gate_loading(self):
         learner, obs, reward = components(batch_size=16)
         with tempfile.TemporaryDirectory() as directory:
             path = save_contextual_checkpoint(
@@ -205,69 +144,51 @@ class ContextualCheckpointTests(unittest.TestCase):
                 learner,
                 observation_builder=obs,
                 reward_builder=reward,
+                runtime_metadata={"algorithm_version": "retired-name"},
             )
             target, target_obs, target_reward = components(
                 seed=99, batch_size=32
             )
-            with self.assertRaisesRegex(
-                ContextualCheckpointError, "learner_config mismatch"
-            ):
-                load_contextual_checkpoint(
-                    path,
-                    target,
-                    observation_builder=target_obs,
-                    reward_builder=target_reward,
-                )
             load_contextual_checkpoint(
                 path,
                 target,
                 observation_builder=target_obs,
                 reward_builder=target_reward,
-                allowed_learner_config_overrides={"batch_size"},
             )
 
-    def test_legacy_tat_metadata_may_be_proven_by_runtime_config(self):
+    def test_exact_legacy_artifact_fingerprint_can_be_promoted(self):
         learner, obs, reward = components()
-        tat_config = {
-            "tat_termination_enabled": True,
-            "tat_termination_grace_steps": 10_000,
-            "early_stop_tat_threshold": 200.0,
-            "tat_above_threshold_patience": 300,
-            "tat_termination_inclusive": True,
-        }
         with tempfile.TemporaryDirectory() as directory:
             path = save_contextual_checkpoint(
-                Path(directory) / "legacy_tat_metadata.pt",
+                Path(directory) / "promoted.pt",
                 learner,
                 observation_builder=obs,
                 reward_builder=reward,
-                runtime_config=tat_config,
-                runtime_metadata={},
+                runtime_config={"reward_version": "N"},
             )
-            load_contextual_checkpoint(
-                path,
-                learner,
-                observation_builder=obs,
-                reward_builder=reward,
-                expected_runtime_metadata=tat_config,
-                allow_resume_metadata_upgrade=True,
+            payload = torch.load(path, weights_only=False)
+            payload.pop("version")
+            payload["checkpoint_version"] = (
+                "contextual_td7_checkpoint_v7_locked_reward_profile"
             )
-            incompatible = dict(tat_config)
-            incompatible["early_stop_tat_threshold"] = 180.0
-            with self.assertRaisesRegex(
-                ContextualCheckpointError,
-                "early_stop_tat_threshold mismatch",
+            torch.save(payload, path)
+            promoted_hash = next(iter(PROMOTED_CHECKPOINTS))
+            with patch(
+                "oht_routing.algorithms.rl.contextual_td7.checkpoint."
+                "_checkpoint_sha256",
+                return_value=promoted_hash,
             ):
+                restored, complete = read_contextual_runtime_config(path)
+                self.assertTrue(complete)
+                self.assertEqual(restored, {"reward_version": "N"})
                 load_contextual_checkpoint(
                     path,
                     learner,
                     observation_builder=obs,
                     reward_builder=reward,
-                    expected_runtime_metadata=incompatible,
-                    allow_resume_metadata_upgrade=True,
                 )
 
-    def test_full_runtime_config_round_trip_and_v3_partial_compatibility(self):
+    def test_full_runtime_config_round_trip(self):
         learner, obs, reward = components()
         runtime_config = {
             "warmup_steps": 12_345,
@@ -300,43 +221,18 @@ class ContextualCheckpointTests(unittest.TestCase):
             self.assertEqual(restored, runtime_config)
 
             payload = torch.load(path, weights_only=False)
-            payload["checkpoint_version"] = (
-                "contextual_td7_checkpoint_v3_independent_twin_critic"
-            )
-            payload.pop("runtime_config")
-            legacy_path = Path(directory) / "v3.pt"
-            torch.save(payload, legacy_path)
-            restored, complete = read_contextual_runtime_config(legacy_path)
-            self.assertFalse(complete)
-            self.assertEqual(restored["action_mode"], "region_b_rl")
-            self.assertEqual(restored["action_scale"], 0.05)
-            self.assertEqual(restored["warmup_steps"], 12_345)
-            self.assertNotIn("exploration_noise_clip", restored)
-            load_contextual_checkpoint(
-                legacy_path,
-                learner,
-                observation_builder=obs,
-                reward_builder=reward,
-            )
-
-            payload = torch.load(path, weights_only=False)
-            for reward_version in (
-                "contextual_controlled_reward_v4_balanced_global_local",
-                "contextual_controlled_reward_v5_completion_dedup",
-                "contextual_controlled_reward_v6_oht_state_cycle",
-                "contextual_controlled_reward_v7_oht_cycle_segments_boundary_delta",
+            self.assertEqual(payload["version"], CONTEXTUAL_VERSION)
+            self.assertNotIn("checkpoint_version", payload)
+            for retired_key in (
+                "learner_version",
+                "observation_version",
+                "action_version",
+                "replay_version",
+                "stack_version",
+                "sale_version",
+                "lap_version",
             ):
-                payload["reward_version"] = reward_version
-                torch.save(payload, legacy_path)
-                with self.assertRaisesRegex(
-                    ContextualCheckpointError, "reward_version mismatch"
-                ):
-                    load_contextual_checkpoint(
-                        legacy_path,
-                        learner,
-                        observation_builder=obs,
-                        reward_builder=reward,
-                    )
+                self.assertNotIn(retired_key, payload)
 
     def test_exploration_rng_round_trip_and_legacy_fallback(self):
         learner, obs, reward = components()
@@ -476,12 +372,12 @@ class ContextualCheckpointTests(unittest.TestCase):
             )
             payload = torch.load(path, weights_only=False)
             legacy = dict(payload)
-            legacy["checkpoint_version"] = "contextual_td7_checkpoint_v2"
+            legacy["version"] = "v1.0.0"
             legacy_path = Path(directory) / "legacy.pt"
             torch.save(legacy, legacy_path)
             target, target_obs, target_reward = components(seed=99)
             with self.assertRaisesRegex(
-                ContextualCheckpointError, "fresh independent twin-critic"
+                ContextualCheckpointError, "checkpoint version mismatch"
             ):
                 load_contextual_checkpoint(
                     legacy_path, target,
@@ -490,7 +386,6 @@ class ContextualCheckpointTests(unittest.TestCase):
                 )
 
             symmetric = dict(payload)
-            symmetric["checkpoint_version"] = CHECKPOINT_VERSION
             symmetric["online_critic"] = {
                 key: value.clone()
                 for key, value in payload["online_critic"].items()
@@ -520,12 +415,14 @@ class ContextualCheckpointTests(unittest.TestCase):
             )
             payload = torch.load(path, weights_only=False)
             for key, value in (
+                ("version", "v9.9.9"),
                 ("topology_hash", "wrong"),
                 ("mapping_hash", "wrong"),
-                ("learner_version", "wrong"),
+                ("network_config", {"wrong": True}),
+                ("action_mode", "wrong"),
                 ("reward_version", "wrong"),
-                ("action_version", "wrong"),
-                ("action_scale", 0.9),
+                ("sale_enabled", True),
+                ("lap_enabled", True),
             ):
                 changed = dict(payload)
                 changed[key] = value
@@ -584,7 +481,7 @@ class ContextualCheckpointTests(unittest.TestCase):
                     reward_builder=target_reward,
                 )
 
-    def test_sale_lap_metadata_mismatch_is_rejected(self):
+    def test_retired_component_versions_do_not_gate_loading(self):
         learner, obs, reward = components()
         with tempfile.TemporaryDirectory() as directory:
             path = save_contextual_checkpoint(
@@ -592,23 +489,26 @@ class ContextualCheckpointTests(unittest.TestCase):
                 observation_builder=obs, reward_builder=reward,
             )
             payload = torch.load(path, weights_only=False)
-            for key, value in (
-                ("sale_enabled", True),
-                ("lap_enabled", True),
-                ("algorithm_variant", "wrong"),
-                ("sale_version", "wrong"),
-                ("lap_version", "wrong"),
-            ):
-                changed = dict(payload)
-                changed[key] = value
-                bad = Path(directory) / f"mismatch_{key}.pt"
-                torch.save(changed, bad)
-                target, target_obs, target_reward = components()
-                with self.assertRaises(ContextualCheckpointError):
-                    load_contextual_checkpoint(
-                        bad, target, observation_builder=target_obs,
-                        reward_builder=target_reward,
-                    )
+            payload.update({
+                "learner_version": "wrong",
+                "observation_version": "wrong",
+                "action_version": "wrong",
+                "replay_version": "wrong",
+                "stack_version": "wrong",
+                "sale_version": "wrong",
+                "lap_version": "wrong",
+                "algorithm_variant": "wrong",
+                "action_scale": 0.9,
+            })
+            changed = Path(directory) / "retired_versions.pt"
+            torch.save(payload, changed)
+            target, target_obs, target_reward = components()
+            load_contextual_checkpoint(
+                changed,
+                target,
+                observation_builder=target_obs,
+                reward_builder=target_reward,
+            )
 
     def test_sale_checkpoint_restores_all_generations_and_output(self):
         source, obs, reward = components(sale=True, lap=True)

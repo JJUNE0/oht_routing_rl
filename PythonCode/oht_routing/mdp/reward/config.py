@@ -21,10 +21,6 @@ RAIL_REWARD_FREE_FLOW_NEUTRAL_2 = "free_flow_neutral_2"
 @dataclass(frozen=True)
 class RewardContract:
     version: str
-    historical_version: str
-    contract_version: str
-    tat_version: str
-    normalization_version: str
     tat_signal_mode: str
     tat_signal_description: str
     tat_termination_enabled: bool
@@ -37,12 +33,6 @@ class RewardContract:
 
 REWARD_N_CONTRACT = RewardContract(
     version="N",
-    historical_version="N",
-    contract_version=(
-        "contextual_controlled_reward_v16_tat_one_sided_unbounded"
-    ),
-    tat_version="one_sided_total_tat_excess160_unbounded_v1",
-    normalization_version="fixed_scale_no_reward_normalizer_v1",
     tat_signal_mode=TAT_SIGNAL_TOTAL_TAT_LEVEL,
     tat_signal_description="one_sided_total_tat_level",
     tat_termination_enabled=True,
@@ -99,17 +89,10 @@ REWARD_N_PROFILE = {
     "rail_tat_clip": 1.0,
 }
 
-REWARD_CONTRACT_VERSION = REWARD_N_CONTRACT.contract_version
-REWARD_TAT_VERSION = REWARD_N_CONTRACT.tat_version
-REWARD_NORMALIZATION_VERSION = REWARD_N_CONTRACT.normalization_version
-
 __all__ = (
     "RAIL_REWARD_FREE_FLOW_NEUTRAL_2",
-    "REWARD_CONTRACT_VERSION",
     "REWARD_N_CONTRACT",
     "REWARD_N_PROFILE",
-    "REWARD_NORMALIZATION_VERSION",
-    "REWARD_TAT_VERSION",
     "REWARD_VERSION",
     "REWARD_VERSIONS",
     "RewardContract",

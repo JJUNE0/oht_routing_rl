@@ -6,7 +6,6 @@ from oht_routing.runtime.client import ClientAlgorithm
 from oht_routing.runtime.cli import parse_args
 # Public imports retained for protocol tests and existing launcher integrations.
 from oht_routing.runtime.protocol import (
-    SmokeReporter,
     handle_command,
     read_port,
     send_active_data,
@@ -42,15 +41,8 @@ def main():
     config = runtime_config_from_args(args)
     seed_everything(config.seed)
     client = ClientAlgorithm(config)
-    reporter = (
-        SmokeReporter(
-            args.smoke_report, args.mode, args.smoke_report_interval
-        )
-        if args.smoke_report is not None
-        else None
-    )
     print_runtime_summary(args, client)
-    serve_contextual(args, client, reporter)
+    serve_contextual(args, client)
 
 
 if __name__ == "__main__":

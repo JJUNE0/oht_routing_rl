@@ -12,11 +12,9 @@ from oht_routing.algorithms.rl.contextual_td7.replay_buffer import (
     snapshot_from_transition,
 )
 from oht_routing.algorithms.rl.contextual_td7.replay_types import ContextualStepSnapshot
-from oht_routing.mdp.action import ACTION_VERSION
 from oht_routing.mdp.observation import (
     GLOBAL_DIM,
     LOCAL_DIM,
-    OBSERVATION_VERSION,
 )
 from oht_routing.mdp.reward.config import REWARD_VERSION
 from test_contextual_observation import (
@@ -27,6 +25,7 @@ from test_contextual_observation import (
 )
 from oht_routing.mdp.reward.builder import ContextualRewardBuilder, ContextualRewardConfig
 from oht_routing.mdp.transition import ContextualTransitionAligner
+from oht_routing.version import CONTEXTUAL_VERSION
 from test_contextual_reward import reward_client
 from test_contextual_transition import observation
 
@@ -74,9 +73,8 @@ def make_snapshot(topology, step, episode=0, done=False):
         episode_id=episode,
         topology_hash=topology.topology_hash,
         mapping_hash=topology.mapping_hash,
-        observation_version=OBSERVATION_VERSION,
+        version=CONTEXTUAL_VERSION,
         reward_version=REWARD_VERSION,
-        action_version=ACTION_VERSION,
     )
 
 
@@ -217,9 +215,8 @@ class ContextualReplayTests(unittest.TestCase):
         for changed in (
             replace(base, topology_hash="wrong"),
             replace(base, mapping_hash="wrong"),
-            replace(base, observation_version="wrong"),
+            replace(base, version="wrong"),
             replace(base, reward_version="wrong"),
-            replace(base, action_version="wrong"),
             replace(base, next_env_step=3),
             replace(
                 base,

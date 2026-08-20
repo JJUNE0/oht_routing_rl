@@ -1,14 +1,8 @@
-"""Named, versioned episode-termination policies for contextual training."""
+"""Named episode-termination policies for contextual training."""
 
 from __future__ import annotations
 
 
-TAT_TERMINATION_POLICY_VERSION = (
-    "tat_termination_episode_gate_v5_named_tat180"
-)
-WARMUP_EPISODE_TRANSITION_VERSION = (
-    "warmup_episode_boundary_v1_terminal_observation"
-)
 TAT_TERMINATION_REWARD_PROFILE = "reward_profile"
 TAT_TERMINATION_EPISODE2_TAT175 = "episode2_tat175"
 TAT_TERMINATION_EPISODE2_TAT180 = "episode2_tat180"
@@ -65,8 +59,6 @@ __all__ = (
     "TAT_TERMINATION_EPISODE2_TAT175",
     "TAT_TERMINATION_EPISODE2_TAT180",
     "TAT_TERMINATION_POLICIES",
-    "TAT_TERMINATION_POLICY_VERSION",
     "TAT_TERMINATION_REWARD_PROFILE",
-    "WARMUP_EPISODE_TRANSITION_VERSION",
     "tat_termination_profile",
 )

@@ -1,4 +1,4 @@
-"""Simulator command dispatch and lightweight smoke reporting."""
+"""Simulator command dispatch for the contextual runtime."""
 
 from __future__ import annotations
 
@@ -6,8 +6,6 @@ import json
 import os
 import time
 from pathlib import Path
-
-import numpy as np
 
 
 DEFAULT_PORT = 9100
@@ -22,86 +20,13 @@ def read_port(path="wpconfig.json"):
     return DEFAULT_PORT
 
 
-class SmokeReporter:
-    _MAX_KEYS = (
-        "cost/all_baseline_abs_error_max",
-        "boundary/cost_baseline_abs_error_max",
-        "runtime/observation_build_calls_per_tick",
-        "runtime/nonfinite_count",
-    )
-
-    def __init__(self, path, mode, write_interval=100):
-        if int(write_interval) <= 0:
-            raise ValueError("smoke report interval must be positive")
-        self.path = Path(path)
-        self.mode = mode
-        self.write_interval = int(write_interval)
-        self.tick_count = 0
-        self.totals = []
-        self.last = {}
-        self.maxima = {key: 0.0 for key in self._MAX_KEYS}
-        self.reset_count = 0
-        self.socket_send_count = 0
-
-    def record_tick(self, diagnostics):
-        self.tick_count += 1
-        self.last = dict(diagnostics)
-        total = (
-            self.last.get("runtime/total_algorithm_ms", np.nan)
-            + self.last.get("runtime/send_cost_ms", 0.0)
-        )
-        if np.isfinite(total):
-            self.totals.append(float(total))
-        for key in self._MAX_KEYS:
-            self.maxima[key] = max(
-                self.maxima[key], float(self.last.get(key, 0.0))
-            )
-        if self.tick_count % self.write_interval == 0:
-            self._write()
-
-    def record_reset(self):
-        self.reset_count += 1
-        self._write()
-
-    def record_send(self):
-        self.socket_send_count += 1
-
-    def _write(self):
-        totals = np.asarray(self.totals, dtype=np.float64)
-        payload = {
-            "mode": self.mode,
-            "tick_count": self.tick_count,
-            "episode_reset_count": self.reset_count,
-            "socket_send_count": self.socket_send_count,
-            "runtime_total_ms": {
-                "median": float(np.median(totals)) if totals.size else None,
-                "p95": (
-                    float(np.percentile(totals, 95)) if totals.size else None
-                ),
-                "p99": (
-                    float(np.percentile(totals, 99)) if totals.size else None
-                ),
-            },
-            "last": self.last,
-            "max": dict(self.maxima) if self.tick_count else {},
-        }
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(
-            json.dumps(payload, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
-
-
-def send_active_data(pclient, client, reporter=None, log_interval=100):
+def send_active_data(pclient, client, log_interval=100):
     pclient.RecieveSimulationActiveData()
     client.Algorithm(pclient)
     started = time.perf_counter()
     pclient.SendRailLineCostMessage()
     client.record_send_cost_ms((time.perf_counter() - started) * 1000.0)
     client.log_wandb_tick()
-    if reporter is not None:
-        reporter.record_send()
-        reporter.record_tick(client.last_diagnostics)
     client.AlgorithmAfter(pclient)
     diagnostics = client.last_diagnostics
     step = int(diagnostics.get("env/step", client.total_steps))
@@ -130,23 +55,18 @@ def handle_command(
     command,
     pclient,
     client,
-    reporter=None,
     sim_end_time=45_000,
     console_log_interval=100,
 ):
     if command == 0:
         if client.total_steps % int(console_log_interval) == 0:
             pclient.WriteAdminLog("Contextual SendAndReceiveRailLineCost.")
-        send_active_data(
-            pclient, client, reporter, log_interval=console_log_interval
-        )
+        send_active_data(pclient, client, log_interval=console_log_interval)
     elif command == 1:
         pclient.WriteAdminLog("Contextual simulation end signal (v=1).")
         client.on_terminal()
     elif command == 2:
         client.Reset(pclient)
-        if reporter is not None:
-            reporter.record_reset()
     elif command == 3:
         pclient.RecieveSimulationSnapshotData()
         client.UpdateDatas(pclient)
@@ -187,7 +107,6 @@ def handle_command(
 
 __all__ = (
     "DEFAULT_PORT",
-    "SmokeReporter",
     "handle_command",
     "read_port",
     "send_active_data",

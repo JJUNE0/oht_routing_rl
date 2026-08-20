@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import heapq
-import hashlib
 import os
 import time
 import traceback
@@ -15,7 +14,6 @@ import numpy as np
 import torch
 
 from oht_routing.algorithms.rl.contextual_td7 import (
-    ALGORITHM_VERSION,
     ContextualActor,
     ContextualLearnerConfig,
     ContextualNetworkConfig,
@@ -25,10 +23,6 @@ from oht_routing.algorithms.rl.contextual_td7 import (
     DirectionalContextEncoder,
     REPLAY_SAMPLING_RAIL,
     REPLAY_SAMPLING_SNAPSHOT,
-    REPLAY_SAMPLING_VERSION,
-    RESUME_DETERMINISTIC_EPISODE_VERSION,
-    RESUME_REPLAY_REFILL_VERSION,
-    STACK_VERSION,
     contextual_algorithm_variant,
     encode_observation_stack,
     flatten_action_stack,
@@ -37,29 +31,20 @@ from oht_routing.algorithms.rl.contextual_td7 import (
     save_contextual_checkpoint,
 )
 from oht_routing.mdp.action import (
-    ACTION_SCALE_SCHEDULE_VERSION,
     EXP_RESIDUAL,
-    EXPLORATION_SCHEDULE_VERSION,
     REGION_B_RL,
-    action_version,
     apply_controlled_action,
 )
-from oht_routing.routing.dispatch import (
-    DISPATCH_COST,
-    DISPATCH_FIRST_MATCH,
-    DISPATCH_SELECTION_VERSION,
+from oht_dispatching import (
+    OHTDispatcher,
 )
 from oht_routing.mdp.observation import (
     ContextualObservationBuilder,
-    OBSERVATION_NORMALIZER_SNAPSHOT_VERSION,
     ObservationNormalizerConfig,
 )
 from oht_routing.mdp.topology import load_cached_contextual_topology
-from oht_routing.mdp.termination import (
-    TAT_TERMINATION_POLICY_VERSION,
-    WARMUP_EPISODE_TRANSITION_VERSION,
-)
 from oht_routing.mdp.reward.builder import ContextualRewardBuilder
+from oht_routing.version import CONTEXTUAL_VERSION
 from oht_routing.utils.reward_diagnostic import (
     LeadingIndicatorTracker,
     RewardDiagnosticWriter,
@@ -67,22 +52,39 @@ from oht_routing.utils.reward_diagnostic import (
 )
 from oht_routing.mdp.transition import ContextualTransitionAligner
 from oht_routing.utils.wandb_logging import ContextualWandbLogger
+from oht_routing.runtime.console import print_entries, print_header
 from oht_routing.runtime.diagnostics import ContextualRuntimeDiagnosticsMixin
 from oht_routing.runtime.config import ContextualRuntimeConfig
+from oht_routing.runtime.config_validation import make_reward_config
 
 
-QUEUED_JOB_STATE = 1
-IDLE_OHT_STATE = 0
-PARAMETER_DW_STATE_VERSION = "parameter_dw_episode_reset_v1"
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+TOPOLOGY_CACHE_DIR = (
+    Path(__file__).resolve().parents[1] / "topology" / "cache"
+)
 
 
 class ContextualTrainingFailure(RuntimeError):
     """Fatal training failure requiring an explicit process restart."""
 
 
-CHECKPOINT_DIRECTORY_VERSION = "contextual_checkpoint_dir_slug_v1"
+class _InferenceReplayContext:
+    """Minimal replay contract required by learner construction and loading."""
 
-
+    def __init__(
+        self,
+        topology,
+        observation_builder,
+        *,
+        num_stacks,
+        stack_interval,
+        seed,
+    ):
+        self.topology = topology
+        self.observation_builder = observation_builder
+        self.num_stacks = int(num_stacks)
+        self.stack_interval = int(stack_interval)
+        self.rng = np.random.default_rng(seed)
 
 
 class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
@@ -105,14 +107,13 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
         self.encoder.eval()
         self.actor.eval()
 
-        root = Path(__file__).resolve().parent.parent
         self.cache_path = Path(
             self.config.topology_cache_path
-            or root / "contextual_topology_cache.npz"
+            or TOPOLOGY_CACHE_DIR / "contextual_topology_cache.npz"
         )
         self.audit_path = Path(
             self.config.topology_audit_path
-            or root / "topology_neighbor_audit.json"
+            or TOPOLOGY_CACHE_DIR / "topology_neighbor_audit.json"
         )
         self.topology = None
         self.observation_builder = None
@@ -168,14 +169,10 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
         self._stale_sim_time_ticks = 0
         self._burnin_last_applied_action = None
         self._burnin_previous_applied_action = None
-        self.latest_dispatch_live_cost_by_rail: dict[int, float] = {}
-        self.latest_dispatch_cost_tick: int | None = None
-        self.dispatch_cost_ready = False
-        self._reset_dispatch_diagnostics()
-        root = Path(__file__).resolve().parent.parent
+        self.dispatcher = OHTDispatcher(self.config.dispatch_mode)
         self.checkpoint_root = Path(
             self.config.checkpoint_root
-            or root / "checkpoints" / self.checkpoint_variant
+            or PROJECT_ROOT / "checkpoints" / self.checkpoint_variant
         )
         self.rail_tat_diagnostic_path = (
             Path(self.config.rail_tat_diagnostic_path)
@@ -197,55 +194,31 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
         )
 
     @property
-    def action_version(self):
-        return action_version(self.config.action_mode)
-
-    @property
     def runtime_variant(self):
-        base = (
-            f"{ALGORITHM_VERSION}_{self.algorithm_variant}_"
-            f"{self.action_version}_{PARAMETER_DW_STATE_VERSION}_"
-            f"reward_{self.config.reward_version}_"
-            f"{STACK_VERSION}_s{self.config.num_stacks}_"
-            f"i{self.config.stack_interval}_"
-            f"{ACTION_SCALE_SCHEDULE_VERSION}_"
+        return (
+            f"{CONTEXTUAL_VERSION}_{self.algorithm_variant}_"
+            f"{self.config.action_mode}_reward_{self.config.reward_version}_"
+            f"s{self.config.num_stacks}i{self.config.stack_interval}_"
+            f"{self.config.replay_sampling_mode}_"
             f"curr{self.config.curriculum_scale_start:g}-"
             f"{self.config.curriculum_scale_end:g}-"
             f"{self.config.curriculum_end_step}-"
-            f"{self.config.curriculum_shape}_"
-            f"{WARMUP_EPISODE_TRANSITION_VERSION}_"
-            f"warmterm{int(self.config.terminate_on_warmup_complete)}_"
-            f"{TAT_TERMINATION_POLICY_VERSION}_"
-            f"{self.config.tat_termination_policy}_"
-            f"ep{self.config.effective_tat_termination_start_episode}_"
-            f"tat{self.config.early_stop_tat_threshold:g}_"
-            f"{OBSERVATION_NORMALIZER_SNAPSHOT_VERSION}_"
-            f"normreuse{int(self.config.state_normalizer_warmup_bypass)}_"
-            f"{RESUME_REPLAY_REFILL_VERSION}_fullrefill"
-            f"{int(self.config.resume_inference_until_replay_full)}_"
-            f"{RESUME_DETERMINISTIC_EPISODE_VERSION}_detfirst"
-            f"{int(self.config.resume_deterministic_first_episode)}"
-        )
-        if self.config.replay_sampling_mode == REPLAY_SAMPLING_RAIL:
-            return base
-        return (
-            f"{base}_{REPLAY_SAMPLING_VERSION}_"
-            f"{self.config.replay_sampling_mode}"
+            f"{self.config.curriculum_shape}"
         )
 
     @property
     def checkpoint_variant(self):
         """Short, collision-resistant directory name for Windows paths."""
-        digest = hashlib.sha256(
-            self.runtime_variant.encode("utf-8")
-        ).hexdigest()[:10]
         return (
-            f"ctx_td7_s{int(self.config.sale_enabled)}_"
+            f"ctx_td7_{CONTEXTUAL_VERSION}_s{int(self.config.sale_enabled)}_"
             f"l{int(self.config.lap_enabled)}_"
             f"k{self.config.num_stacks}_i{self.config.stack_interval}_"
             f"r{self.config.reward_version}_"
             f"{self.config.action_mode}_"
-            f"{self.config.replay_sampling_mode}_{digest}"
+            f"{self.config.replay_sampling_mode}_"
+            f"c{self.config.curriculum_scale_start:g}-"
+            f"{self.config.curriculum_scale_end:g}-"
+            f"{self.config.curriculum_end_step}"
         )
 
     def _synchronize(self):
@@ -288,13 +261,22 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
             flush=True,
         )
 
+    def _needs_learner_runtime(self) -> bool:
+        return bool(
+            self.config.mode == "training"
+            or (
+                self.config.mode == "actor_inference"
+                and self.config.resume_checkpoint_path is not None
+            )
+        )
+
     def _ensure_initialized(self, pclient):
         if self.topology is not None:
             self._maybe_load_state_normalizer()
             if self.reward_builder is None:
                 self.reward_builder = ContextualRewardBuilder(
                     self.topology,
-                    self.config.make_reward_config(),
+                    make_reward_config(self.config),
                     completion_diagnostic_path=self.rail_tat_diagnostic_path,
                     global_step_provider=lambda: self.total_steps,
                     completion_diagnostic_max_global_step=(
@@ -306,8 +288,8 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
                     self.topology, self.reward_builder
                 )
                 self.transition_aligner.episode_id = self.episode_id
-            if self.config.mode == "training" and self.learner is None:
-                self._initialize_training()
+            if self._needs_learner_runtime() and self.learner is None:
+                self._initialize_learner_runtime()
             return
         self.topology = load_cached_contextual_topology(
             pclient.RAILLINE_DIC,
@@ -324,7 +306,7 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
         self._maybe_load_state_normalizer()
         self.reward_builder = ContextualRewardBuilder(
             self.topology,
-            self.config.make_reward_config(),
+            make_reward_config(self.config),
             completion_diagnostic_path=self.rail_tat_diagnostic_path,
             global_step_provider=lambda: self.total_steps,
             completion_diagnostic_max_global_step=(
@@ -336,24 +318,33 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
             self.topology, self.reward_builder
         )
         self.transition_aligner.episode_id = self.episode_id
-        if self.config.mode == "training":
-            self._initialize_training()
+        if self._needs_learner_runtime():
+            self._initialize_learner_runtime()
 
-    def _initialize_training(self):
+    def _initialize_learner_runtime(self):
         if self.learner is not None:
             return
-        self.replay_buffer = ContextualStepReplayBuffer(
-            self.topology,
-            self.observation_builder,
-            capacity_env_steps=self.config.replay_capacity_env_steps,
-            seed=self.config.seed,
-            lap_enabled=self.config.lap_enabled,
-            action_version=self.action_version,
-            reward_version=self.config.reward_version,
-            sampling_mode=self.config.replay_sampling_mode,
-            num_stacks=self.config.num_stacks,
-            stack_interval=self.config.stack_interval,
-        )
+        if self.config.mode == "training":
+            self.replay_buffer = ContextualStepReplayBuffer(
+                self.topology,
+                self.observation_builder,
+                capacity_env_steps=self.config.replay_capacity_env_steps,
+                seed=self.config.seed,
+                lap_enabled=self.config.lap_enabled,
+                reward_version=self.config.reward_version,
+                sampling_mode=self.config.replay_sampling_mode,
+                num_stacks=self.config.num_stacks,
+                stack_interval=self.config.stack_interval,
+            )
+            learner_replay = self.replay_buffer
+        else:
+            learner_replay = _InferenceReplayContext(
+                self.topology,
+                self.observation_builder,
+                num_stacks=self.config.num_stacks,
+                stack_interval=self.config.stack_interval,
+                seed=self.config.seed,
+            )
         learner_config = ContextualLearnerConfig(
             action_mode=self.config.action_mode,
             action_scale=self.config.action_scale,
@@ -372,7 +363,7 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
             stack_interval=self.config.stack_interval,
         )
         self.learner = ContextualTD7Learner(
-            self.replay_buffer,
+            learner_replay,
             network_config=network_config,
             config=learner_config,
             device=self.device,
@@ -383,103 +374,17 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
         self.actor = self.learner.actor
         self.encoder.eval()
         self.actor.eval()
-        self.transition_aligner.callback = self._on_completed_transition
+        self.transition_aligner.callback = (
+            self._on_completed_transition
+            if self.config.mode == "training"
+            else None
+        )
         if self.config.resume_checkpoint_path:
             runtime_metadata = load_contextual_checkpoint(
                 self.config.resume_checkpoint_path,
                 self.learner,
                 observation_builder=self.observation_builder,
                 reward_builder=self.reward_builder,
-                expected_runtime_metadata={
-                    "algorithm_version": self.runtime_variant,
-                    "action_mode": self.config.action_mode,
-                    "action_version": self.action_version,
-                    "reward_version": self.reward_builder.reward_version,
-                    "reward_contract_version": (
-                        self.reward_builder.reward_contract_version
-                    ),
-                    "reward_tat_version": (
-                        self.reward_builder.reward_tat_version
-                    ),
-                    "reward_normalization_version": (
-                        self.reward_builder.reward_normalization_version
-                    ),
-                    "parameter_dw_state_version": PARAMETER_DW_STATE_VERSION,
-                    "stack_version": STACK_VERSION,
-                    "action_scale": self.config.action_scale,
-                    "curriculum_end_step": self.config.curriculum_end_step,
-                    "curriculum_scale_start": (
-                        self.config.curriculum_scale_start
-                    ),
-                    "curriculum_scale_end": self.config.curriculum_scale_end,
-                    "curriculum_shape": self.config.curriculum_shape,
-                    "action_scale_schedule_version": (
-                        ACTION_SCALE_SCHEDULE_VERSION
-                    ),
-                    "state_normalizer_snapshot_version": (
-                        OBSERVATION_NORMALIZER_SNAPSHOT_VERSION
-                    ),
-                    "state_normalizer_warmup_bypass": (
-                        self.config.state_normalizer_warmup_bypass
-                    ),
-                    "effective_warmup_steps": (
-                        self.config.effective_warmup_steps
-                    ),
-                    "warmup_episode_transition_version": (
-                        WARMUP_EPISODE_TRANSITION_VERSION
-                    ),
-                    "terminate_on_warmup_complete": (
-                        self.config.terminate_on_warmup_complete
-                    ),
-                    "tat_termination_policy_version": (
-                        TAT_TERMINATION_POLICY_VERSION
-                    ),
-                    "tat_termination_policy": (
-                        self.config.tat_termination_policy
-                    ),
-                    "tat_termination_configured_start_episode": (
-                        self.config.tat_termination_start_episode
-                    ),
-                    "tat_termination_start_episode": (
-                        self.config.effective_tat_termination_start_episode
-                    ),
-                    "tat_termination_enabled": (
-                        self.config.tat_termination_enabled
-                    ),
-                    "tat_termination_grace_steps": (
-                        self.config.tat_termination_grace_steps
-                    ),
-                    "early_stop_tat_threshold": (
-                        self.config.early_stop_tat_threshold
-                    ),
-                    "tat_above_threshold_patience": (
-                        self.config.tat_above_threshold_patience
-                    ),
-                    "tat_termination_inclusive": (
-                        self.config.tat_termination_inclusive
-                    ),
-                    "exploration_noise_std": self.config.exploration_noise_std,
-                    "episode_burnin_steps": self.config.episode_burnin_steps,
-                    "num_stacks": self.config.num_stacks,
-                    "stack_interval": self.config.stack_interval,
-                    "resume_replay_refill_version": (
-                        RESUME_REPLAY_REFILL_VERSION
-                    ),
-                    "resume_inference_until_replay_full": (
-                        self.config.resume_inference_until_replay_full
-                    ),
-                    "resume_refill_target_env_steps": (
-                        self.config.resume_refill_target_env_steps
-                    ),
-                    "resume_deterministic_episode_version": (
-                        RESUME_DETERMINISTIC_EPISODE_VERSION
-                    ),
-                    "resume_deterministic_first_episode": (
-                        self.config.resume_deterministic_first_episode
-                    ),
-                },
-                allow_resume_metadata_upgrade=True,
-                allowed_learner_config_overrides={"batch_size"},
                 exploration_rng=self.exploration_rng,
                 exploration_seed=self.config.seed,
             )
@@ -505,11 +410,35 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
                     "checkpoint warm-up bypass requires populated, frozen "
                     "observation state normalizers"
                 )
-            self._resume_requires_refill = True
+            self._resume_requires_refill = self.config.mode == "training"
             self._resume_deterministic_episode_active = bool(
-                self.config.resume_deterministic_first_episode
+                self.config.mode == "training"
+                and self.config.resume_deterministic_first_episode
             )
             self.action_enabled_env_steps = 0
+            print_header("checkpoint-loaded")
+            print_entries(
+                (
+                    ("version", CONTEXTUAL_VERSION),
+                    ("mode", self.config.mode),
+                    ("environment step", self.total_steps),
+                    ("episode", self.episode_id),
+                    ("action scale", self._action_scale()),
+                    (
+                        "normalizers restored",
+                        self._state_normalizers_ready_for_bypass(),
+                    ),
+                    (
+                        "learner updates enabled",
+                        self.config.mode == "training",
+                    ),
+                    (
+                        "replay collection enabled",
+                        self.config.mode == "training",
+                    ),
+                ),
+                indent=2,
+            )
 
     def _on_completed_transition(self, transition):
         started = time.perf_counter()
@@ -596,116 +525,21 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
 
     def _runtime_checkpoint_metadata(self, checkpoint_kind="latest"):
         return {
-            "algorithm_version": self.runtime_variant,
-            "checkpoint_directory_version": CHECKPOINT_DIRECTORY_VERSION,
+            "version": CONTEXTUAL_VERSION,
             "checkpoint_variant": self.checkpoint_variant,
-            "uniform_replay": not self.config.lap_enabled,
             "sale": self.config.sale_enabled,
             "lap": self.config.lap_enabled,
-            "critic_loss_mode": self.config.critic_loss_mode,
             "action_mode": self.config.action_mode,
-            "action_version": self.action_version,
             "reward_version": self.reward_builder.reward_version,
-            "reward_contract_version": (
-                self.reward_builder.reward_contract_version
-            ),
-            "reward_tat_version": self.reward_builder.reward_tat_version,
-            "reward_normalization_version": (
-                self.reward_builder.reward_normalization_version
-            ),
-            "parameter_dw_state_version": PARAMETER_DW_STATE_VERSION,
-            "stack_version": STACK_VERSION,
             "num_stacks": self.config.num_stacks,
             "stack_interval": self.config.stack_interval,
             "dispatch_mode": self.config.dispatch_mode,
-            "dispatch_selection_version": DISPATCH_SELECTION_VERSION,
-            "action_scale": self.config.action_scale,
-            "curriculum_end_step": self.config.curriculum_end_step,
-            "curriculum_scale_start": self.config.curriculum_scale_start,
-            "curriculum_scale_end": self.config.curriculum_scale_end,
-            "curriculum_shape": self.config.curriculum_shape,
-            "action_scale_schedule_version": ACTION_SCALE_SCHEDULE_VERSION,
-            "tat_termination_policy_version": (
-                TAT_TERMINATION_POLICY_VERSION
-            ),
-            "tat_termination_policy": self.config.tat_termination_policy,
-            "tat_termination_configured_start_episode": (
-                self.config.tat_termination_start_episode
-            ),
-            "tat_termination_start_episode": (
-                self.config.effective_tat_termination_start_episode
-            ),
-            "tat_termination_enabled": self.config.tat_termination_enabled,
-            "tat_termination_grace_steps": (
-                self.config.tat_termination_grace_steps
-            ),
-            "early_stop_tat_threshold": (
-                self.config.early_stop_tat_threshold
-            ),
-            "tat_above_threshold_patience": (
-                self.config.tat_above_threshold_patience
-            ),
-            "tat_termination_inclusive": (
-                self.config.tat_termination_inclusive
-            ),
-            "episode_burnin_steps": self.config.episode_burnin_steps,
-            "exploration_noise_std": self.config.exploration_noise_std,
-            "exploration_noise_final_std": (
-                self.config.exploration_noise_final_std
-            ),
-            "exploration_noise_anneal_steps": (
-                self.config.exploration_noise_anneal_steps
-            ),
-            "exploration_noise_anneal_start_step": (
-                self.config.effective_warmup_steps
-            ),
-            "exploration_noise_anneal_end_step": (
-                self.config.effective_warmup_steps
-                + self.config.exploration_noise_anneal_steps
-            ),
-            "configured_warmup_steps": self.config.warmup_steps,
-            "effective_warmup_steps": self.config.effective_warmup_steps,
-            "warmup_episode_transition_version": (
-                WARMUP_EPISODE_TRANSITION_VERSION
-            ),
-            "terminate_on_warmup_complete": (
-                self.config.terminate_on_warmup_complete
-            ),
             "warmup_episode_boundary_sent": (
                 self.warmup_episode_boundary_sent
-            ),
-            "state_normalizer_snapshot_version": (
-                OBSERVATION_NORMALIZER_SNAPSHOT_VERSION
-            ),
-            "state_normalizer_warmup_bypass": (
-                self.config.state_normalizer_warmup_bypass
-            ),
-            "state_normalizer_loaded": self.state_normalizer_loaded,
-            "state_normalizer_saved": self.state_normalizer_saved,
-            "exploration_schedule_version": (
-                EXPLORATION_SCHEDULE_VERSION
             ),
             "runtime_env_step": self.total_steps,
             "episode_id": self.episode_id,
             "action_enabled_env_steps": self.action_enabled_env_steps,
-            "resume_replay_refill_version": (
-                RESUME_REPLAY_REFILL_VERSION
-            ),
-            "resume_inference_until_replay_full": (
-                self.config.resume_inference_until_replay_full
-            ),
-            "resume_refill_target_env_steps": (
-                self.config.resume_refill_target_env_steps
-            ),
-            "resume_deterministic_episode_version": (
-                RESUME_DETERMINISTIC_EPISODE_VERSION
-            ),
-            "resume_deterministic_first_episode": (
-                self.config.resume_deterministic_first_episode
-            ),
-            "resume_deterministic_episode_active": (
-                self._resume_deterministic_episode_active
-            ),
             "normalizers_frozen": self._normalizers_frozen(),
             "checkpoint_kind": str(checkpoint_kind),
             "training_failed": bool(self.training_failed),
@@ -880,7 +714,11 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
             pclient.RAILLINECOST_DIC[rail_id].FRailLineCost = float(
                 baseline[physical_row]
             )
-        self._capture_dispatch_cost_snapshot(baseline)
+        self.dispatcher.capture_cost_snapshot(
+            self.topology.all_rail_ids,
+            baseline,
+            self.total_steps,
+        )
         return apply_controlled_action(
             baseline,
             np.zeros(controlled_count, dtype=np.float32),
@@ -925,10 +763,7 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
         self.parameterDw.clear()
         self.parameterPassTimes.clear()
         self.parameterC.clear()
-        self.latest_dispatch_live_cost_by_rail = {}
-        self.latest_dispatch_cost_tick = None
-        self.dispatch_cost_ready = False
-        self._reset_dispatch_diagnostics()
+        self.dispatcher.reset_episode()
         if hasattr(self, "leading_indicator_tracker"):
             self.leading_indicator_tracker.reset_episode()
         if self.transition_aligner is not None:
@@ -1091,187 +926,6 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
 
     def _baseline_cost(self, pclient) -> np.ndarray:
         return self._cost_components(pclient)[2]
-
-    def _capture_dispatch_cost_snapshot(self, final_cost):
-        """Freeze the exact command-0 rail costs for later command-6 use."""
-        if self.config.dispatch_mode != DISPATCH_COST:
-            return
-        costs = np.asarray(final_cost, dtype=np.float64)
-        rail_ids = np.asarray(self.topology.all_rail_ids)
-        if costs.shape != rail_ids.shape:
-            raise RuntimeError(
-                "dispatch cost snapshot shape does not match topology"
-            )
-        self.latest_dispatch_live_cost_by_rail = {
-            int(rail_id): float(costs[row])
-            for row, rail_id in enumerate(rail_ids)
-        }
-        self.latest_dispatch_cost_tick = int(self.total_steps)
-        self._dispatch_cost_snapshot_step = int(self.total_steps)
-        self.dispatch_cost_ready = True
-
-    def _reset_dispatch_diagnostics(self):
-        self._dispatch_job_count = 0
-        self._dispatch_eligible_job_count = 0
-        self._dispatch_zero_candidate_count = 0
-        self._dispatch_candidate_total = 0
-        self._dispatch_selected_count = 0
-        self._dispatch_selected_hops_total = 0
-        self._dispatch_cost_attempt_count = 0
-        self._dispatch_path_cost_count = 0
-        self._dispatch_path_cost_total = 0.0
-        self._dispatch_first_match_path_cost_total = 0.0
-        self._dispatch_first_match_hops_total = 0
-        self._dispatch_cost_saving_total = 0.0
-        self._dispatch_relative_cost_saving_total = 0.0
-        self._dispatch_candidate_cost_spread_total = 0.0
-        self._dispatch_multi_candidate_count = 0
-        self._dispatch_changed_count = 0
-        self._dispatch_strict_cost_improvement_count = 0
-        self._dispatch_margin_count = 0
-        self._dispatch_margin_total = 0.0
-        self._dispatch_cost_snapshot_fallback_count = 0
-        self._dispatch_invalid_cost_count = 0
-        self._dispatch_cost_snapshot_step = None
-
-    @staticmethod
-    def _safe_ratio(numerator, denominator):
-        return (
-            float(numerator) / float(denominator)
-            if denominator > 0
-            else 0.0
-        )
-
-    def _dispatch_diagnostics(self):
-        eligible = self._dispatch_eligible_job_count
-        selected = self._dispatch_selected_count
-        attempts = self._dispatch_cost_attempt_count
-        decisions = self._dispatch_path_cost_count
-        snapshot_age = (
-            -1.0
-            if self._dispatch_cost_snapshot_step is None
-            else float(
-                max(
-                    0,
-                    self.total_steps - self._dispatch_cost_snapshot_step,
-                )
-            )
-        )
-        changed_ratio = self._safe_ratio(
-            self._dispatch_changed_count,
-            decisions,
-        )
-        selection_margin = self._safe_ratio(
-            self._dispatch_margin_total,
-            self._dispatch_margin_count,
-        )
-        return {
-            "dispatch/mode_first_match": float(
-                self.config.dispatch_mode == DISPATCH_FIRST_MATCH
-            ),
-            "dispatch/mode_neutral_path_cost": 0.0,
-            "dispatch/mode_live_td7_path_cost": float(
-                self.config.dispatch_mode == DISPATCH_COST
-            ),
-            "dispatch/cost_mode_active": float(
-                self.config.dispatch_mode == DISPATCH_COST
-            ),
-            "dispatch/cost_snapshot_ready": float(
-                self.dispatch_cost_ready
-            ),
-            "dispatch/cost_snapshot_ready_ratio": self._safe_ratio(
-                decisions,
-                attempts,
-            ),
-            "dispatch/cost_snapshot_age_steps": snapshot_age,
-            "dispatch/eligible_job_count_total": float(eligible),
-            "dispatch/candidate_count_mean": (
-                self._safe_ratio(
-                    self._dispatch_candidate_total,
-                    self._dispatch_job_count,
-                )
-            ),
-            "dispatch/candidate_count_mean_per_eligible_job": (
-                self._safe_ratio(
-                    self._dispatch_candidate_total,
-                    eligible,
-                )
-            ),
-            "dispatch/zero_candidate_ratio_per_eligible_job": (
-                self._safe_ratio(
-                    self._dispatch_zero_candidate_count,
-                    eligible,
-                )
-            ),
-            "dispatch/selected_ratio_per_eligible_job": (
-                self._safe_ratio(selected, eligible)
-            ),
-            "dispatch/selected_pickup_hops_mean": (
-                self._safe_ratio(
-                    self._dispatch_selected_hops_total,
-                    selected,
-                )
-            ),
-            "dispatch/first_match_pickup_hops_mean": (
-                self._safe_ratio(
-                    self._dispatch_first_match_hops_total,
-                    decisions,
-                )
-            ),
-            "dispatch/first_match_path_cost_mean": (
-                self._safe_ratio(
-                    self._dispatch_first_match_path_cost_total,
-                    decisions,
-                )
-            ),
-            "dispatch/selected_path_cost_mean": (
-                self._safe_ratio(
-                    self._dispatch_path_cost_total,
-                    decisions,
-                )
-            ),
-            "dispatch/cost_saving_vs_first_mean": (
-                self._safe_ratio(
-                    self._dispatch_cost_saving_total,
-                    decisions,
-                )
-            ),
-            "dispatch/cost_saving_vs_first_ratio_mean": (
-                self._safe_ratio(
-                    self._dispatch_relative_cost_saving_total,
-                    decisions,
-                )
-            ),
-            "dispatch/candidate_cost_spread_mean": (
-                self._safe_ratio(
-                    self._dispatch_candidate_cost_spread_total,
-                    decisions,
-                )
-            ),
-            "dispatch/multi_candidate_ratio": self._safe_ratio(
-                self._dispatch_multi_candidate_count,
-                decisions,
-            ),
-            "dispatch/changed_from_first_ratio": changed_ratio,
-            "dispatch/strict_cost_improvement_ratio": self._safe_ratio(
-                self._dispatch_strict_cost_improvement_count,
-                decisions,
-            ),
-            "dispatch/cost_snapshot_fallback_ratio": self._safe_ratio(
-                self._dispatch_cost_snapshot_fallback_count,
-                attempts,
-            ),
-            "dispatch/selection_margin_mean": selection_margin,
-            # Compatibility aliases for existing dashboards.
-            "dispatch/selection_changed_from_first_match_ratio": changed_ratio,
-            "dispatch/best_second_margin_mean": selection_margin,
-            "dispatch/cost_snapshot_fallback_count": float(
-                self._dispatch_cost_snapshot_fallback_count
-            ),
-            "dispatch/invalid_cost_count": float(
-                self._dispatch_invalid_cost_count
-            ),
-        }
 
     @staticmethod
     def _cpu_tensors(observation):
@@ -1715,7 +1369,11 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
             pclient.RAILLINECOST_DIC[rail_id].FRailLineCost = float(
                 action_result.final_cost[physical_row]
             )
-        self._capture_dispatch_cost_snapshot(action_result.final_cost)
+        self.dispatcher.capture_cost_snapshot(
+            self.topology.all_rail_ids,
+            action_result.final_cost,
+            self.total_steps,
+        )
         cost_apply_ms = (time.perf_counter() - t0) * 1000.0
 
         replay_sample_ms = 0.0
@@ -1905,7 +1563,7 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
             "learner/updates": float(
                 getattr(self.learner, "learner_update_count", 0)
             ),
-            **self._dispatch_diagnostics(),
+            **self.dispatcher.diagnostics(self.total_steps),
         }
         if completed is not None:
             reward_diagnostics = self.reward_builder.diagnostics(
@@ -2111,161 +1769,8 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
         }
 
     def Assign(self, pclient, job_list):
-        assigned = {}
-        used = set()
-        jobs = list(job_list)
-        owned_oht_ids = {
-            int(job.OHTId)
-            for job in jobs
-            if int(job.OHTId) != 0
-        }
-        pickup_candidates = defaultdict(list)
-        for iteration_index, (oht_id, oht) in enumerate(
-            pclient.OHT_DIC.items()
-        ):
-            if (
-                oht.State != IDLE_OHT_STATE
-                or oht.JobID != 0
-                or oht.DispatchedCommand != 0
-                or int(oht_id) in owned_oht_ids
-            ):
-                continue
-            route_window = tuple(list(oht.RouteList)[:16])
-            seen_rails = set()
-            for pickup_index, rail_id in enumerate(route_window):
-                if rail_id in seen_rails:
-                    continue
-                seen_rails.add(rail_id)
-                pickup_candidates[rail_id].append(
-                    (
-                        iteration_index,
-                        oht_id,
-                        oht,
-                        route_window[: pickup_index + 1],
-                        pickup_index + 1,
-                    )
-                )
-
-        for job in jobs:
-            self._dispatch_job_count += 1
-            if job.State != QUEUED_JOB_STATE or job.OHTId != 0:
-                continue
-            self._dispatch_eligible_job_count += 1
-
-            candidates = []
-            for (
-                iteration_index,
-                oht_id,
-                oht,
-                pickup_path,
-                pickup_hops,
-            ) in pickup_candidates.get(job.FromNode, ()):
-                carrier_ok = any(
-                    value in job.CarrierTypes for value in oht.CarrierTypes
-                )
-                area_ok = (
-                    oht.RunningAreaType in job.RunningAreaTyes
-                    or oht.RunningAreaType == 0
-                    or job.RunningAreaTyes[0] == 0
-                )
-                if not carrier_ok or not area_ok or oht_id in used:
-                    continue
-                candidates.append({
-                    "oht_id": oht_id,
-                    "pickup_path": pickup_path,
-                    "pickup_hops": pickup_hops,
-                    "iteration_index": iteration_index,
-                })
-
-            self._dispatch_candidate_total += len(candidates)
-            if not candidates:
-                self._dispatch_zero_candidate_count += 1
-                continue
-
-            selected = candidates[0]
-            if self.config.dispatch_mode == DISPATCH_COST:
-                self._dispatch_cost_attempt_count += 1
-                if not self.dispatch_cost_ready:
-                    self._dispatch_cost_snapshot_fallback_count += 1
-                else:
-                    scored = []
-                    for candidate in candidates:
-                        score = 0.0
-                        for rail_id in candidate["pickup_path"]:
-                            cost = self.latest_dispatch_live_cost_by_rail.get(
-                                int(rail_id)
-                            )
-                            if (
-                                cost is None
-                                or not np.isfinite(cost)
-                                or cost < 0.0
-                            ):
-                                self._dispatch_invalid_cost_count += 1
-                                raise ValueError(
-                                    "invalid dispatch rail cost: "
-                                    f"mode={self.config.dispatch_mode}, "
-                                    f"rail_id={rail_id}, cost={cost}"
-                                )
-                            score += cost
-                        scored.append((score, candidate))
-                    first_match_score = scored[0][0]
-                    first_match_hops = candidates[0]["pickup_hops"]
-                    candidate_scores = [item[0] for item in scored]
-                    candidate_cost_spread = (
-                        max(candidate_scores) - min(candidate_scores)
-                    )
-                    scored.sort(
-                        key=lambda item: (
-                            item[0],
-                            item[1]["pickup_hops"],
-                            int(item[1]["oht_id"]),
-                        )
-                    )
-                    selected_score, selected = scored[0]
-                    cost_saving = max(
-                        0.0,
-                        first_match_score - selected_score,
-                    )
-                    relative_saving = (
-                        cost_saving / first_match_score
-                        if first_match_score > 1e-12
-                        else 0.0
-                    )
-                    changed = (
-                        selected["oht_id"] != candidates[0]["oht_id"]
-                    )
-                    strict_improvement = cost_saving > 1e-9
-                    self._dispatch_path_cost_count += 1
-                    self._dispatch_path_cost_total += selected_score
-                    self._dispatch_first_match_path_cost_total += (
-                        first_match_score
-                    )
-                    self._dispatch_first_match_hops_total += first_match_hops
-                    self._dispatch_cost_saving_total += cost_saving
-                    self._dispatch_relative_cost_saving_total += (
-                        relative_saving
-                    )
-                    self._dispatch_candidate_cost_spread_total += (
-                        candidate_cost_spread
-                    )
-                    self._dispatch_changed_count += int(changed)
-                    self._dispatch_strict_cost_improvement_count += int(
-                        strict_improvement
-                    )
-                    if len(scored) > 1:
-                        self._dispatch_multi_candidate_count += 1
-                        self._dispatch_margin_count += 1
-                        self._dispatch_margin_total += (
-                            scored[1][0] - scored[0][0]
-                        )
-
-            assigned[job.ID] = {
-                "oht_id": selected["oht_id"],
-                "pickup_path": list(selected["pickup_path"]),
-            }
-            used.add(selected["oht_id"])
-            self._dispatch_selected_count += 1
-            self._dispatch_selected_hops_total += selected["pickup_hops"]
-
-        self.last_diagnostics.update(self._dispatch_diagnostics())
-        return assigned
+        assignments = self.dispatcher.assign(pclient.OHT_DIC, job_list)
+        self.last_diagnostics.update(
+            self.dispatcher.diagnostics(self.total_steps)
+        )
+        return assignments

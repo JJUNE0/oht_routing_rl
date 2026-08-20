@@ -3,8 +3,8 @@
 import argparse
 from pathlib import Path
 
+from oht_dispatching.config import DISPATCH_FIRST_MATCH, DISPATCH_MODES
 from oht_routing.mdp.action import ACTION_MODES, REGION_B_RL
-from oht_routing.routing.dispatch import DISPATCH_FIRST_MATCH, DISPATCH_MODES
 from oht_routing.mdp.reward.config import (
     REWARD_VERSION,
     REWARD_VERSIONS,
@@ -238,17 +238,5 @@ def parse_args():
         type=int,
         default=45_000,
         help="Override PClient's simulator episode end time after every init/reset.",
-    )
-    parser.add_argument(
-        "--smoke-report",
-        type=Path,
-        default=None,
-        help="Continuously write aggregated live smoke metrics as JSON.",
-    )
-    parser.add_argument(
-        "--smoke-report-interval",
-        type=int,
-        default=100,
-        help="Write the smoke summary every N active ticks.",
     )
     return parser.parse_args()

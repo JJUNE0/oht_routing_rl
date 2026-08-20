@@ -26,8 +26,6 @@ from .stacking import (
 )
 
 
-LEARNER_VERSION = "contextual_td7_previous_applied_action_actor_critic_v6"
-LEARNER_PERFORMANCE_VERSION = "contextual_td7_sparse_diagnostics_v1"
 DIAGNOSTICS_INTERVAL = 10
 
 

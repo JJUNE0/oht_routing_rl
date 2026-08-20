@@ -11,7 +11,6 @@ from oht_routing.runtime.client import ClientAlgorithm, ContextualRuntimeConfig
 from oht_routing.runtime.client import ContextualTrainingFailure
 from oht_routing.mdp.action import EXP_RESIDUAL, REGION_B_RL
 from oht_routing.algorithms.rl.contextual_td7 import (
-    ALGORITHM_VERSION,
     ContextualLearnerConfig,
     ContextualNetworkConfig,
     ContextualTD7Learner,
@@ -20,7 +19,6 @@ from oht_routing.algorithms.rl.contextual_td7.learner_types import (
     ContextualLearnerUpdate,
 )
 from oht_routing.mdp.observation import (
-    OBSERVATION_VERSION,
     ContextualObservationBatch,
     RunningFeatureNormalizer,
 )
@@ -36,6 +34,7 @@ from oht_routing.utils.wandb_logging import (
     runtime_exp_meta,
 )
 from oht_routing.utils.export_wandb_run import EXPORT_COLUMNS
+from oht_routing.version import CONTEXTUAL_VERSION
 
 
 class TrainingObservationBuilder:
@@ -244,7 +243,8 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
             sale_uniform_random_rail,
         ):
             self.assertIn(runtime.algorithm_variant, runtime.runtime_variant)
-            self.assertIn(runtime.action_version, runtime.runtime_variant)
+            self.assertIn(runtime.config.action_mode, runtime.runtime_variant)
+            self.assertIn(CONTEXTUAL_VERSION, runtime.runtime_variant)
             self.assertLess(len(runtime.checkpoint_root.name), 80)
             self.assertEqual(
                 runtime.checkpoint_root.name, runtime.checkpoint_variant
@@ -1101,6 +1101,91 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
             resumed.Algorithm(resumed_client)
             self.assertEqual(resumed.learner.learner_update_count, 1)
 
+    def test_actor_inference_restores_checkpoint_without_training_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime, _ = training_runtime(
+                checkpoint_root=directory,
+                warmup_steps=4,
+                normalizer_freeze_steps=1,
+            )
+            runtime.learner = ContextualTD7Learner(
+                runtime.replay_buffer,
+                network_config=ContextualNetworkConfig(),
+                config=ContextualLearnerConfig(
+                    action_scale=0.05,
+                    batch_size=16,
+                    minimum_replay_env_steps=2,
+                    minimum_action_enabled_env_steps=2,
+                    sale_enabled=False,
+                    lap_enabled=False,
+                ),
+                device="cpu",
+                seed=12,
+            )
+            runtime.encoder = runtime.learner.encoder
+            runtime.actor = runtime.learner.actor
+            runtime.observation_builder.load_normalizers(
+                "synthetic-normalizer.npz", require_frozen=True
+            )
+            runtime.total_steps = 400_000
+            runtime.episode_id = 8
+            runtime.transition_aligner.episode_id = 8
+            checkpoint = runtime._save_runtime_checkpoint("latest")
+            expected_actor = {
+                key: value.detach().clone()
+                for key, value in runtime.actor.state_dict().items()
+            }
+            expected_updates = runtime.learner.learner_update_count
+
+            inference = ClientAlgorithm(ContextualRuntimeConfig(
+                mode="actor_inference",
+                action_enabled=True,
+                action_scale=0.05,
+                warmup_steps=4,
+                terminate_on_warmup_complete=False,
+                normalizer_freeze_steps=1,
+                state_normalizer_warmup_bypass=True,
+                device="cpu",
+                seed=12,
+                replay_capacity_env_steps=64,
+                batch_size=16,
+                minimum_replay_env_steps=2,
+                minimum_action_enabled_env_steps=2,
+                checkpoint_root=directory,
+                resume_checkpoint_path=str(checkpoint),
+                sale_enabled=False,
+                lap_enabled=False,
+            ))
+            inference.topology = make_topology()
+            inference.observation_builder = TrainingObservationBuilder(
+                inference.topology, freeze_steps=1
+            )
+            pclient = make_runtime_pclient()
+            inference._ensure_initialized(pclient)
+
+            self.assertTrue(inference.checkpoint_loaded)
+            self.assertEqual(inference.total_steps, 400_000)
+            self.assertEqual(inference.episode_id, 8)
+            self.assertEqual(inference._action_scale(), 1.0)
+            self.assertTrue(inference._state_normalizers_ready_for_bypass())
+            self.assertIsNone(inference.replay_buffer)
+            self.assertIsNone(inference.transition_aligner.callback)
+            for key, expected in expected_actor.items():
+                torch.testing.assert_close(
+                    inference.actor.state_dict()[key], expected
+                )
+
+            inference.Algorithm(pclient)
+            inference.Algorithm(pclient)
+            self.assertEqual(
+                inference.learner.learner_update_count, expected_updates
+            )
+            self.assertIsNone(inference.replay_buffer)
+            self.assertEqual(
+                inference.last_diagnostics["action/cross_rail_noise_std"],
+                0.0,
+            )
+
     def test_resume_can_collect_full_replay_before_any_learner_update(self):
         with tempfile.TemporaryDirectory() as directory:
             runtime, pclient = training_runtime(
@@ -1303,7 +1388,8 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
             "action/policy_saturation_ratio", "action/clipped_fraction",
             "action/exploration_noise_std", "action/applied_mean",
             "action/applied_std", "curriculum/action_scale", "b_rl/mean",
-            "b_rl/std", "reward/total_mean", "reward/total_std",
+            "b_rl/std", "cost/all_baseline_abs_error_max",
+            "reward/total_mean", "reward/total_std",
             "reward/terminal_penalty",
             "reward/global/tat_component_raw",
             "reward/global/backlog_component_raw",
@@ -1340,7 +1426,9 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
             "grad/critic_norm", "learner/actor_updates_total",
             "learner/updates", "replay/size_env_steps",
             "replay/reward_mean", "replay/reward_std",
-            "numeric/learner_finite_ratio", "sale/loss",
+            "numeric/learner_finite_ratio",
+            "runtime/observation_build_calls_per_tick",
+            "runtime/nonfinite_count", "sale/loss",
             "sale/prediction_error_mean", "sale/online_grad_norm",
             "sale/fixed_online_distance", "lead/backlog/value",
             "lead/backlog/delta_300", "lead/idle/value",
@@ -1391,10 +1479,7 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
         meta = runtime_exp_meta(config)
         self.assertEqual(captured["config"]["EXP_META"], meta)
         self.assertEqual(captured["notes"], meta["description"])
-        self.assertEqual(
-            meta["wandb_metric_schema_version"],
-            "contextual_wandb_compact_v10_n_only",
-        )
+        self.assertEqual(meta["version"], CONTEXTUAL_VERSION)
         self.assertEqual(meta["reward_version"], "N")
         self.assertEqual(
             meta["tat_signal"],
@@ -1407,18 +1492,16 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
         self.assertTrue(meta["use_op"])
         self.assertEqual(meta["dispatch_mode"], "first-match")
         self.assertIn("dispatch_first_match", meta["note"])
-        self.assertEqual(
-            meta["algorithm_version"],
-            ALGORITHM_VERSION,
-        )
         self.assertEqual(meta["num_stacks"], 1)
         self.assertEqual(meta["stack_interval"], 1)
-        self.assertEqual(meta["observation_version"], OBSERVATION_VERSION)
+        self.assertNotIn("observation_version", meta)
+        self.assertNotIn("sale_version", meta)
+        self.assertNotIn("lap_version", meta)
         self.assertEqual(
             meta["previous_action_input"],
             "actor_and_critic_previous_applied_action_separate_from_encoder",
         )
-        self.assertEqual(meta["critic_initialization"], "independent")
+        self.assertNotIn("critic_initialization", meta)
         experiment_meta = runtime_exp_meta(ContextualRuntimeConfig(
             curriculum_scale_start=1.0,
             curriculum_scale_end=1.0,

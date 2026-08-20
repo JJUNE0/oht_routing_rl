@@ -5,59 +5,35 @@ from __future__ import annotations
 from datetime import datetime
 
 from oht_routing.algorithms.rl.contextual_td7 import (
-    ALGORITHM_VERSION,
-    CHECKPOINT_VERSION,
-    CRITIC_INITIALIZATION,
-    LAP_VERSION,
-    REPLAY_SAMPLING_VERSION,
-    RESUME_DETERMINISTIC_EPISODE_VERSION,
-    RESUME_REPLAY_REFILL_VERSION,
-    SALE_VERSION,
-    STACK_VERSION,
     contextual_algorithm_variant,
 )
 from oht_routing.mdp.action import (
-    ACTION_SCALE_SCHEDULE_VERSION,
-    EXPLORATION_SCHEDULE_VERSION,
     REGION_B_RL,
-    action_version,
-)
-from oht_routing.routing.dispatch import DISPATCH_SELECTION_VERSION
-from oht_routing.mdp.observation import (
-    OBSERVATION_NORMALIZER_SNAPSHOT_VERSION,
-    OBSERVATION_VERSION,
 )
 from oht_routing.mdp.reward.builder import ContextualRewardConfig
 from oht_routing.mdp.reward.config import (
     reward_contract,
 )
-from oht_routing.mdp.termination import (
-    TAT_TERMINATION_POLICY_VERSION,
-    WARMUP_EPISODE_TRANSITION_VERSION,
-)
+from oht_routing.version import CONTEXTUAL_VERSION
 
 _EXP_REWARD_VERSION = "N"
 _EXP_REWARD_CONTRACT = reward_contract(_EXP_REWARD_VERSION)
 
 EXP_META = {
+    "version": CONTEXTUAL_VERSION,
     "cost_structure": "b_rl",
     "action_range": "b_rl_0.0-1.0_resume_curriculum_0.05-1",
     "topology": "directed_10in_10out_controlled_centers_v2",
     "observation": "contextual_obs_previous_applied_action_v3",
-    "observation_version": OBSERVATION_VERSION,
     "previous_action_input": (
         "actor_and_critic_previous_applied_action_separate_from_encoder"
     ),
     "critic_action_input": "previous_applied_plus_current_candidate_action",
-    "stack_version": STACK_VERSION,
     "num_stacks": 1,
     "stack_interval": 1,
     "reward_version": _EXP_REWARD_VERSION,
-    "reward_contract_version": _EXP_REWARD_CONTRACT.contract_version,
-    "reward_tat_version": _EXP_REWARD_CONTRACT.tat_version,
-    "reward_normalization_version": _EXP_REWARD_CONTRACT.normalization_version,
     "tat_signal": _EXP_REWARD_CONTRACT.tat_signal_description,
-    "calibration_status": "reward_n_only_v2",
+    "calibration_status": "reward_n_only",
     "reward_global_alpha": 0.5,
     "reward_local_alpha": 0.5,
     "tat_reference": 165.0,
@@ -84,36 +60,16 @@ EXP_META = {
     "rail_tat_weight": 30.0,
     "rail_tat_clip": 1.0,
     "action_scale": 0.05,
-    "action_scale_schedule_version": ACTION_SCALE_SCHEDULE_VERSION,
     "curriculum_scale_start": 0.05,
     "curriculum_scale_end": 1.0,
     "curriculum_shape": "geometric",
     "warmup_steps": 10_000,
-    "state_normalizer_snapshot_version": (
-        OBSERVATION_NORMALIZER_SNAPSHOT_VERSION
-    ),
     "state_normalizer_reuse": (
         "exact_contract_load_sets_effective_warmup_to_zero"
     ),
     "exploration_noise_std": 0.10,
     "exploration_noise_final_std": 0.02,
     "exploration_noise_anneal_steps": 100_000,
-    "exploration_schedule_version": EXPLORATION_SCHEDULE_VERSION,
-    "resume_refill_version": RESUME_REPLAY_REFILL_VERSION,
-    "resume_deterministic_episode_version": (
-        RESUME_DETERMINISTIC_EPISODE_VERSION
-    ),
-    "checkpoint_rng_version": "exploration_rng_v2",
-    "checkpoint_directory_version": "contextual_checkpoint_dir_slug_v1",
-    "episode_burnin_version": "deterministic_policy_burnin_v1",
-    "parameter_dw_state_version": "parameter_dw_episode_reset_v1",
-    "send_cost_logging_version": "post_send_v2",
-    "protocol_version": "single_end_time_v2",
-    "diagnostic_schema_version": "contextual_reward_diagnostic_v24_n_only",
-    "wandb_metric_schema_version": "contextual_wandb_compact_v10_n_only",
-    "reward_budget_version": (
-        "tat_backlog_final_abs_contribution_v2_reward_profile"
-    ),
     "arrival_tracking_source": "PClient.JOB_DIC.Job.ID_command_id",
     "arrival_tracking_reuse_fail_safe": True,
     "diagnostic_only_leading_indicators": (
@@ -121,14 +77,11 @@ EXP_META = {
         "arrival_completion_flow,oht_utilization,leadlag,composite_pressure"
     ),
     "centering": False,
-    "replay_sampling_version": REPLAY_SAMPLING_VERSION,
     "replay_capacity_env_steps": 100_000,
     "batch_size": 2_048,
     "seed": 0,
     "tat_early_termination": True,
     "tat_termination_policy": "reward_profile",
-    "tat_termination_policy_version": TAT_TERMINATION_POLICY_VERSION,
-    "warmup_episode_transition_version": WARMUP_EPISODE_TRANSITION_VERSION,
     "tat_termination_configured_start_episode": 1,
     "tat_termination_start_episode": 1,
     "tat_termination_grace_steps": 10_000,
@@ -137,10 +90,10 @@ EXP_META = {
     "terminal_tat_penalty": -20.0,
     "note": "n_only_v2",
     "description": (
-        "Contextual TD7 v2 executes the single locked Reward N formula. "
+        "Contextual TD7 v2.0.0 executes the single locked Reward N formula. "
         "Historical reward selectors, completion-event reward, marginal-TAT "
-        "reward, and reward normalizer state are removed. Existing v7 Reward "
-        "N checkpoints remain resume-compatible through the v8 loader."
+        "reward, and reward normalizer state are removed. The fingerprinted "
+        "step_400000.pt artifact is promoted to v2.0.0 on load."
     ),
 }
 
@@ -148,7 +101,7 @@ EXP_META = {
 def _make_run_name(exp_meta):
     stamp = datetime.now().strftime("%m%d_%H%M")
     return (
-        f"run_{stamp}_{exp_meta['cost_structure']}_"
+        f"run_{stamp}_{exp_meta['version']}_{exp_meta['cost_structure']}_"
         f"{exp_meta['action_range']}_{exp_meta['reward_version']}_"
         f"{exp_meta['note']}"
     )
@@ -187,7 +140,6 @@ WANDB_METRIC_KEYS = (
     "action/applied_controlled_mean", "action/applied_controlled_std",
     "action/applied_controlled_min", "action/applied_controlled_max",
     "action/applied_scale", "action/mode_region_b_rl",
-    "action/version_region_b_rl_v1",
     "b_rl/mean", "b_rl/std", "b_rl/min", "b_rl/max",
     "boundary/action_abs_max", "boundary/cost_baseline_abs_error_max",
     "reward/global_raw",
@@ -493,6 +445,7 @@ WANDB_METRIC_KEYS = (
     "curriculum/action_scale",
     "b_rl/mean",
     "b_rl/std",
+    "cost/all_baseline_abs_error_max",
     # Locked Reward N components and contribution budget.
     "reward/total_mean",
     "reward/total_std",
@@ -555,6 +508,9 @@ WANDB_METRIC_KEYS = (
     "replay/reward_mean",
     "replay/reward_std",
     "numeric/learner_finite_ratio",
+    # Runtime safety checks.
+    "runtime/observation_build_calls_per_tick",
+    "runtime/nonfinite_count",
     # SALE essentials only.
     "sale/loss",
     "sale/prediction_error_mean",
@@ -603,11 +559,8 @@ def runtime_exp_meta(config) -> dict:
         action_mode=config.action_mode,
     )
     contract = reward_config.contract
+    meta["version"] = CONTEXTUAL_VERSION
     meta["reward_version"] = contract.version
-    meta["reward_historical_version"] = contract.historical_version
-    meta["reward_contract_version"] = contract.contract_version
-    meta["reward_tat_version"] = contract.tat_version
-    meta["reward_normalization_version"] = contract.normalization_version
     meta["tat_signal"] = contract.tat_signal_description
     meta["calibration_status"] = (
         f"{EXP_META['calibration_status']}_"
@@ -616,17 +569,9 @@ def runtime_exp_meta(config) -> dict:
     sale = bool(config.sale_enabled)
     lap = bool(config.lap_enabled)
     action_mode = str(config.action_mode)
-    mode_version = action_version(action_mode)
-    meta["algorithm_version"] = ALGORITHM_VERSION
-    meta["algorithm_variant"] = (
-        f"{contextual_algorithm_variant(sale, lap)}_{mode_version}"
-    )
-    meta["critic_initialization"] = CRITIC_INITIALIZATION
-    meta["checkpoint_version"] = CHECKPOINT_VERSION
+    meta["algorithm_variant"] = contextual_algorithm_variant(sale, lap)
     meta["action_mode"] = action_mode
-    meta["action_version"] = mode_version
     meta["dispatch_mode"] = str(config.dispatch_mode)
-    meta["dispatch_selection_version"] = DISPATCH_SELECTION_VERSION
     meta["note"] = (
         f"{meta['note']}_r{contract.version}_s{int(config.num_stacks)}i"
         f"{int(config.stack_interval)}_dispatch_"
@@ -638,11 +583,7 @@ def runtime_exp_meta(config) -> dict:
     )
     meta["sale"] = sale
     meta["lap"] = lap
-    meta["sale_version"] = SALE_VERSION
-    meta["lap_version"] = LAP_VERSION
-    meta["replay_sampling_version"] = REPLAY_SAMPLING_VERSION
     meta["replay_sampling_mode"] = config.replay_sampling_mode
-    meta["stack_version"] = STACK_VERSION
     meta["num_stacks"] = int(config.num_stacks)
     meta["stack_interval"] = int(config.stack_interval)
     meta["critic_loss_mode"] = config.critic_loss_mode
@@ -659,7 +600,6 @@ def runtime_exp_meta(config) -> dict:
         config.curriculum_scale_end
         if action_mode == REGION_B_RL else config.action_scale
     )
-    meta["action_scale_schedule_version"] = ACTION_SCALE_SCHEDULE_VERSION
     meta["reward_global_alpha"] = float(reward_config.global_alpha)
     meta["reward_local_alpha"] = float(reward_config.local_alpha)
     meta["local_reward_scale"] = float(reward_config.local_reward_scale)
@@ -702,9 +642,6 @@ def runtime_exp_meta(config) -> dict:
     meta["idle_reserve_scale"] = float(reward_config.idle_reserve_scale)
     meta["idle_reserve_weight"] = float(reward_config.idle_reserve_weight)
     meta["tat_early_termination"] = bool(config.tat_termination_enabled)
-    meta["tat_termination_policy_version"] = (
-        TAT_TERMINATION_POLICY_VERSION
-    )
     meta["tat_termination_policy"] = str(config.tat_termination_policy)
     meta["tat_termination_configured_start_episode"] = int(
         config.tat_termination_start_episode
@@ -737,14 +674,8 @@ def runtime_exp_meta(config) -> dict:
     meta["configured_warmup_steps"] = int(config.warmup_steps)
     meta["warmup_steps"] = int(config.effective_warmup_steps)
     meta["effective_warmup_steps"] = int(config.effective_warmup_steps)
-    meta["warmup_episode_transition_version"] = (
-        WARMUP_EPISODE_TRANSITION_VERSION
-    )
     meta["terminate_on_warmup_complete"] = bool(
         config.terminate_on_warmup_complete
-    )
-    meta["state_normalizer_snapshot_version"] = (
-        OBSERVATION_NORMALIZER_SNAPSHOT_VERSION
     )
     meta["state_normalizer_load_requested"] = bool(
         config.load_state_normalizer_path
@@ -756,17 +687,11 @@ def runtime_exp_meta(config) -> dict:
         config.state_normalizer_warmup_bypass
     )
     meta["batch_size"] = int(config.batch_size)
-    meta["resume_replay_refill_version"] = (
-        RESUME_REPLAY_REFILL_VERSION
-    )
     meta["resume_inference_until_replay_full"] = bool(
         config.resume_inference_until_replay_full
     )
     meta["resume_refill_target_env_steps"] = int(
         config.resume_refill_target_env_steps
-    )
-    meta["resume_deterministic_episode_version"] = (
-        RESUME_DETERMINISTIC_EPISODE_VERSION
     )
     meta["resume_deterministic_first_episode"] = bool(
         config.resume_deterministic_first_episode
@@ -800,7 +725,6 @@ def runtime_exp_meta(config) -> dict:
         config.effective_warmup_steps
         + config.exploration_noise_anneal_steps
     )
-    meta["exploration_schedule_version"] = EXPLORATION_SCHEDULE_VERSION
     replay_mode = "lap" if lap else "uniform"
     meta["replay"] = (
         f"{config.replay_sampling_mode}_{replay_mode}_"
@@ -814,8 +738,7 @@ def runtime_exp_meta(config) -> dict:
         f"action_mode={action_mode}, dispatch_mode={config.dispatch_mode}, "
         f"critic_loss={config.critic_loss_mode}, "
         "independently initialized Q1/Q2 heads, "
-        f"reward {contract.version} (historical={contract.historical_version}, "
-        f"{contract.contract_version}, global/local="
+        f"reward {contract.version} (global/local="
         f"{reward_config.global_alpha:g}/{reward_config.local_alpha:g}), "
         f"tat_signal={contract.tat_signal_description}, "
         f"local_fixed_scale={reward_config.local_reward_scale:g}, "

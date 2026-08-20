@@ -1,0 +1,5 @@
+"""Dispatch policy names."""
+
+DISPATCH_FIRST_MATCH = "first-match"
+DISPATCH_COST = "cost"
+DISPATCH_MODES = (DISPATCH_FIRST_MATCH, DISPATCH_COST)

@@ -1432,11 +1432,6 @@ class ContextualRailRewardMixin:
         tolerance = 1e-12
         record = {
             "reward_version": self.reward_version,
-            "reward_contract_version": self.reward_contract_version,
-            "reward_tat_version": self.reward_tat_version,
-            "reward_normalization_version": (
-                self.reward_normalization_version
-            ),
             "global_step": global_step,
             "episode_id": int(episode_id),
             "episode_step": int(env_step),

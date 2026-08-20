@@ -21,7 +21,9 @@ from oht_routing.mdp.topology import TopologyAuditError, build_contextual_topolo
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 9100
-DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parents[3]
+DEFAULT_OUTPUT_DIR = (
+    Path(__file__).resolve().parents[1] / "topology" / "cache"
+)
 EXPECTED_SIMULATION_STATES = {0, 1, 2, 3, 4, 5, 6}
 
 

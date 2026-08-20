@@ -7,11 +7,9 @@ import time
 import numpy as np
 import torch
 
-from oht_routing.mdp.action import ACTION_VERSION
 from oht_routing.mdp.observation import (
     GLOBAL_DIM,
     LOCAL_DIM,
-    OBSERVATION_VERSION,
 )
 from oht_routing.mdp.reward.config import (
     REWARD_VERSION,
@@ -19,6 +17,7 @@ from oht_routing.mdp.reward.config import (
 )
 from oht_routing.mdp.topology import ContextualTopology
 from oht_routing.mdp.transition import CompletedContextualTransition
+from oht_routing.version import CONTEXTUAL_VERSION
 
 from .replay_types import (
     ContextualReplayBatch,
@@ -32,8 +31,6 @@ class ContextualReplayError(RuntimeError):
     pass
 
 
-REPLAY_VERSION = "contextual_step_snapshot_previous_applied_action_v4"
-REPLAY_SAMPLING_VERSION = "contextual_replay_sampling_modes_v2"
 REPLAY_SAMPLING_RAIL = "rail"
 REPLAY_SAMPLING_SNAPSHOT = "snapshot"
 REPLAY_SAMPLING_RANDOM_RAIL = "random_rail"
@@ -42,8 +39,6 @@ REPLAY_SAMPLING_MODES = (
     REPLAY_SAMPLING_SNAPSHOT,
     REPLAY_SAMPLING_RANDOM_RAIL,
 )
-LAP_VERSION = "contextual_snapshot_lap_hierarchical_v1"
-LAP_PERFORMANCE_VERSION = "contextual_lap_cached_vectorized_v2"
 
 
 def _copy_array(name, values, shape, dtype=np.float32):
@@ -62,7 +57,6 @@ def _copy_array(name, values, shape, dtype=np.float32):
 def snapshot_from_transition(
     transition: CompletedContextualTransition,
     *,
-    action_version: str = ACTION_VERSION,
     reward_version: str = REWARD_VERSION,
 ) -> ContextualStepSnapshot:
     """Copy the raw state and controlled vectors from a completed transition."""
@@ -112,9 +106,8 @@ def snapshot_from_transition(
         episode_id=int(transition.episode_id),
         topology_hash=transition.topology_hash,
         mapping_hash=transition.mapping_hash,
-        observation_version=OBSERVATION_VERSION,
+        version=CONTEXTUAL_VERSION,
         reward_version=str(reward_version),
-        action_version=str(action_version),
     )
 
 
@@ -131,7 +124,6 @@ class ContextualStepReplayBuffer:
         lap_enabled: bool = False,
         lap_alpha: float = 0.4,
         lap_min_priority: float = 1.0,
-        action_version: str = ACTION_VERSION,
         reward_version: str = REWARD_VERSION,
         sampling_mode: str = REPLAY_SAMPLING_RAIL,
         num_stacks: int = 1,
@@ -163,7 +155,6 @@ class ContextualStepReplayBuffer:
         self.lap_enabled = bool(lap_enabled)
         self.lap_alpha = float(lap_alpha)
         self.lap_min_priority = float(lap_min_priority)
-        self.action_version = str(action_version)
         self.reward_version = canonical_reward_version(reward_version)
         self.sampling_mode = str(sampling_mode)
         self.num_stacks, self.stack_interval = validate_stack_config(
@@ -260,9 +251,8 @@ class ContextualStepReplayBuffer:
 
     def _validate_snapshot(self, snapshot: ContextualStepSnapshot) -> None:
         expected_versions = (
-            (snapshot.observation_version, OBSERVATION_VERSION, "observation"),
+            (snapshot.version, CONTEXTUAL_VERSION, "runtime"),
             (snapshot.reward_version, self.reward_version, "reward"),
-            (snapshot.action_version, self.action_version, "action"),
         )
         if snapshot.topology_hash != self.topology.topology_hash:
             self.hash_mismatch_count += 1
@@ -443,7 +433,6 @@ class ContextualStepReplayBuffer:
         return self.push(
             snapshot_from_transition(
                 transition,
-                action_version=self.action_version,
                 reward_version=self.reward_version,
             )
         )

@@ -1,5 +1,21 @@
 # Contextual TD7 v2 for OHT routing
 
+## Checkpoint actor evaluation
+
+Run a deterministic actor evaluation without exploration, replay collection,
+learner updates, or checkpoint writes:
+
+```powershell
+python .\PythonCode\main.py `
+  --mode actor_inference `
+  --action-enabled `
+  --resume-checkpoint ".\checkpoints\ctx_td7_reward_n_detep1_b2048\periodic\step_400000.pt"
+```
+
+The checkpoint is loaded after simulator topology initialization. Confirm the
+`[checkpoint-loaded]` block reports the expected environment step, action
+scale, and restored normalizers before using evaluation results.
+
 반도체 FAB OHT의 rail cost를 학습해 혼잡 구간을 우회시키는 contextual TD7
 구현입니다. `contextual-td7-v2` 브랜치는 Reward N만 실행하며, 이전 Reward
 E~U 구현과 실험 기록은 `contextual-region-brl-v1` 브랜치와 루트의
@@ -77,10 +93,9 @@ oht_routing/
 ├─ algorithms/rl/contextual_td7/   TD7, SALE, LAP, replay, checkpoint
 ├─ mdp/                            action, observation, transition, termination
 │  └─ reward/                      Reward N 설정, 조합, rail-cycle 추적
-├─ routing/dispatch.py             simulator dispatch 선택
 ├─ runtime/                        client, CLI/config, protocol, TCP server
 └─ utils/                          W&B, reward 진단, topology/분석 도구
-oht_dispatching/                   job-to-OHT dispatching 전용 패키지
+oht_dispatching/                   job-to-OHT 후보 생성과 dispatch 선택
 simulator/                         TCP protocol과 simulator entity 모델
 tests/                             contextual 회귀 테스트
 ```
@@ -115,11 +130,12 @@ python .\PythonCode\main.py `
 
 ## Checkpoint와 resume
 
-새 checkpoint 형식은
-`contextual_td7_checkpoint_v8_reward_n_only`입니다. replay payload는
-저장하지 않으므로 resume 후 replay를 다시 채워야 합니다. v7 Reward N
-checkpoint는 명시적인 호환 경로로 읽으며, reward identity나 topology,
-observation, network 계약이 다르면 fail-fast합니다.
+통합 runtime/checkpoint 버전은 `v2.0.0`입니다. checkpoint 로드는
+통합 버전, topology/mapping hash, network config, action mode,
+SALE/LAP 사용 여부, Reward N만 호환성으로 검사합니다. replay payload는
+저장하지 않으므로 training resume 후에는 replay를 다시 채워야 합니다.
+기존 `step_400000.pt`는 정확한 SHA-256 fingerprint으로만
+`v2.0.0`으로 예외 승격됩니다.
 
 ```powershell
 python .\PythonCode\main.py `
@@ -149,8 +165,8 @@ PyTorch가 memory-efficient attention backward의 비결정적 CUDA 경로를
 `EXP_META["description"]`을 notes로 전달합니다.
 
 v2 변경과 실험 결과는 루트의 `EXPERIMENTS_v2.md`에 기록합니다.
-reward 공식 변경 시 reward version을 올리고, action/observation/replay/
-checkpoint 계약 변경 시 해당 버전과 호환성 영향을 함께 기록합니다.
+모든 변경은 `oht_routing/version.py`의 단일
+`vMAJOR.MINOR.PATCH` 버전으로 분리하고 호환성 영향을 함께 기록합니다.
 W&B metric을 바꾸면
 `oht_routing/utils/export_wandb_run.py`도 같이 수정합니다.
 

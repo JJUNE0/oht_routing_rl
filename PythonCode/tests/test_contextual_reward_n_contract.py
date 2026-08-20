@@ -90,20 +90,9 @@ class RewardNContractTests(unittest.TestCase):
                     batch.global_component, 0.5 * expected_global_raw
                 )
 
-    def test_checkpoint_and_termination_identity(self):
+    def test_reward_and_termination_identity(self):
         contract = reward_contract("N")
-        self.assertEqual(
-            contract.contract_version,
-            "contextual_controlled_reward_v16_tat_one_sided_unbounded",
-        )
-        self.assertEqual(
-            contract.tat_version,
-            "one_sided_total_tat_excess160_unbounded_v1",
-        )
-        self.assertEqual(
-            contract.normalization_version,
-            "fixed_scale_no_reward_normalizer_v1",
-        )
+        self.assertEqual(contract.version, "N")
         self.assertEqual(
             tat_termination_profile(
                 TAT_TERMINATION_REWARD_PROFILE, contract

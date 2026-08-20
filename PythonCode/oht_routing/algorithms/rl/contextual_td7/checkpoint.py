@@ -2,33 +2,22 @@
 
 from __future__ import annotations
 
+import hashlib
 import random
-import re
 from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
 import torch
 
-from oht_routing.mdp.action import action_version
-from oht_routing.mdp.observation import OBSERVATION_VERSION
-from .learner import LEARNER_VERSION
-from .replay_buffer import REPLAY_VERSION
-from .replay_buffer import LAP_VERSION
-from .sale import SALE_VERSION
-from .stacking import STACK_VERSION
+from oht_routing.version import CONTEXTUAL_VERSION
 
 
-CHECKPOINT_VERSION = "contextual_td7_checkpoint_v8_reward_n_only"
-RESUME_REPLAY_REFILL_VERSION = (
-    "contextual_resume_replay_refill_v3_optional_full_capacity"
-)
-RESUME_DETERMINISTIC_EPISODE_VERSION = (
-    "contextual_resume_deterministic_first_episode_v1"
-)
-LEGACY_CHECKPOINT_VERSIONS = {
-    "contextual_td7_checkpoint_v3_independent_twin_critic",
-    "contextual_td7_checkpoint_v7_locked_reward_profile",
+PROMOTED_CHECKPOINTS = {
+    # checkpoints/ctx_td7_reward_n_detep1_b2048/periodic/step_400000.pt
+    "7c2d6a19184060584efeb69f52be57c3e7fffad33da52c8c1c879ed39db8bc2b": (
+        "contextual_td7_checkpoint_v7_locked_reward_profile"
+    ),
 }
 CRITIC_INITIALIZATION = "independent"
 
@@ -37,130 +26,67 @@ class ContextualCheckpointError(RuntimeError):
     pass
 
 
-_ADDITIVE_RESUME_RUNTIME_METADATA = {
-    "action_scale_schedule_version",
-    "state_normalizer_snapshot_version",
-    "warmup_episode_transition_version",
-    "terminate_on_warmup_complete",
-    # Legacy v7 metadata only; v8 has no reward-normalizer state.
-    "reward_normalizer_snapshot_version",
-    "tat_termination_policy_version",
-    "tat_termination_policy",
-    "tat_termination_configured_start_episode",
-    "resume_replay_refill_version",
-    "resume_deterministic_episode_version",
-}
-_RUNTIME_CONFIG_BACKED_RESUME_METADATA = {
-    "tat_termination_enabled",
-    "tat_termination_grace_steps",
-    "early_stop_tat_threshold",
-    "tat_above_threshold_patience",
-    "tat_termination_inclusive",
-}
+def _checkpoint_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as checkpoint_file:
+        for chunk in iter(lambda: checkpoint_file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
-def _resume_algorithm_versions_compatible(saved, runtime) -> bool:
-    """Accept only known resume-lifecycle changes to an algorithm identity."""
-    if not isinstance(saved, str) or not isinstance(runtime, str):
-        return False
-    # Checkpoints written before the lifecycle fields were added end at the
-    # stack identity. All model/reward/observation contracts are still checked
-    # independently below.
-    if runtime.startswith(saved + "_"):
-        return True
+def _resolve_checkpoint_version(
+    path: str | Path,
+    payload: dict,
+    *,
+    announce_promotion: bool = False,
+) -> str:
+    """Return the unified version, allowing one fingerprinted promotion."""
+    saved_version = payload.get("version")
+    if saved_version == CONTEXTUAL_VERSION:
+        return CONTEXTUAL_VERSION
 
-    def normalize(value):
-        value = re.sub(
-            r"rewardnormreuse[01]", "rewardnormreuse*", value
-        )
-        value = re.sub(r"_ep\d+_", "_ep*_", value)
-        value = re.sub(r"normreuse[01]", "normreuse*", value)
-        value = re.sub(r"detfirst[01]", "detfirst*", value)
-        return re.sub(r"fullrefill[01]", "fullrefill*", value)
+    target = Path(path)
+    legacy_version = payload.get("checkpoint_version")
+    fingerprint = _checkpoint_sha256(target)
+    promoted_legacy_version = PROMOTED_CHECKPOINTS.get(fingerprint)
+    if (
+        promoted_legacy_version is not None
+        and promoted_legacy_version == legacy_version
+    ):
+        if announce_promotion:
+            print(
+                "[checkpoint-compat] promoted checkpoint artifact: "
+                f"{legacy_version} -> {CONTEXTUAL_VERSION}, "
+                f"sha256={fingerprint}",
+                flush=True,
+            )
+        return CONTEXTUAL_VERSION
 
-    return normalize(saved) == normalize(runtime)
-
-
-def _resume_runtime_metadata_transition_allowed(key, saved, runtime) -> bool:
-    """Allow additive metadata and intentional normalizer-resume transitions."""
-    if key == "algorithm_version":
-        return _resume_algorithm_versions_compatible(saved, runtime)
-    if key in {
-        "resume_inference_until_replay_full",
-        "resume_deterministic_first_episode",
-    }:
-        return isinstance(runtime, bool) and (
-            saved is None or isinstance(saved, bool)
-        )
-    if key == "resume_refill_target_env_steps":
-        return runtime > 0 and (saved is None or int(saved) > 0)
-    if key in _ADDITIVE_RESUME_RUNTIME_METADATA:
-        return saved is None
-    if key == "state_normalizer_warmup_bypass":
-        return runtime is True and saved in (None, False)
-    if key == "effective_warmup_steps":
-        return runtime == 0 and (saved is None or int(saved) >= 0)
-    if key == "reward_normalizer_reuse":
-        # Compatibility with v7 lifecycle metadata; not an active v8 feature.
-        return runtime is True and saved in (None, False)
-    if key == "tat_termination_start_episode":
-        return runtime == 1 and (saved is None or int(saved) >= 1)
-    return False
+    raise ContextualCheckpointError(
+        "checkpoint version mismatch: "
+        f"saved={saved_version or legacy_version!r}, "
+        f"runtime={CONTEXTUAL_VERSION!r}. Only the explicitly fingerprinted "
+        "step_400000.pt legacy artifact is promoted."
+    )
 
 
 def read_contextual_runtime_config(path) -> tuple[dict, bool]:
     """Read saved runtime settings before constructing the runtime.
 
     Current checkpoints contain the complete ContextualRuntimeConfig.
-    Version 3 checkpoints are reconstructed from the metadata that existed at
-    the time; settings absent from that format must retain current defaults.
+    The one explicitly promoted legacy artifact also contains this complete
+    runtime configuration.
     """
-    payload = torch.load(Path(path), map_location="cpu", weights_only=False)
-    version = payload.get("checkpoint_version")
-    if version != CHECKPOINT_VERSION and version not in LEGACY_CHECKPOINT_VERSIONS:
-        raise ContextualCheckpointError(
-            "Legacy or incompatible contextual checkpoint resume refused: "
-            f"saved={version!r}, runtime={CHECKPOINT_VERSION!r}."
-        )
+    target = Path(path)
+    payload = torch.load(target, map_location="cpu", weights_only=False)
+    _resolve_checkpoint_version(target, payload)
     saved = payload.get("runtime_config")
     if isinstance(saved, dict) and saved:
         return dict(saved), True
-
-    # Best-effort compatibility for checkpoints produced by the already
-    # running v3 process. These formats did not persist every runtime field.
-    reconstructed = {}
-    metadata = dict(payload.get("runtime_metadata", {}))
-    learner_config = dict(payload.get("learner_config", {}))
-    direct_metadata_fields = (
-        "action_mode",
-        "action_scale",
-        "curriculum_end_step",
-        "curriculum_scale_start",
-        "curriculum_scale_end",
-        "curriculum_shape",
-        "exploration_noise_std",
-        "exploration_noise_final_std",
-        "exploration_noise_anneal_steps",
-        "critic_loss_mode",
+    raise ContextualCheckpointError(
+        "checkpoint runtime_config is missing; this artifact cannot be "
+        "restored under the unified version contract"
     )
-    for key in direct_metadata_fields:
-        if key in metadata:
-            reconstructed[key] = metadata[key]
-    if "exploration_noise_anneal_start_step" in metadata:
-        reconstructed["warmup_steps"] = metadata[
-            "exploration_noise_anneal_start_step"
-        ]
-    for key in (
-        "batch_size",
-        "minimum_replay_env_steps",
-        "minimum_action_enabled_env_steps",
-        "sale_enabled",
-        "lap_enabled",
-        "critic_loss_mode",
-    ):
-        if key in learner_config:
-            reconstructed[key] = learner_config[key]
-    return reconstructed, False
 
 
 def _normalizer_state(normalizer):
@@ -217,19 +143,10 @@ def save_contextual_checkpoint(
             "refusing to save a symmetric target twin critic"
         )
     payload = {
-        "checkpoint_version": CHECKPOINT_VERSION,
+        "version": CONTEXTUAL_VERSION,
         "critic_initialization": CRITIC_INITIALIZATION,
-        "learner_version": LEARNER_VERSION,
-        "observation_version": OBSERVATION_VERSION,
         "reward_version": reward_builder.reward_version,
-        "reward_contract_version": reward_builder.reward_contract_version,
-        "reward_tat_version": reward_builder.reward_tat_version,
-        "reward_normalization_version": (
-            reward_builder.reward_normalization_version
-        ),
-        "action_version": action_version(learner.config.action_mode),
-        "replay_version": REPLAY_VERSION,
-        "stack_version": STACK_VERSION,
+        "action_mode": learner.config.action_mode,
         "topology_hash": learner.replay.topology.topology_hash,
         "mapping_hash": learner.replay.topology.mapping_hash,
         "network_config": asdict(learner.network_config),
@@ -239,8 +156,6 @@ def save_contextual_checkpoint(
         "algorithm_variant": learner.config.algorithm_variant,
         "sale_enabled": learner.config.sale_enabled,
         "lap_enabled": learner.config.lap_enabled,
-        "sale_version": SALE_VERSION,
-        "lap_version": LAP_VERSION,
         "lap_metadata": {
             "enabled": learner.config.lap_enabled,
             "alpha": learner.config.lap_alpha,
@@ -310,15 +225,11 @@ def load_contextual_checkpoint(
     *,
     observation_builder,
     reward_builder,
-    expected_runtime_metadata=None,
-    allow_resume_metadata_upgrade=False,
-    allowed_learner_config_overrides=(),
     exploration_rng=None,
     exploration_seed=0,
 ) -> None:
-    payload = torch.load(
-        Path(path), map_location=learner.device, weights_only=False
-    )
+    target = Path(path)
+    payload = torch.load(target, map_location=learner.device, weights_only=False)
     runtime_metadata = dict(payload.get("runtime_metadata", {}))
     if (
         runtime_metadata.get("checkpoint_kind") == "crash"
@@ -328,119 +239,32 @@ def load_contextual_checkpoint(
             "Crash checkpoint resume refused. "
             "Crash checkpoints are diagnostic artifacts only."
         )
-    saved_checkpoint_version = payload.get("checkpoint_version")
-    if (
-        saved_checkpoint_version != CHECKPOINT_VERSION
-        and saved_checkpoint_version not in LEGACY_CHECKPOINT_VERSIONS
-    ):
-        raise ContextualCheckpointError(
-            "Legacy or incompatible contextual checkpoint resume refused: "
-            f"saved={saved_checkpoint_version!r}, "
-            f"runtime={CHECKPOINT_VERSION!r}. A fresh independent twin-critic "
-            "run is required."
-        )
+    _resolve_checkpoint_version(target, payload, announce_promotion=True)
     expected = {
-        "critic_initialization": CRITIC_INITIALIZATION,
-        "learner_version": LEARNER_VERSION,
-        "observation_version": OBSERVATION_VERSION,
-        "action_version": action_version(learner.config.action_mode),
-        "replay_version": REPLAY_VERSION,
-        "stack_version": STACK_VERSION,
         "topology_hash": learner.replay.topology.topology_hash,
         "mapping_hash": learner.replay.topology.mapping_hash,
         "network_config": asdict(learner.network_config),
-        "learner_config": asdict(learner.config),
-        "action_scale": learner.config.action_scale,
-        "algorithm_variant": learner.config.algorithm_variant,
+        "action_mode": learner.config.action_mode,
+        "reward_version": reward_builder.reward_version,
         "sale_enabled": learner.config.sale_enabled,
         "lap_enabled": learner.config.lap_enabled,
-        "sale_version": SALE_VERSION,
-        "lap_version": LAP_VERSION,
-        "lap_metadata": {
-            "enabled": learner.config.lap_enabled,
-            "alpha": learner.config.lap_alpha,
-            "min_priority": learner.config.lap_min_priority,
-            "priority_array_saved": False,
-            "resume_requires_replay_refill": True,
-        },
     }
-    allowed_learner_config_overrides = frozenset(
-        allowed_learner_config_overrides
-    )
     for key, value in expected.items():
         saved = payload.get(key)
+        if key == "action_mode" and saved is None:
+            saved = dict(payload.get("learner_config", {})).get(key)
         if saved == value:
             continue
-        if key == "learner_config" and allowed_learner_config_overrides:
-            saved_config = dict(saved or {})
-            runtime_config = dict(value)
-            differing = {
-                name
-                for name in set(saved_config) | set(runtime_config)
-                if saved_config.get(name) != runtime_config.get(name)
-            }
-            if differing and differing <= allowed_learner_config_overrides:
-                print(
-                    "[checkpoint-compat] accepted learner config override: "
-                    + ",".join(sorted(differing)),
-                    flush=True,
-                )
-                continue
         raise ContextualCheckpointError(
             f"checkpoint {key} mismatch: saved={saved!r}, "
             f"runtime={value!r}"
         )
-    expected_reward = {
-        "reward_version": reward_builder.reward_version,
-        "reward_contract_version": reward_builder.reward_contract_version,
-        "reward_tat_version": reward_builder.reward_tat_version,
-        "reward_normalization_version": (
-            reward_builder.reward_normalization_version
-        ),
-    }
-    for key, value in expected_reward.items():
-        if payload.get(key) != value:
-            raise ContextualCheckpointError(
-                f"checkpoint {key} mismatch: "
-                f"saved={payload.get(key)!r}, runtime={value!r}. A fresh "
-                "run is required because reward formula/normalizer state "
-                "from another reward profile is incompatible."
-            )
     for state_key in ("online_critic", "target_critic"):
         if _twin_state_max_abs_diff(payload[state_key]) <= 0.0:
             raise ContextualCheckpointError(
                 "symmetric twin-critic checkpoint resume refused: "
                 f"{state_key} has identical Q1/Q2 parameters"
             )
-    upgraded_runtime_metadata = []
-    saved_runtime_config = dict(payload.get("runtime_config", {}) or {})
-    for key, value in dict(expected_runtime_metadata or {}).items():
-        saved = payload.get("runtime_metadata", {}).get(key)
-        if saved == value:
-            continue
-        if (
-            allow_resume_metadata_upgrade
-            and saved is None
-            and key in _RUNTIME_CONFIG_BACKED_RESUME_METADATA
-            and saved_runtime_config.get(key) == value
-        ):
-            upgraded_runtime_metadata.append(key)
-            continue
-        if allow_resume_metadata_upgrade and (
-            _resume_runtime_metadata_transition_allowed(key, saved, value)
-        ):
-            upgraded_runtime_metadata.append(key)
-            continue
-        raise ContextualCheckpointError(
-            f"checkpoint runtime metadata {key} mismatch: "
-            f"saved={saved!r}, runtime={value!r}"
-        )
-    if upgraded_runtime_metadata:
-        print(
-            "[checkpoint-compat] accepted resume-only metadata upgrade: "
-            + ",".join(upgraded_runtime_metadata),
-            flush=True,
-        )
     learner.encoder.load_state_dict(payload["online_encoder"])
     learner.actor.load_state_dict(payload["online_actor"])
     learner.critic.load_state_dict(payload["online_critic"])

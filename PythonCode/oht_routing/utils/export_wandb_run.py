@@ -57,6 +57,11 @@ WARMUP_BOUNDARY_EXPORT_COLUMNS = {
     "termination/by_warmup",
     "warmup/episode_boundary_sent",
 }
+RUNTIME_SAFETY_EXPORT_COLUMNS = {
+    "cost/all_baseline_abs_error_max",
+    "runtime/observation_build_calls_per_tick",
+    "runtime/nonfinite_count",
+}
 
 
 if len(WANDB_METRIC_KEYS) != len(set(WANDB_METRIC_KEYS)):
@@ -67,9 +72,11 @@ if not REWARD_N_EXPORT_COLUMNS <= set(WANDB_METRIC_KEYS):
     raise RuntimeError("Reward N diagnostics are missing from W&B export schema")
 if not WARMUP_BOUNDARY_EXPORT_COLUMNS <= set(WANDB_METRIC_KEYS):
     raise RuntimeError("warm-up boundary diagnostics are missing from W&B export schema")
+if not RUNTIME_SAFETY_EXPORT_COLUMNS <= set(WANDB_METRIC_KEYS):
+    raise RuntimeError("runtime safety diagnostics are missing from W&B export schema")
 
 EXPORT_COLUMNS = ("_step",) + WANDB_METRIC_KEYS
-EXPORT_SCHEMA_VERSION = EXP_META["wandb_metric_schema_version"]
+EXPORT_SCHEMA_VERSION = EXP_META["version"]
 
 
 def main():

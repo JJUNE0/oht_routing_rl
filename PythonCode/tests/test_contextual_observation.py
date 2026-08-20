@@ -9,13 +9,13 @@ from oht_routing.mdp.observation import (
     GLOBAL_DIM,
     LOCAL_FEATURE_NAMES,
     LOCAL_DIM,
-    OBSERVATION_NORMALIZER_SNAPSHOT_VERSION,
     RELATION_DIM,
     ContextualObservationBuilder,
     ObservationContractError,
     ObservationNormalizerConfig,
 )
 from oht_routing.mdp.topology import ContextualTopology
+from oht_routing.version import CONTEXTUAL_VERSION
 
 
 BOUNDARY_IDS = (3250, 3251, 3252)
@@ -322,8 +322,8 @@ class ContextualObservationTests(unittest.TestCase):
 
         with np.load(path, allow_pickle=False) as saved:
             self.assertEqual(
-                str(saved["snapshot_version"].item()),
-                OBSERVATION_NORMALIZER_SNAPSHOT_VERSION,
+                str(saved["version"].item()),
+                CONTEXTUAL_VERSION,
             )
             self.assertEqual(
                 tuple(str(value) for value in saved["local_feature_names"]),

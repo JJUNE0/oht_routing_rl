@@ -15,6 +15,7 @@ from typing import Mapping
 import numpy as np
 
 from oht_routing.mdp.topology import ContextualTopology, TOPOLOGY_VERSION
+from oht_routing.version import CONTEXTUAL_VERSION
 
 
 LOCAL_FEATURE_NAMES = (
@@ -43,12 +44,6 @@ RELATION_FEATURE_NAMES = (
 LOCAL_DIM = len(LOCAL_FEATURE_NAMES)
 GLOBAL_DIM = len(GLOBAL_FEATURE_NAMES)
 RELATION_DIM = len(RELATION_FEATURE_NAMES)
-OBSERVATION_VERSION = "physical_raw_contextual_previous_applied_action_v2"
-OBSERVATION_NORMALIZER_SNAPSHOT_VERSION = (
-    "contextual_observation_normalizer_snapshot_v2_feature_contract"
-)
-
-
 class ObservationContractError(RuntimeError):
     """Raised when runtime observation data violates the fixed contract."""
 
@@ -534,10 +529,7 @@ class ContextualObservationBuilder:
         with temporary.open("wb") as stream:
             np.savez_compressed(
                 stream,
-                snapshot_version=np.asarray(
-                    OBSERVATION_NORMALIZER_SNAPSHOT_VERSION
-                ),
-                observation_version=np.asarray(OBSERVATION_VERSION),
+                version=np.asarray(CONTEXTUAL_VERSION),
                 topology_version=np.asarray(TOPOLOGY_VERSION),
                 topology_hash=np.asarray(self.topology.topology_hash),
                 mapping_hash=np.asarray(self.topology.mapping_hash),
@@ -597,8 +589,7 @@ class ContextualObservationBuilder:
         try:
             with np.load(source, allow_pickle=False) as saved:
                 expected_scalars = {
-                    "snapshot_version": OBSERVATION_NORMALIZER_SNAPSHOT_VERSION,
-                    "observation_version": OBSERVATION_VERSION,
+                    "version": CONTEXTUAL_VERSION,
                     "topology_version": TOPOLOGY_VERSION,
                     "topology_hash": self.topology.topology_hash,
                     "mapping_hash": self.topology.mapping_hash,
