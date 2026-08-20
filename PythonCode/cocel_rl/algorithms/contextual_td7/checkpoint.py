@@ -19,9 +19,7 @@ from .sale import SALE_VERSION
 from .stacking import STACK_VERSION
 
 
-CHECKPOINT_VERSION = (
-    "contextual_td7_checkpoint_v7_locked_reward_profile"
-)
+CHECKPOINT_VERSION = "contextual_td7_checkpoint_v8_reward_n_only"
 RESUME_REPLAY_REFILL_VERSION = (
     "contextual_resume_replay_refill_v3_optional_full_capacity"
 )
@@ -30,6 +28,7 @@ RESUME_DETERMINISTIC_EPISODE_VERSION = (
 )
 LEGACY_CHECKPOINT_VERSIONS = {
     "contextual_td7_checkpoint_v3_independent_twin_critic",
+    "contextual_td7_checkpoint_v7_locked_reward_profile",
 }
 CRITIC_INITIALIZATION = "independent"
 
@@ -43,6 +42,7 @@ _ADDITIVE_RESUME_RUNTIME_METADATA = {
     "state_normalizer_snapshot_version",
     "warmup_episode_transition_version",
     "terminate_on_warmup_complete",
+    # Legacy v7 metadata only; v8 has no reward-normalizer state.
     "reward_normalizer_snapshot_version",
     "tat_termination_policy_version",
     "tat_termination_policy",
@@ -101,6 +101,7 @@ def _resume_runtime_metadata_transition_allowed(key, saved, runtime) -> bool:
     if key == "effective_warmup_steps":
         return runtime == 0 and (saved is None or int(saved) >= 0)
     if key == "reward_normalizer_reuse":
+        # Compatibility with v7 lifecycle metadata; not an active v8 feature.
         return runtime is True and saved in (None, False)
     if key == "tat_termination_start_episode":
         return runtime == 1 and (saved is None or int(saved) >= 1)
@@ -267,12 +268,6 @@ def save_contextual_checkpoint(
         ),
         "observation_global_normalizer": _normalizer_state(
             observation_builder.global_normalizer
-        ),
-        "reward_local_normalizer": _normalizer_state(
-            reward_builder.local_normalizer
-        ),
-        "reward_global_normalizer": _normalizer_state(
-            reward_builder.global_normalizer
         ),
         "reward_steps": int(reward_builder.reward_steps),
         "python_random_state": random.getstate(),
@@ -485,14 +480,6 @@ def load_contextual_checkpoint(
     _load_normalizer(
         observation_builder.global_normalizer,
         payload["observation_global_normalizer"],
-    )
-    _load_normalizer(
-        reward_builder.local_normalizer,
-        payload["reward_local_normalizer"],
-    )
-    _load_normalizer(
-        reward_builder.global_normalizer,
-        payload["reward_global_normalizer"],
     )
     reward_builder.reward_steps = int(payload["reward_steps"])
     random.setstate(payload["python_random_state"])

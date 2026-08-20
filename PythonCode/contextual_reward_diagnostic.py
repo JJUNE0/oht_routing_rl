@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 
 
-DIAGNOSTIC_SCHEMA_VERSION = "contextual_reward_diagnostic_v23_reward_profiles_e_u"
+DIAGNOSTIC_SCHEMA_VERSION = "contextual_reward_diagnostic_v24_n_only"
 DEFAULT_DIAGNOSTIC_WINDOWS = (
     (0, 1_000, "00000_01000"),
     (10_000, 11_000, "10000_11000"),

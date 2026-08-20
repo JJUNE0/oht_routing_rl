@@ -128,34 +128,28 @@ class ContextualRuntimeTests(unittest.TestCase):
         self.assertTrue(np.isfinite(costs).all())
         np.testing.assert_array_equal(costs, result.final_cost)
 
-    def test_runtime_wires_reward_u_completion_global_raw_local_normalized(self):
+    def test_runtime_wires_locked_reward_n_profile(self):
         runtime = self.runtime()
         runtime._ensure_initialized(make_runtime_pclient())
         reward = runtime.reward_builder.config
 
         self.assertEqual(reward.tat_reference, 165.0)
-        self.assertEqual(reward.tat_weight, 2.3)
-        self.assertFalse(reward.tat_one_sided)
-        self.assertEqual(reward.op_weight, 0.0)
-        self.assertFalse(reward.use_op)
-        self.assertEqual(reward.backlog_weight, 0.0025)
-        self.assertFalse(reward.backlog_growth_enabled)
-        self.assertEqual(reward.backlog_growth_weight, 0.0)
-        self.assertEqual(reward.idle_reserve_weight, 0.0)
+        self.assertEqual(reward.tat_weight, 11.0)
+        self.assertEqual(reward.op_weight, 4.0)
+        self.assertTrue(reward.use_op)
+        self.assertEqual(reward.backlog_weight, 0.0004)
+        self.assertTrue(reward.backlog_growth_enabled)
+        self.assertEqual(reward.backlog_growth_weight, 0.16)
+        self.assertEqual(reward.idle_reserve_weight, 0.20)
         self.assertEqual(reward.local_oht_weight, 0.3)
-        self.assertEqual(reward.local_predicted_oht_weight, 0.2)
+        self.assertEqual(reward.local_predicted_oht_weight, 0.075)
         self.assertEqual(reward.local_stop_weight, 0.3)
-        self.assertEqual(reward.local_idle_weight, 0.1)
+        self.assertEqual(reward.local_idle_weight, 0.0)
         self.assertEqual(reward.local_capacity_weight, 0.1)
-        self.assertFalse(reward.global_normalization_enabled)
-        self.assertTrue(reward.local_normalization_enabled)
-        self.assertFalse(reward.local_fixed_scale_enabled)
-        self.assertEqual(reward.freeze_after_env_steps, 30_000)
-        self.assertEqual(reward.rail_tat_weight, 1.0)
-        self.assertIsNone(reward.rail_tat_clip)
+        self.assertEqual(reward.rail_tat_weight, 30.0)
+        self.assertEqual(reward.rail_tat_clip, 1.0)
         self.assertEqual(reward.rail_free_flow_neutral_ratio, 2.0)
-        self.assertIsNone(reward.tat_raw_clip)
-        self.assertEqual(reward.smooth_b_rl_weight, 0.05)
+        self.assertEqual(reward.smooth_b_rl_weight, 0.25)
         self.assertIsNone(runtime.reward_diagnostic_writer)
         self.assertIsNone(runtime.rail_tat_diagnostic_path)
 
@@ -180,18 +174,17 @@ class ContextualRuntimeTests(unittest.TestCase):
             record = records[0]
             self.assertEqual(record["global_step"], 1)
             self.assertEqual(record["episode_step"], 0)
-            self.assertEqual(record["tat_weight"], 2.3)
-            self.assertEqual(record["backlog_weight"], 0.0025)
-            self.assertEqual(record["local_predicted_oht_weight"], 0.2)
-            self.assertEqual(record["local_reward_scale"], 1.0)
-            self.assertEqual(record["rail_tat_weight"], 1.0)
-            self.assertIsNone(record["rail_tat_clip"])
+            self.assertEqual(record["tat_weight"], 11.0)
+            self.assertEqual(record["backlog_weight"], 0.0004)
+            self.assertEqual(record["local_predicted_oht_weight"], 0.075)
+            self.assertEqual(record["local_reward_scale"], 2.0)
+            self.assertEqual(record["rail_tat_weight"], 30.0)
+            self.assertEqual(record["rail_tat_clip"], 1.0)
             for field in (
-                "global_normalized",
-                "completion_tat_raw_abs",
+                "tat_raw_abs",
                 "backlog_raw_abs",
                 "global_component_abs",
-                "completion_tat_contribution_abs",
+                "tat_contribution_abs",
                 "backlog_contribution_abs",
                 "local_component_abs_mean",
                 "rail_component_abs_mean",
@@ -202,11 +195,11 @@ class ContextualRuntimeTests(unittest.TestCase):
                 self.assertIn(field, record)
             self.assertEqual(
                 set(record["reward_budget_shares"]),
-                {"completion_tat", "backlog", "local", "rail", "smooth"},
+                {"tat", "backlog", "local", "rail", "smooth"},
             )
             self.assertAlmostEqual(
-                record["completion_tat_contribution_abs"],
-                0.5 * record["completion_tat_raw_abs"],
+                record["tat_contribution_abs"],
+                0.5 * record["tat_raw_abs"],
             )
             self.assertAlmostEqual(
                 record["backlog_contribution_abs"],

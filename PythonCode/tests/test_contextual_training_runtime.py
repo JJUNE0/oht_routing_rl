@@ -10,10 +10,6 @@ import torch
 from ClientAlgorithm_contextual import ClientAlgorithm, ContextualRuntimeConfig
 from ClientAlgorithm_contextual import ContextualTrainingFailure
 from contextual_action import EXP_RESIDUAL, REGION_B_RL
-from contextual_termination import (
-    TAT_TERMINATION_EPISODE2_TAT175,
-    TAT_TERMINATION_EPISODE2_TAT180,
-)
 from cocel_rl.algorithms.contextual_td7 import (
     ALGORITHM_VERSION,
     ContextualLearnerConfig,
@@ -254,19 +250,16 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
                 runtime.checkpoint_root.name, runtime.checkpoint_variant
             )
 
-        historical_e = ClientAlgorithm(ContextualRuntimeConfig(
-            reward_version="E",
+        scheduled_n = ClientAlgorithm(ContextualRuntimeConfig(
             curriculum_scale_start=0.05,
             curriculum_scale_end=1.0,
         ))
-        fixed_scale_e = ClientAlgorithm(ContextualRuntimeConfig(
-            reward_version="E",
+        fixed_scale_n = ClientAlgorithm(ContextualRuntimeConfig(
             curriculum_scale_start=1.0,
             curriculum_scale_end=1.0,
-            tat_termination_policy=TAT_TERMINATION_EPISODE2_TAT175,
         ))
         self.assertNotEqual(
-            historical_e.checkpoint_root, fixed_scale_e.checkpoint_root
+            scheduled_n.checkpoint_root, fixed_scale_n.checkpoint_root
         )
 
     def test_wandb_tick_is_logged_only_after_send_timing_is_recorded(self):
@@ -293,24 +286,24 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
         self.assertIn("runtime/checkpoint_ms", captured[0][0])
         self.assertEqual(captured[0][1], runtime.total_steps)
 
-    def test_command_trace_completion_forces_wandb_log_between_intervals(self):
+    def test_wandb_logging_uses_the_configured_interval(self):
         runtime, _ = training_runtime(wandb_log_interval=10)
         captured = []
         runtime.wandb_logger.log = lambda diagnostics, step: captured.append(
             (dict(diagnostics), step)
         )
         runtime.total_steps = 7
-        runtime.last_diagnostics = {"trace/command/completed": 0.0}
+        runtime.last_diagnostics = {"reward/total_mean": 1.0}
 
         runtime.log_wandb_tick()
         self.assertEqual(captured, [])
 
-        runtime.last_diagnostics["trace/command/completed"] = 1.0
+        runtime.total_steps = 10
         runtime.log_wandb_tick()
 
         self.assertEqual(len(captured), 1)
-        self.assertEqual(captured[0][0]["trace/command/completed"], 1.0)
-        self.assertEqual(captured[0][1], 7)
+        self.assertEqual(captured[0][0]["reward/total_mean"], 1.0)
+        self.assertEqual(captured[0][1], 10)
 
     def test_rich_compatibility_diagnostics_stay_out_of_compact_wandb(self):
         runtime, pclient = training_runtime(
@@ -348,10 +341,8 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
             "curriculum/action_scale",
             "oht/idle_count",
             "reward/rail_tat_mean",
-            "reward/global/normalized",
+            "reward/global/component",
             "reward/local/normalized_mean",
-            "trace/command/cmd_tat",
-            "trace/command/oht_tat",
         }
         compact_removed = {
             "reward/step_reward",
@@ -406,8 +397,6 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
             )
         with self.assertRaisesRegex(ValueError, "requires"):
             ContextualRuntimeConfig(state_normalizer_warmup_bypass=True)
-        with self.assertRaisesRegex(ValueError, "requires"):
-            ContextualRuntimeConfig(reward_normalizer_reuse=True)
         with self.assertRaisesRegex(ValueError, "requires checkpoint resume"):
             ContextualRuntimeConfig(
                 resume_inference_until_replay_full=True
@@ -494,31 +483,6 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
         runtime.Algorithm(pclient)
         self.assertEqual(pclient.sent_is_end, [0, 0, 1, 0])
         self.assertEqual(actor_steps, [3])
-
-    def test_reward_e_normalizers_freeze_before_boundary_checkpoint(self):
-        runtime, pclient = training_runtime(
-            reward_version="E",
-            warmup_steps=10_000,
-            normalizer_freeze_steps=1,
-            terminate_on_warmup_complete=True,
-            latest_checkpoint_interval=20_000,
-            periodic_checkpoint_interval=20_000,
-        )
-        checkpoint_kinds = []
-        runtime._save_runtime_checkpoint = checkpoint_kinds.append
-        runtime.total_steps = 9_999
-
-        runtime.Algorithm(pclient)
-        self.assertEqual(pclient.sent_is_end, [0])
-        self.assertIsNotNone(runtime.transition_aligner.pending)
-        runtime.reward_builder.reward_steps = 9_999
-
-        runtime.Algorithm(pclient)
-        self.assertEqual(pclient.sent_is_end, [0, 1])
-        self.assertEqual(runtime.reward_builder.reward_steps, 10_000)
-        self.assertTrue(runtime.reward_builder.global_normalizer.frozen)
-        self.assertTrue(runtime.reward_builder.local_normalizer.frozen)
-        self.assertEqual(checkpoint_kinds, ["latest"])
 
     def test_episode_burnin_boundary_excludes_replay_and_stale_action(self):
         runtime, pclient = training_runtime(
@@ -737,61 +701,6 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
         runtime.Algorithm(pclient)
         self.assertEqual(len(runtime.observation_builder.save_calls), 1)
         self.assertTrue(runtime.state_normalizer_saved)
-
-    def test_reward_e_local_global_normalizers_save_and_load_together(self):
-        with tempfile.TemporaryDirectory() as directory:
-            target = Path(directory) / "reward_e.npz"
-            runtime, pclient = training_runtime(
-                reward_version="E",
-                warmup_steps=10_000,
-                normalizer_freeze_steps=1,
-                terminate_on_warmup_complete=True,
-                save_reward_normalizer_path="auto",
-                latest_checkpoint_interval=20_000,
-                periodic_checkpoint_interval=20_000,
-            )
-            automatic = runtime.reward_builder.default_normalizer_snapshot_path(
-                seed=runtime.config.seed
-            )
-            self.assertIn("contextual_reward_e_", automatic.name)
-            self.assertIn("seed12", automatic.name)
-            runtime.reward_builder.default_normalizer_snapshot_path = (
-                lambda **kwargs: target
-            )
-            runtime._save_runtime_checkpoint = lambda kind: None
-            runtime.total_steps = 9_999
-            runtime.Algorithm(pclient)
-            runtime.reward_builder.reward_steps = 9_999
-            runtime.Algorithm(pclient)
-
-            self.assertTrue(runtime.reward_normalizer_saved)
-            self.assertEqual(
-                runtime.resolved_save_reward_normalizer_path, str(target)
-            )
-            self.assertTrue(target.exists())
-            with np.load(target, allow_pickle=False) as saved:
-                self.assertIn("local_mean", saved.files)
-                self.assertIn("global_mean", saved.files)
-                self.assertTrue(bool(saved["local_frozen"].item()))
-                self.assertTrue(bool(saved["global_frozen"].item()))
-
-            restored, _ = training_runtime(
-                reward_version="E",
-                warmup_steps=10_000,
-                normalizer_freeze_steps=1,
-                load_reward_normalizer_path=str(target),
-            )
-            self.assertTrue(restored.reward_normalizer_loaded)
-            self.assertTrue(restored.config.reward_normalizer_reuse)
-            self.assertEqual(restored.reward_builder.reward_steps, 10_000)
-            np.testing.assert_array_equal(
-                restored.reward_builder.local_normalizer.mean,
-                runtime.reward_builder.local_normalizer.mean,
-            )
-            np.testing.assert_array_equal(
-                restored.reward_builder.global_normalizer.mean,
-                runtime.reward_builder.global_normalizer.mean,
-            )
 
     def test_region_curriculum_is_exact_legacy_geometric_schedule(self):
         runtime, _ = training_runtime(
@@ -1326,70 +1235,8 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
         self.assertEqual(runtime.last_diagnostics["env/termination_reason"], 1.0)
         self.assertIsNone(runtime.transition_aligner.pending)
 
-    def test_tat_175_termination_starts_only_from_second_episode(self):
+    def test_reward_n_tat_patience_adds_terminal_penalty_once(self):
         runtime, pclient = training_runtime(
-            reward_version="E",
-            tat_termination_policy=TAT_TERMINATION_EPISODE2_TAT175,
-        )
-        pclient.TotalTat = 176.0
-
-        # Production sends an initial command=2 before the first active tick.
-        runtime.Reset(pclient)
-        self.assertEqual(runtime.episode_id, 1)
-        runtime.Algorithm(pclient)
-        self.assertEqual(pclient.sent_is_end, [0])
-        self.assertEqual(runtime.tat_above_threshold_count, 0)
-
-        runtime.Reset(pclient)
-        self.assertEqual(runtime.episode_id, 2)
-        runtime.Algorithm(pclient)
-        self.assertEqual(pclient.sent_is_end, [0, 1])
-        self.assertEqual(
-            runtime.last_diagnostics["termination/by_tat"], 1.0
-        )
-
-    def test_loaded_state_normalizer_enables_tat_175_in_first_episode(self):
-        runtime, pclient = training_runtime(
-            reward_version="E",
-            tat_termination_policy=TAT_TERMINATION_EPISODE2_TAT175,
-            load_state_normalizer_path="state_normalizer.npz",
-        )
-        pclient.TotalTat = 176.0
-
-        runtime.Reset(pclient)
-        self.assertEqual(runtime.episode_id, 1)
-        self.assertEqual(runtime.config.tat_termination_start_episode, 2)
-        self.assertEqual(
-            runtime.config.effective_tat_termination_start_episode, 1
-        )
-        runtime.Algorithm(pclient)
-        self.assertEqual(pclient.sent_is_end, [1])
-        self.assertEqual(
-            runtime.last_diagnostics["termination/by_tat"], 1.0
-        )
-
-    def test_named_tat_180_policy_uses_strict_episode_two_threshold(self):
-        runtime, pclient = training_runtime(
-            reward_version="E",
-            tat_termination_policy=TAT_TERMINATION_EPISODE2_TAT180,
-        )
-
-        pclient.TotalTat = 181.0
-        runtime.Reset(pclient)
-        runtime.Algorithm(pclient)
-        self.assertEqual(pclient.sent_is_end, [0])
-
-        runtime.Reset(pclient)
-        pclient.TotalTat = 180.0
-        runtime.Algorithm(pclient)
-        self.assertEqual(pclient.sent_is_end, [0, 0])
-        pclient.TotalTat = 180.01
-        runtime.Algorithm(pclient)
-        self.assertEqual(pclient.sent_is_end, [0, 0, 1])
-
-    def test_reward_r_tat_patience_adds_terminal_penalty_once(self):
-        runtime, pclient = training_runtime(
-            reward_version="R",
             replay_capacity_env_steps=512,
             minimum_replay_env_steps=512,
             minimum_action_enabled_env_steps=512,
@@ -1460,13 +1307,7 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
             "reward/terminal_penalty",
             "reward/global/tat_component_raw",
             "reward/global/backlog_component_raw",
-            "reward/global/raw", "reward/global/normalized",
-            "reward/global/component", "reward/completion/count",
-            "reward/completion/valid_count",
-            "reward/completion/invalid_count",
-            "reward/completion/tat_mean", "reward/completion/tat_std",
-            "reward/completion/tat_min", "reward/completion/tat_max",
-            "reward/completion/raw", "reward/completion/weighted_raw",
+            "reward/global/raw", "reward/global/component",
             "reward/local/raw_mean",
             "reward/local/raw_std", "reward/local/normalized_mean",
             "reward/local/normalized_std", "reward/local/component_mean",
@@ -1477,24 +1318,14 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
             "local/idle_abs_mean", "local/idle_std",
             "local/capacity_abs_mean", "local/capacity_std",
             "reward/smooth_penalty_mean",
-            "reward/global_normalizer_mean",
-            "reward/global_normalizer_std",
-            "reward/local_normalizer_mean",
-            "reward/local_normalizer_std",
-            "reward/contribution/completion_tat_abs",
             "reward/contribution/tat_abs",
             "reward/contribution/backlog_abs",
             "reward/contribution/local_abs",
             "reward/budget/rail_abs", "reward/budget/smooth_abs",
-            "reward/budget/completion_tat_share",
             "reward/budget/tat_share", "reward/budget/backlog_share",
             "reward/budget/local_share",
             "reward/budget/rail_share", "reward/budget/smooth_share",
             "reward/budget/share_sum_error", "reward/rail/route_ratio_mean",
-            "trace/command/id", "trace/command/lifetime",
-            "trace/command/available", "trace/command/cmd_tat",
-            "trace/command/oht_tat", "trace/command/oht_id",
-            "trace/command/oht_state", "trace/command/completed",
             "reward/rail/route_ratio_p95",
             "reward/rail/positive_cycle_ratio",
             "reward/rail/negative_cycle_ratio",
@@ -1562,22 +1393,18 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
         self.assertEqual(captured["notes"], meta["description"])
         self.assertEqual(
             meta["wandb_metric_schema_version"],
-            "contextual_wandb_compact_v9_warmup_episode_boundary",
+            "contextual_wandb_compact_v10_n_only",
         )
-        self.assertEqual(meta["reward_version"], "U")
+        self.assertEqual(meta["reward_version"], "N")
         self.assertEqual(
             meta["tat_signal"],
-            "actual_new_completion_cmd_tat_event",
+            "one_sided_total_tat_level",
         )
-        self.assertFalse(meta["marginal_tat_enabled"])
-        self.assertEqual(
-            meta["command_trace_selection"],
-            "first_valid_CmdCompleteTat_command_per_episode",
-        )
-        self.assertFalse(meta["tat_one_sided"])
-        self.assertFalse(meta["global_normalization_enabled"])
-        self.assertTrue(meta["local_normalization_enabled"])
-        self.assertEqual(meta["reward_normalizer_freeze_steps"], 30_000)
+        self.assertNotIn("marginal_tat_enabled", meta)
+        self.assertNotIn("command_trace_selection", meta)
+        self.assertNotIn("reward_normalizer_freeze_steps", meta)
+        self.assertEqual(meta["op_weight"], 4.0)
+        self.assertTrue(meta["use_op"])
         self.assertEqual(meta["dispatch_mode"], "first-match")
         self.assertIn("dispatch_first_match", meta["note"])
         self.assertEqual(
@@ -1592,44 +1419,27 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
             "actor_and_critic_previous_applied_action_separate_from_encoder",
         )
         self.assertEqual(meta["critic_initialization"], "independent")
-        reward_t_meta = runtime_exp_meta(
-            ContextualRuntimeConfig(reward_version="T")
-        )
-        self.assertEqual(reward_t_meta["reward_version"], "T")
-        self.assertEqual(
-            reward_t_meta["reward_contract_version"],
-            "contextual_controlled_reward_v22_global_raw_local_running_norm",
-        )
-        self.assertEqual(
-            reward_t_meta["tat_signal"], "signed_total_tat_level"
-        )
-        self.assertFalse(reward_t_meta["global_normalization_enabled"])
-        self.assertTrue(reward_t_meta["local_normalization_enabled"])
         experiment_meta = runtime_exp_meta(ContextualRuntimeConfig(
-            reward_version="E",
             curriculum_scale_start=1.0,
             curriculum_scale_end=1.0,
             replay_capacity_env_steps=100_000,
             batch_size=1_024,
             warmup_steps=10_000,
             seed=0,
-            tat_termination_policy=TAT_TERMINATION_EPISODE2_TAT175,
         ))
-        self.assertEqual(experiment_meta["reward_version"], "E")
+        self.assertEqual(experiment_meta["reward_version"], "N")
         self.assertEqual(experiment_meta["action_scale"], 1.0)
         self.assertFalse(experiment_meta["curriculum_enabled"])
         self.assertEqual(
-            experiment_meta["tat_termination_policy"], "episode2_tat175"
+            experiment_meta["tat_termination_policy"], "reward_profile"
         )
-        self.assertEqual(experiment_meta["tat_termination_start_episode"], 2)
-        self.assertEqual(experiment_meta["early_stop_tat_threshold"], 175.0)
+        self.assertEqual(experiment_meta["tat_termination_start_episode"], 1)
+        self.assertEqual(experiment_meta["early_stop_tat_threshold"], 200.0)
         self.assertEqual(experiment_meta["replay_capacity_env_steps"], 100_000)
         self.assertEqual(experiment_meta["batch_size"], 1_024)
         self.assertEqual(experiment_meta["configured_warmup_steps"], 10_000)
         self.assertEqual(experiment_meta["effective_warmup_steps"], 10_000)
         reused_meta = runtime_exp_meta(ContextualRuntimeConfig(
-            reward_version="E",
-            tat_termination_policy=TAT_TERMINATION_EPISODE2_TAT175,
             load_state_normalizer_path="state_normalizer.npz",
         ))
         self.assertEqual(reused_meta["configured_warmup_steps"], 10_000)
@@ -1637,7 +1447,7 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
         self.assertTrue(reused_meta["state_normalizer_load_requested"])
         self.assertTrue(reused_meta["state_normalizer_warmup_bypass"])
         self.assertEqual(
-            reused_meta["tat_termination_configured_start_episode"], 2
+            reused_meta["tat_termination_configured_start_episode"], 1
         )
         self.assertEqual(reused_meta["tat_termination_start_episode"], 1)
         self.assertIn("normreuse1", reused_meta["note"])

@@ -3,6 +3,7 @@
 
 # .gitignore 자체는 추적
 !/.gitignore
+!/EXPERIMENTS_v2.md
 
 # PythonCode 디렉토리만 추적
 !/PythonCode/

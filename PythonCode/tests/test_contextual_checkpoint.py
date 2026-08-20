@@ -41,7 +41,7 @@ class CheckpointObservationBuilder(FakeObservationBuilder):
 
 
 def components(
-    seed=17, *, sale=False, lap=False, reward_version="U", batch_size=16
+    seed=17, *, sale=False, lap=False, reward_version="N", batch_size=16
 ):
     topology = make_topology()
     builder = CheckpointObservationBuilder(topology)
@@ -90,7 +90,7 @@ def components(
 
 
 class ContextualCheckpointTests(unittest.TestCase):
-    def test_reward_normalizer_step_state_round_trips(self):
+    def test_reward_step_counter_round_trips(self):
         learner, obs, reward = components()
         reward.reward_steps = 12_345
         with tempfile.TemporaryDirectory() as directory:
@@ -110,26 +110,28 @@ class ContextualCheckpointTests(unittest.TestCase):
             )
             self.assertEqual(target_reward.reward_steps, 12_345)
 
-    def test_checkpoint_rejects_cross_reward_profile_and_normalizers(self):
-        learner_u, obs_u, reward_u = components(reward_version="U")
+    def test_checkpoint_rejects_non_n_reward_identity(self):
+        learner, obs, reward = components()
         with tempfile.TemporaryDirectory() as directory:
             path = save_contextual_checkpoint(
-                Path(directory) / "reward_u.pt",
-                learner_u,
-                observation_builder=obs_u,
-                reward_builder=reward_u,
+                Path(directory) / "reward_n.pt",
+                learner,
+                observation_builder=obs,
+                reward_builder=reward,
             )
-            learner_t, obs_t, reward_t = components(
-                seed=99, reward_version="T"
-            )
+            payload = torch.load(path, weights_only=False)
+            payload["reward_version"] = "U"
+            incompatible = Path(directory) / "reward_u.pt"
+            torch.save(payload, incompatible)
+            target, target_obs, target_reward = components(seed=99)
             with self.assertRaisesRegex(
                 ContextualCheckpointError, "reward_version mismatch"
             ):
                 load_contextual_checkpoint(
-                    path,
-                    learner_t,
-                    observation_builder=obs_t,
-                    reward_builder=reward_t,
+                    incompatible,
+                    target,
+                    observation_builder=target_obs,
+                    reward_builder=target_reward,
                 )
 
     def test_resume_only_runtime_metadata_upgrade_is_narrow(self):

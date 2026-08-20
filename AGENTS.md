@@ -24,8 +24,8 @@ run_{MMDD_HHMM}_{cost_structure}_{action_range}_{reward_version}_{note}
 
 ## 변경 기록 규칙
 
-- reward 공식 변경 → `reward_version` 알파벳 올리기 + `EXPERIMENTS.md` 한 줄 기록
-- action 방식·obs 구조 등 코드 교체 → 버전 명시 + `EXPERIMENTS.md` 기록
+- reward 공식 변경 → `reward_version` 알파벳 올리기 + `EXPERIMENTS_v2.md` 한 줄 기록
+- action 방식·obs 구조 등 코드 교체 → 버전 명시 + `EXPERIMENTS_v2.md` 기록
 - `ClientAlgorithm.py` 에 wandb 메트릭 추가/변경 → `export_wandb_run.py` 동시 수정
 
 ## 실행

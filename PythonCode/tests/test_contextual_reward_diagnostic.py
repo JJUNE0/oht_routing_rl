@@ -7,7 +7,6 @@ from types import SimpleNamespace
 import numpy as np
 
 from contextual_reward import ContextualRewardBuilder, ContextualRewardConfig
-from contextual_reward_version_cfg import RAIL_TAT_FREE_FLOW_RATIO
 from contextual_reward_diagnostic import (
     DIAGNOSTIC_SCHEMA_VERSION,
     RewardDiagnosticWriter,
@@ -93,10 +92,7 @@ class ContextualRewardDiagnosticTests(unittest.TestCase):
             writer = RewardDiagnosticWriter(directory, "0:10")
             builder = ContextualRewardBuilder(
                 topology,
-                ContextualRewardConfig(
-                    tat_reference=100.0,
-                    rail_reward_mode="fixed_tat_reference",
-                ),
+                ContextualRewardConfig(),
                 global_step_provider=lambda: step["value"],
                 reward_diagnostic_writer=writer,
             )
@@ -128,7 +124,7 @@ class ContextualRewardDiagnosticTests(unittest.TestCase):
             oht.CmdCompleteTat = {}
             raw = builder._rail_tat_raw(client, env_step=4)
 
-            np.testing.assert_allclose(raw, [1.0])
+            self.assertLess(raw[0], 0.0)
             path = Path(directory) / "rail_cycle_window_00000_00010.jsonl"
             record = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
             self.assertTrue(record["route_free_flow_available"])
@@ -151,10 +147,7 @@ class ContextualRewardDiagnosticTests(unittest.TestCase):
             writer = RewardDiagnosticWriter(directory, "0:10")
             builder = ContextualRewardBuilder(
                 topology,
-                ContextualRewardConfig(
-                    tat_reference=100.0,
-                    rail_reward_mode="fixed_tat_reference",
-                ),
+                ContextualRewardConfig(),
                 reward_diagnostic_writer=writer,
             )
             client = rail_tat_client(state=0)
@@ -193,10 +186,7 @@ class ContextualRewardDiagnosticTests(unittest.TestCase):
             writer = RewardDiagnosticWriter(directory, "0:10")
             builder = ContextualRewardBuilder(
                 topology,
-                ContextualRewardConfig(
-                    tat_reference=100.0,
-                    rail_reward_mode="fixed_tat_reference",
-                ),
+                ContextualRewardConfig(),
                 reward_diagnostic_writer=writer,
             )
             client = rail_tat_client(state=0)
@@ -237,10 +227,7 @@ class ContextualRewardDiagnosticTests(unittest.TestCase):
         )
         builder = ContextualRewardBuilder(
             topology,
-            ContextualRewardConfig(
-                rail_reward_mode="free_flow_neutral_2",
-                rail_free_flow_neutral_ratio=2.0,
-            ),
+            ContextualRewardConfig(),
         )
         client = rail_tat_client(state=0)
         client.RAILLINE_DIC = {
@@ -270,10 +257,7 @@ class ContextualRewardDiagnosticTests(unittest.TestCase):
 
     def test_reward_config_rejects_negative_rail_weight(self):
         with self.assertRaisesRegex(ValueError, "rail_tat_weight"):
-            ContextualRewardConfig(
-                rail_tat_weight=-1.0,
-                rail_reward_mode="fixed_tat_reference",
-            )
+            ContextualRewardConfig(rail_tat_weight=-1.0)
 
 
 if __name__ == "__main__":

@@ -13,7 +13,10 @@ from contextual_observation import (
     LOCAL_DIM,
     OBSERVATION_VERSION,
 )
-from contextual_reward_version_cfg import REWARD_VERSION
+from contextual_reward_version_cfg import (
+    REWARD_VERSION,
+    canonical_reward_version,
+)
 from contextual_topology import ContextualTopology
 from contextual_transition import CompletedContextualTransition
 
@@ -161,7 +164,7 @@ class ContextualStepReplayBuffer:
         self.lap_alpha = float(lap_alpha)
         self.lap_min_priority = float(lap_min_priority)
         self.action_version = str(action_version)
-        self.reward_version = str(reward_version)
+        self.reward_version = canonical_reward_version(reward_version)
         self.sampling_mode = str(sampling_mode)
         self.num_stacks, self.stack_interval = validate_stack_config(
             num_stacks, stack_interval

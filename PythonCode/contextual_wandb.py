@@ -27,10 +27,7 @@ from contextual_observation import (
     OBSERVATION_NORMALIZER_SNAPSHOT_VERSION,
     OBSERVATION_VERSION,
 )
-from contextual_reward import (
-    REWARD_NORMALIZER_SNAPSHOT_VERSION,
-    ContextualRewardConfig,
-)
+from contextual_reward import ContextualRewardConfig
 from contextual_reward_version_cfg import (
     reward_contract,
 )
@@ -60,44 +57,32 @@ EXP_META = {
     "reward_tat_version": _EXP_REWARD_CONTRACT.tat_version,
     "reward_normalization_version": _EXP_REWARD_CONTRACT.normalization_version,
     "tat_signal": _EXP_REWARD_CONTRACT.tat_signal_description,
-    "marginal_tat_enabled": True,
-    "tat_one_sided": False,
-    "calibration_status": "reward_n_checkpoint_resume_deterministic_episode",
+    "calibration_status": "reward_n_only_v2",
     "reward_global_alpha": 0.5,
     "reward_local_alpha": 0.5,
     "tat_reference": 165.0,
     "tat_weight": 11.0,
-    "tat_raw_clip": None,
     "op_reference": 0.80,
-    "op_weight": 5.0,
-    "use_op": False,
-    "backlog_weight": 0.01,
-    "backlog_growth_enabled": False,
+    "op_weight": 4.0,
+    "use_op": True,
+    "backlog_weight": 0.0004,
+    "backlog_growth_enabled": True,
     "backlog_growth_horizon": 300,
     "backlog_growth_scale": 30.0,
-    "backlog_growth_weight": 0.0,
+    "backlog_growth_weight": 0.16,
     "idle_reserve_target": 200.0,
     "idle_reserve_scale": 50.0,
-    "idle_reserve_weight": 0.0,
+    "idle_reserve_weight": 0.20,
     "local_oht_weight": 0.3,
-    "local_predicted_oht_weight": 0.2,
+    "local_predicted_oht_weight": 0.075,
     "local_stop_weight": 0.3,
-    "local_idle_weight": 0.1,
+    "local_idle_weight": 0.0,
     "local_capacity_weight": 0.1,
-    "local_fixed_scale_enabled": True,
     "local_reward_scale": 2.0,
-    "reward_normalizer_freeze_steps": 10_000,
-    "reward_normalizer_snapshot_version": REWARD_NORMALIZER_SNAPSHOT_VERSION,
-    "reward_normalizer_snapshot_policy": (
-        "auto_versioned_atomic_local_global_save"
-    ),
-    "global_normalization_enabled": False,
-    "local_normalization_enabled": False,
     "rail_reward_mode": "free_flow_neutral_2",
     "rail_free_flow_neutral_ratio": 2.0,
     "rail_tat_weight": 30.0,
     "rail_tat_clip": 1.0,
-    "tat_confidence_ramp": False,
     "action_scale": 0.05,
     "action_scale_schedule_version": ACTION_SCALE_SCHEDULE_VERSION,
     "curriculum_scale_start": 0.05,
@@ -124,24 +109,11 @@ EXP_META = {
     "parameter_dw_state_version": "parameter_dw_episode_reset_v1",
     "send_cost_logging_version": "post_send_v2",
     "protocol_version": "single_end_time_v2",
-    "diagnostic_schema_version": (
-        "contextual_reward_diagnostic_v23_reward_profiles_e_u"
-    ),
-    "wandb_metric_schema_version": (
-        "contextual_wandb_compact_v9_warmup_episode_boundary"
-    ),
+    "diagnostic_schema_version": "contextual_reward_diagnostic_v24_n_only",
+    "wandb_metric_schema_version": "contextual_wandb_compact_v10_n_only",
     "reward_budget_version": (
         "tat_backlog_final_abs_contribution_v2_reward_profile"
     ),
-    "completion_tracking_source": "PClient.OHT_DIC.CmdCompleteTat.CmdTat",
-    "completion_tracking_boundary": "OHT_state_5_to_0_2_3",
-    "completion_tracking_deduplication": (
-        "episode_local_command_id_with_JOB_DIC_reuse_lifetimes"
-    ),
-    "command_trace_selection": (
-        "first_valid_CmdCompleteTat_command_per_episode"
-    ),
-    "command_trace_end": "first_selected_command_completion",
     "arrival_tracking_source": "PClient.JOB_DIC.Job.ID_command_id",
     "arrival_tracking_reuse_fail_safe": True,
     "diagnostic_only_leading_indicators": (
@@ -163,17 +135,12 @@ EXP_META = {
     "early_stop_tat_threshold": 200.0,
     "tat_above_threshold_patience": 300,
     "terminal_tat_penalty": -20.0,
-    "note": "resumeNdetep1b2048",
+    "note": "n_only_v2",
     "description": (
-        "Resume the cross-machine Reward N step-220000 checkpoint with its "
-        "actor, critics, optimizers, RNG, and state/reward normalizers. Use "
-        "batch 2048 and a fresh replay. Run the first resumed episode with "
-        "the deterministic actor, zero action noise, and no learner updates; "
-        "retain that episode in replay. From the next episode, restore the "
-        "saved final exploration noise and resume learning as soon as the "
-        "ordinary 100-environment-step replay gate is satisfied. Preserve the "
-        "saved Reward N formula, curriculum history, seed, and reward-profile "
-        "TAT termination settings."
+        "Contextual TD7 v2 executes the single locked Reward N formula. "
+        "Historical reward selectors, completion-event reward, marginal-TAT "
+        "reward, and reward normalizer state are removed. Existing v7 Reward "
+        "N checkpoints remain resume-compatible through the v8 loader."
     ),
 }
 
@@ -330,9 +297,6 @@ WANDB_METRIC_KEYS += (
     "reward/global/total_tat", "reward/global/tat_reference",
     "reward/global/tat_error", "reward/global/tat_weight",
     "reward/global/tat_signal_available",
-    "reward/global/tat_raw_preclip", "reward/global/tat_raw_postclip",
-    "reward/global/tat_confidence",
-    "reward/global/tat_confidence_n0", "reward/global/tat_raw_ramped",
     "reward/global/completed_episode", "reward/global/completed_delta",
     "reward/global/op_rate", "reward/global/op_reference",
     "reward/global/op_error", "reward/global/op_delta",
@@ -363,7 +327,7 @@ WANDB_METRIC_KEYS += (
     "reward/scale/smooth_abs_share", "reward/scale/abs_share_sum_error",
     "reward/config/global_alpha", "reward/config/local_alpha",
     "reward/config/local_reward_scale", "reward/config/rail_tat_weight",
-    "reward/config/rail_tat_clip", "reward/config/tat_raw_clip",
+    "reward/config/rail_tat_clip",
     "reward/config/smooth_weight_effective",
     "reward/terminal_penalty",
     "reward/global/tat_raw", "reward/global/tat_component",
@@ -529,24 +493,14 @@ WANDB_METRIC_KEYS = (
     "curriculum/action_scale",
     "b_rl/mean",
     "b_rl/std",
-    # Reward U completion-event/global-raw/local-normalized reward and budget.
+    # Locked Reward N components and contribution budget.
     "reward/total_mean",
     "reward/total_std",
     "reward/terminal_penalty",
     "reward/global/tat_component_raw",
     "reward/global/backlog_component_raw",
     "reward/global/raw",
-    "reward/global/normalized",
     "reward/global/component",
-    "reward/completion/count",
-    "reward/completion/valid_count",
-    "reward/completion/invalid_count",
-    "reward/completion/tat_mean",
-    "reward/completion/tat_std",
-    "reward/completion/tat_min",
-    "reward/completion/tat_max",
-    "reward/completion/raw",
-    "reward/completion/weighted_raw",
     "reward/local/raw_mean",
     "reward/local/raw_std",
     "reward/local/normalized_mean",
@@ -565,31 +519,17 @@ WANDB_METRIC_KEYS = (
     "local/capacity_std",
     "reward/rail_tat_mean",
     "reward/smooth_penalty_mean",
-    "reward/global_normalizer_mean",
-    "reward/global_normalizer_std",
-    "reward/local_normalizer_mean",
-    "reward/local_normalizer_std",
-    "reward/contribution/completion_tat_abs",
     "reward/contribution/tat_abs",
     "reward/contribution/backlog_abs",
     "reward/contribution/local_abs",
     "reward/budget/rail_abs",
     "reward/budget/smooth_abs",
-    "reward/budget/completion_tat_share",
     "reward/budget/tat_share",
     "reward/budget/backlog_share",
     "reward/budget/local_share",
     "reward/budget/rail_share",
     "reward/budget/smooth_share",
     "reward/budget/share_sum_error",
-    "trace/command/id",
-    "trace/command/lifetime",
-    "trace/command/available",
-    "trace/command/cmd_tat",
-    "trace/command/oht_tat",
-    "trace/command/oht_id",
-    "trace/command/oht_state",
-    "trace/command/completed",
     "reward/rail/route_ratio_mean",
     "reward/rail/route_ratio_p95",
     "reward/rail/positive_cycle_ratio",
@@ -691,8 +631,8 @@ def runtime_exp_meta(config) -> dict:
         f"{meta['note']}_r{contract.version}_s{int(config.num_stacks)}i"
         f"{int(config.stack_interval)}_dispatch_"
         f"{str(config.dispatch_mode).replace('-', '_')}_normreuse"
-        f"{int(config.state_normalizer_warmup_bypass)}_rewardnormreuse"
-        f"{int(config.reward_normalizer_reuse)}_b{int(config.batch_size)}_"
+        f"{int(config.state_normalizer_warmup_bypass)}_b"
+        f"{int(config.batch_size)}_"
         f"fullrefill{int(config.resume_inference_until_replay_full)}_"
         f"detfirst{int(config.resume_deterministic_first_episode)}"
     )
@@ -722,36 +662,6 @@ def runtime_exp_meta(config) -> dict:
     meta["action_scale_schedule_version"] = ACTION_SCALE_SCHEDULE_VERSION
     meta["reward_global_alpha"] = float(reward_config.global_alpha)
     meta["reward_local_alpha"] = float(reward_config.local_alpha)
-    meta["reward_normalizer_freeze_steps"] = int(
-        reward_config.freeze_after_env_steps
-    )
-    meta["reward_normalizer_snapshot_version"] = (
-        REWARD_NORMALIZER_SNAPSHOT_VERSION
-    )
-    meta["reward_normalizer_load_requested"] = bool(
-        config.load_reward_normalizer_path
-    )
-    meta["reward_normalizer_reuse"] = bool(
-        config.reward_normalizer_reuse
-    )
-    meta["reward_normalizer_save_requested"] = bool(
-        config.save_reward_normalizer_path
-    )
-    meta["load_reward_normalizer_path"] = (
-        config.load_reward_normalizer_path
-    )
-    meta["save_reward_normalizer_path"] = (
-        config.save_reward_normalizer_path
-    )
-    meta["global_normalization_enabled"] = bool(
-        reward_config.global_normalization_enabled
-    )
-    meta["local_normalization_enabled"] = bool(
-        reward_config.local_normalization_enabled
-    )
-    meta["local_fixed_scale_enabled"] = bool(
-        reward_config.local_fixed_scale_enabled
-    )
     meta["local_reward_scale"] = float(reward_config.local_reward_scale)
     meta["local_predicted_oht_weight"] = float(
         reward_config.local_predicted_oht_weight
@@ -770,28 +680,8 @@ def runtime_exp_meta(config) -> dict:
     meta["rail_free_flow_neutral_ratio"] = float(
         reward_config.rail_free_flow_neutral_ratio
     )
-    meta["tat_raw_clip"] = (
-        None
-        if reward_config.tat_raw_clip is None
-        else float(reward_config.tat_raw_clip)
-    )
-    meta["tat_confidence_n0"] = float(reward_config.tat_confidence_n0)
-    meta["tat_confidence_ramp"] = bool(reward_config.tat_confidence_ramp)
-    meta["tat_confidence_supported"] = bool(
-        reward_config.tat_confidence_supported
-    )
     meta["tat_reference"] = float(reward_config.tat_reference)
     meta["tat_weight"] = float(reward_config.tat_weight)
-    meta["tat_one_sided"] = bool(reward_config.tat_one_sided)
-    meta["tat_excess_clip"] = reward_config.tat_excess_clip
-    meta["tat_ema_beta"] = float(reward_config.tat_ema_beta)
-    meta["global_zero_on_first_tick"] = bool(
-        reward_config.global_zero_on_first_tick
-    )
-    meta["marginal_tat_enabled"] = (
-        reward_config.tat_signal_mode == "marginal_tat_ema"
-    )
-    meta["tat_signal_mode"] = str(reward_config.tat_signal_mode)
     meta["op_reference"] = float(reward_config.op_reference)
     meta["op_weight"] = float(reward_config.op_weight)
     meta["use_op"] = bool(reward_config.use_op)
@@ -927,15 +817,8 @@ def runtime_exp_meta(config) -> dict:
         f"reward {contract.version} (historical={contract.historical_version}, "
         f"{contract.contract_version}, global/local="
         f"{reward_config.global_alpha:g}/{reward_config.local_alpha:g}), "
-        "reward_normalizer="
-        f"global_{'running' if reward_config.global_normalization_enabled else 'off'}_"
-        f"local_{'running' if reward_config.local_normalization_enabled else 'off'}, "
-        "reward_normalizer_snapshot="
-        f"{'reused' if config.reward_normalizer_reuse else 'collected'}, "
         f"tat_signal={contract.tat_signal_description}, "
-        f"fixed_scale={'on' if reward_config.local_fixed_scale_enabled else 'off'}, "
-        f"marginal_tat={'on' if meta['marginal_tat_enabled'] else 'off'}, "
-        "completion_ema=off, "
+        f"local_fixed_scale={reward_config.local_reward_scale:g}, "
         f"replay_capacity={int(config.replay_capacity_env_steps)}, "
         "action_scale="
         f"{float(config.curriculum_scale_start):g}->"

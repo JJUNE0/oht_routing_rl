@@ -184,7 +184,7 @@ class ContextualReplayTests(unittest.TestCase):
     def test_completed_transition_converts_to_exactly_one_snapshot_push(self):
         reward_builder = ContextualRewardBuilder(
             self.topology,
-            ContextualRewardConfig(rail_reward_mode="fixed_tat_reference"),
+            ContextualRewardConfig(),
         )
         aligner = ContextualTransitionAligner(self.topology, reward_builder)
         zeros = np.zeros((CONTROLLED_COUNT, 1), np.float32)
@@ -235,20 +235,20 @@ class ContextualReplayTests(unittest.TestCase):
         with self.assertRaises(ContextualReplayError):
             replay.push(replace(base, reward=bad_reward))
 
-    def test_replay_uses_the_runtime_selected_reward_version(self):
-        replay_t = ContextualStepReplayBuffer(
-            self.topology,
-            self.builder,
-            capacity_env_steps=2,
-            reward_version="T",
+    def test_replay_is_locked_to_reward_n(self):
+        with self.assertRaisesRegex(ValueError, "only reward_version='N'"):
+            ContextualStepReplayBuffer(
+                self.topology,
+                self.builder,
+                capacity_env_steps=2,
+                reward_version="T",
+            )
+        replay = ContextualStepReplayBuffer(
+            self.topology, self.builder, capacity_env_steps=2
         )
-        snapshot_u = make_snapshot(self.topology, 0)
-        with self.assertRaisesRegex(
-            ContextualReplayError, "reward version mismatch"
-        ):
-            replay_t.push(snapshot_u)
-        replay_t.push(replace(snapshot_u, reward_version="T"))
-        self.assertEqual(replay_t.size_env_steps, 1)
+        snapshot = make_snapshot(self.topology, 0)
+        replay.push(snapshot)
+        self.assertEqual(replay.size_env_steps, 1)
 
     def test_empty_sampling_and_uniform_priority_contract(self):
         replay = ContextualStepReplayBuffer(

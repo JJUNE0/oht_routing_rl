@@ -8,8 +8,7 @@ import os
 import time
 import traceback
 from collections import defaultdict, deque
-from dataclasses import asdict, dataclass, replace
-from numbers import Integral
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import numpy as np
@@ -24,8 +23,6 @@ from cocel_rl.algorithms.contextual_td7 import (
     ContextualStepReplayBuffer,
     ContextualTD7Learner,
     DirectionalContextEncoder,
-    REPLAY_SAMPLING_MODES,
-    REPLAY_SAMPLING_RANDOM_RAIL,
     REPLAY_SAMPLING_RAIL,
     REPLAY_SAMPLING_SNAPSHOT,
     REPLAY_SAMPLING_VERSION,
@@ -41,7 +38,6 @@ from cocel_rl.algorithms.contextual_td7 import (
 )
 from contextual_action import (
     ACTION_SCALE_SCHEDULE_VERSION,
-    ACTION_MODES,
     EXP_RESIDUAL,
     EXPLORATION_SCHEDULE_VERSION,
     REGION_B_RL,
@@ -51,7 +47,6 @@ from contextual_action import (
 from contextual_dispatch import (
     DISPATCH_COST,
     DISPATCH_FIRST_MATCH,
-    DISPATCH_MODES,
     DISPATCH_SELECTION_VERSION,
 )
 from contextual_observation import (
@@ -62,21 +57,9 @@ from contextual_observation import (
 from contextual_topology import load_cached_contextual_topology
 from contextual_termination import (
     TAT_TERMINATION_POLICY_VERSION,
-    TAT_TERMINATION_REWARD_PROFILE,
     WARMUP_EPISODE_TRANSITION_VERSION,
-    tat_termination_profile,
 )
-from contextual_reward import (
-    REWARD_NORMALIZER_SNAPSHOT_VERSION,
-    ContextualRewardBuilder,
-    ContextualRewardConfig,
-)
-from contextual_reward_version_cfg import (
-    RAIL_REWARD_MODES,
-    REWARD_VERSION,
-    canonical_reward_version,
-    reward_contract,
-)
+from contextual_reward import ContextualRewardBuilder
 from contextual_reward_diagnostic import (
     LeadingIndicatorTracker,
     RewardDiagnosticWriter,
@@ -84,6 +67,8 @@ from contextual_reward_diagnostic import (
 )
 from contextual_transition import ContextualTransitionAligner
 from contextual_wandb import ContextualWandbLogger
+from contextual_runtime_diagnostics import ContextualRuntimeDiagnosticsMixin
+from contextual_runtime_config import ContextualRuntimeConfig
 
 
 QUEUED_JOB_STATE = 1
@@ -96,532 +81,11 @@ class ContextualTrainingFailure(RuntimeError):
 
 
 CHECKPOINT_DIRECTORY_VERSION = "contextual_checkpoint_dir_slug_v1"
-AUTO_REWARD_NORMALIZER_PATH = "auto"
 
 
-@dataclass(frozen=True)
-class ContextualRuntimeConfig:
-    mode: str = "baseline_only"
-    action_enabled: bool = False
-    reward_version: str = REWARD_VERSION
-    action_mode: str = REGION_B_RL
-    action_scale: float = 0.05
-    num_stacks: int = 1
-    stack_interval: int = 1
-    curriculum_end_step: int = 20_000
-    curriculum_scale_start: float = 0.05
-    curriculum_scale_end: float = 1.0
-    curriculum_shape: str = "geometric"
-    smooth_b_rl_weight: float | None = None
-    smooth_exp_residual_weight: float | None = None
-    warmup_steps: int = 10_000
-    terminate_on_warmup_complete: bool = True
-    episode_burnin_steps: int = 0
-    normalizer_freeze_steps: int = 10_000
-    load_state_normalizer_path: str | None = None
-    save_state_normalizer_path: str | None = None
-    state_normalizer_warmup_bypass: bool = False
-    load_reward_normalizer_path: str | None = None
-    save_reward_normalizer_path: str | None = None
-    reward_normalizer_reuse: bool = False
-    reward_normalizer_freeze_steps: int | None = None
-    global_normalization_enabled: bool | None = None
-    local_normalization_enabled: bool | None = None
-    tat_reference: float | None = None
-    tat_weight: float | None = None
-    tat_one_sided: bool | None = None
-    tat_excess_clip: float | None = None
-    tat_ema_beta: float | None = None
-    global_zero_on_first_tick: bool | None = None
-    op_weight: float | None = None
-    use_op: bool | None = None
-    backlog_weight: float | None = None
-    backlog_growth_enabled: bool | None = None
-    backlog_growth_horizon: int | None = None
-    backlog_growth_scale: float | None = None
-    backlog_growth_weight: float | None = None
-    idle_reserve_target: float | None = None
-    idle_reserve_scale: float | None = None
-    idle_reserve_weight: float | None = None
-    local_oht_weight: float | None = None
-    local_predicted_oht_weight: float | None = None
-    local_stop_weight: float | None = None
-    local_idle_weight: float | None = None
-    local_capacity_weight: float | None = None
-    local_fixed_scale_enabled: bool | None = None
-    local_reward_scale: float | None = None
-    rail_reward_mode: str | None = None
-    rail_free_flow_neutral_ratio: float | None = None
-    rail_baseline_ratio_reference: float | None = None
-    reward_rail_tat_weight: float | None = None
-    reward_rail_tat_clip: float | None = None
-    tat_raw_clip: float | None = None
-    reward_diagnostic_dir: str | None = None
-    reward_diagnostic_windows: str = "0:1000,10000:11000,20000:21000"
-    tat_confidence_n0: float | None = None
-    tat_confidence_ramp: bool | None = None
-    tat_confidence_supported: bool | None = None
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    seed: int = 0
-    topology_cache_path: str | None = None
-    topology_audit_path: str | None = None
-    exploration_noise_std: float = 0.10
-    exploration_noise_final_std: float = 0.02
-    exploration_noise_anneal_steps: int = 100_000
-    exploration_noise_clip: float = 0.20
-    replay_capacity_env_steps: int = 10_000
-    replay_sampling_mode: str = REPLAY_SAMPLING_RAIL
-    batch_size: int = 1_024
-    minimum_replay_env_steps: int = 100
-    minimum_action_enabled_env_steps: int = 100
-    updates_per_env_step: int = 1
-    learn_every_env_steps: int = 1
-    latest_checkpoint_interval: int = 1_000
-    periodic_checkpoint_interval: int = 5_000
-    checkpoint_root: str | None = None
-    resume_checkpoint_path: str | None = None
-    resume_inference_until_replay_full: bool = False
-    resume_deterministic_first_episode: bool = False
-    rail_tat_diagnostic_path: str | None = None
-    rail_tat_diagnostic_max_step: int = 1_000
-    wandb_enabled: bool = False
-    wandb_log_interval: int = 10
-    sale_enabled: bool = True
-    lap_enabled: bool = True
-    critic_loss_mode: str = "auto"
-    early_stop_queued_threshold: float = 500.0
-    tat_termination_policy: str = TAT_TERMINATION_REWARD_PROFILE
-    tat_termination_start_episode: int | None = None
-    tat_termination_enabled: bool | None = None
-    tat_termination_grace_steps: int | None = None
-    early_stop_tat_threshold: float | None = None
-    tat_above_threshold_patience: int | None = None
-    tat_termination_inclusive: bool | None = None
-    terminal_tat_penalty: float | None = None
-    max_stale_sim_time_ticks: int = 5
-    dispatch_mode: str = DISPATCH_FIRST_MATCH
-    minimum_sign_sample_count: int = 100
-
-    @property
-    def effective_warmup_steps(self) -> int:
-        return (
-            0
-            if self.state_normalizer_warmup_bypass
-            or self.load_state_normalizer_path is not None
-            else int(self.warmup_steps)
-        )
-
-    @property
-    def resume_refill_target_env_steps(self) -> int:
-        return int(
-            self.replay_capacity_env_steps
-            if self.resume_inference_until_replay_full
-            else self.minimum_replay_env_steps
-        )
-
-    @property
-    def effective_tat_termination_start_episode(self) -> int:
-        return (
-            1
-            if self.state_normalizer_warmup_bypass
-            else int(self.tat_termination_start_episode)
-        )
-
-    @staticmethod
-    def _runtime_to_reward_fields():
-        return {
-            "smooth_b_rl_weight": "smooth_b_rl_weight",
-            "smooth_exp_residual_weight": "smooth_exp_residual_weight",
-            "reward_normalizer_freeze_steps": "freeze_after_env_steps",
-            "global_normalization_enabled": "global_normalization_enabled",
-            "local_normalization_enabled": "local_normalization_enabled",
-            "tat_reference": "tat_reference",
-            "tat_weight": "tat_weight",
-            "tat_one_sided": "tat_one_sided",
-            "tat_excess_clip": "tat_excess_clip",
-            "tat_ema_beta": "tat_ema_beta",
-            "global_zero_on_first_tick": "global_zero_on_first_tick",
-            "op_weight": "op_weight",
-            "use_op": "use_op",
-            "backlog_weight": "backlog_weight",
-            "backlog_growth_enabled": "backlog_growth_enabled",
-            "backlog_growth_horizon": "backlog_growth_horizon",
-            "backlog_growth_scale": "backlog_growth_scale",
-            "backlog_growth_weight": "backlog_growth_weight",
-            "idle_reserve_target": "idle_reserve_target",
-            "idle_reserve_scale": "idle_reserve_scale",
-            "idle_reserve_weight": "idle_reserve_weight",
-            "local_oht_weight": "local_oht_weight",
-            "local_predicted_oht_weight": "local_predicted_oht_weight",
-            "local_stop_weight": "local_stop_weight",
-            "local_idle_weight": "local_idle_weight",
-            "local_capacity_weight": "local_capacity_weight",
-            "local_fixed_scale_enabled": "local_fixed_scale_enabled",
-            "local_reward_scale": "local_reward_scale",
-            "rail_reward_mode": "rail_reward_mode",
-            "rail_free_flow_neutral_ratio": "rail_free_flow_neutral_ratio",
-            "rail_baseline_ratio_reference": "rail_baseline_ratio_reference",
-            "reward_rail_tat_weight": "rail_tat_weight",
-            "reward_rail_tat_clip": "rail_tat_clip",
-            "tat_raw_clip": "tat_raw_clip",
-            "tat_confidence_n0": "tat_confidence_n0",
-            "tat_confidence_ramp": "tat_confidence_ramp",
-            "tat_confidence_supported": "tat_confidence_supported",
-        }
-
-    def __post_init__(self):
-        canonical_version = (
-            canonical_reward_version(self.reward_version)
-        )
-        object.__setattr__(
-            self, "reward_version", canonical_version
-        )
-        profile = ContextualRewardConfig.for_version(
-            canonical_version,
-            action_mode=self.action_mode,
-        )
-        runtime_to_reward = self._runtime_to_reward_fields()
-        incompatible = []
-        for runtime_name, reward_name in runtime_to_reward.items():
-            expected = getattr(profile, reward_name)
-            actual = getattr(self, runtime_name)
-            if actual is None:
-                object.__setattr__(self, runtime_name, expected)
-            elif actual != expected:
-                incompatible.append((runtime_name, actual, expected))
-        contract = reward_contract(canonical_version)
-        termination_profile = tat_termination_profile(
-            self.tat_termination_policy, contract
-        )
-        termination_incompatible = []
-        for name, expected in termination_profile.items():
-            actual = getattr(self, name)
-            if actual is None:
-                object.__setattr__(self, name, expected)
-            elif actual != expected:
-                target = (
-                    incompatible
-                    if self.tat_termination_policy
-                    == TAT_TERMINATION_REWARD_PROFILE
-                    else termination_incompatible
-                )
-                target.append((name, actual, expected))
-        if self.terminal_tat_penalty is None:
-            object.__setattr__(
-                self, "terminal_tat_penalty", contract.terminal_tat_penalty
-            )
-        elif self.terminal_tat_penalty != contract.terminal_tat_penalty:
-            incompatible.append((
-                "terminal_tat_penalty",
-                self.terminal_tat_penalty,
-                contract.terminal_tat_penalty,
-            ))
-        if termination_incompatible:
-            details = ", ".join(
-                f"{name}={actual!r} (expected {expected!r})"
-                for name, actual, expected in termination_incompatible
-            )
-            raise ValueError(
-                f"TAT termination policy {self.tat_termination_policy} is "
-                f"locked; incompatible overrides: {details}"
-            )
-        if incompatible:
-            details = ", ".join(
-                f"{name}={actual!r} (expected {expected!r})"
-                for name, actual, expected in incompatible
-            )
-            raise ValueError(
-                f"Reward {canonical_version} is a locked full "
-                f"reward profile; incompatible overrides: {details}"
-            )
-        if self.mode not in {"baseline_only", "actor_inference", "training"}:
-            raise ValueError(
-                "mode must be baseline_only, actor_inference, or training"
-            )
-        if self.mode == "training" and not self.action_enabled:
-            raise ValueError("training mode requires explicit action_enabled")
-        for name in ("num_stacks", "stack_interval"):
-            value = getattr(self, name)
-            if isinstance(value, bool) or not isinstance(value, Integral):
-                raise ValueError(f"{name} must be an integer")
-            if int(value) <= 0:
-                raise ValueError(f"{name} must be positive")
-        if self.action_mode not in ACTION_MODES:
-            raise ValueError(f"action_mode must be one of {ACTION_MODES}")
-        if self.replay_sampling_mode not in REPLAY_SAMPLING_MODES:
-            raise ValueError(
-                f"replay_sampling_mode must be one of {REPLAY_SAMPLING_MODES}"
-            )
-        if self.dispatch_mode not in DISPATCH_MODES:
-            raise ValueError(
-                f"dispatch_mode must be one of {DISPATCH_MODES}"
-            )
-        if (
-            self.replay_sampling_mode
-            in {REPLAY_SAMPLING_SNAPSHOT, REPLAY_SAMPLING_RANDOM_RAIL}
-            and self.lap_enabled
-        ):
-            raise ValueError(
-                f"{self.replay_sampling_mode} replay sampling requires "
-                "lap_enabled=False"
-            )
-        if (
-            not np.isfinite(self.action_scale)
-            or self.action_scale < 0.0
-            or self.action_scale > 1.0
-        ):
-            raise ValueError("action_scale must be finite and in [0, 1]")
-        if (
-            isinstance(self.episode_burnin_steps, bool)
-            or not isinstance(self.episode_burnin_steps, Integral)
-        ):
-            raise ValueError("episode_burnin_steps must be an integer")
-        if (
-            self.warmup_steps < 0
-            or self.episode_burnin_steps < 0
-            or self.normalizer_freeze_steps < 0
-            or self.reward_normalizer_freeze_steps < 0
-        ):
-            raise ValueError("warmup/burn-in/freeze steps must be non-negative")
-        for name in (
-            "load_state_normalizer_path",
-            "save_state_normalizer_path",
-            "load_reward_normalizer_path",
-            "save_reward_normalizer_path",
-        ):
-            value = getattr(self, name)
-            if value is not None and (
-                not isinstance(value, str) or not value.strip()
-            ):
-                raise ValueError(f"{name} must be a non-empty path string")
-        if not isinstance(self.state_normalizer_warmup_bypass, bool):
-            raise ValueError("state_normalizer_warmup_bypass must be bool")
-        if not isinstance(self.terminate_on_warmup_complete, bool):
-            raise ValueError("terminate_on_warmup_complete must be bool")
-        if not isinstance(self.reward_normalizer_reuse, bool):
-            raise ValueError("reward_normalizer_reuse must be bool")
-        if not isinstance(self.resume_inference_until_replay_full, bool):
-            raise ValueError(
-                "resume_inference_until_replay_full must be bool"
-            )
-        if not isinstance(self.resume_deterministic_first_episode, bool):
-            raise ValueError(
-                "resume_deterministic_first_episode must be bool"
-            )
-        if self.load_state_normalizer_path is not None:
-            object.__setattr__(
-                self, "state_normalizer_warmup_bypass", True
-            )
-        if self.load_reward_normalizer_path is not None:
-            object.__setattr__(self, "reward_normalizer_reuse", True)
-        if self.resume_checkpoint_path is not None and (
-            self.load_state_normalizer_path is not None
-            or self.load_reward_normalizer_path is not None
-        ):
-            raise ValueError(
-                "standalone normalizer loads and --resume-checkpoint are "
-                "mutually exclusive; checkpoint resume already restores "
-                "state and reward normalizers"
-            )
-        if (
-            self.state_normalizer_warmup_bypass
-            and self.load_state_normalizer_path is None
-            and self.resume_checkpoint_path is None
-        ):
-            raise ValueError(
-                "state_normalizer_warmup_bypass requires a standalone "
-                "normalizer load or checkpoint resume"
-            )
-        if (
-            self.reward_normalizer_reuse
-            and self.load_reward_normalizer_path is None
-            and self.resume_checkpoint_path is None
-        ):
-            raise ValueError(
-                "reward_normalizer_reuse requires a standalone normalizer "
-                "load or checkpoint resume"
-            )
-        if (
-            self.resume_inference_until_replay_full
-            and self.resume_checkpoint_path is None
-        ):
-            raise ValueError(
-                "resume_inference_until_replay_full requires checkpoint "
-                "resume"
-            )
-        if (
-            self.resume_deterministic_first_episode
-            and self.resume_checkpoint_path is None
-        ):
-            raise ValueError(
-                "resume_deterministic_first_episode requires checkpoint "
-                "resume"
-            )
-        if self.mode == "training" and self.action_scale <= 0:
-            raise ValueError("training mode requires positive action_scale")
-        if (
-            self.curriculum_end_step <= self.effective_warmup_steps
-            or not 0 < self.curriculum_scale_start <= 1
-            or not 0 < self.curriculum_scale_end <= 1
-            or self.curriculum_scale_start > self.curriculum_scale_end
-            or self.curriculum_shape not in {"geometric", "linear"}
-        ):
-            raise ValueError("invalid action curriculum configuration")
-        if (
-            self.smooth_b_rl_weight < 0
-            or self.smooth_exp_residual_weight < 0
-        ):
-            raise ValueError("smooth penalty weights must be non-negative")
-        if (
-            not np.isfinite((
-                self.local_reward_scale,
-                self.tat_reference,
-                self.tat_weight,
-                self.op_weight,
-                self.backlog_weight,
-                self.backlog_growth_scale,
-                self.backlog_growth_weight,
-                self.idle_reserve_target,
-                self.idle_reserve_scale,
-                self.idle_reserve_weight,
-                self.local_oht_weight,
-                self.local_predicted_oht_weight,
-                self.local_stop_weight,
-                self.local_idle_weight,
-                self.local_capacity_weight,
-                self.reward_rail_tat_weight,
-            )).all()
-            or self.local_reward_scale <= 0
-            or self.tat_reference <= 0
-            or self.tat_weight < 0
-            or self.op_weight < 0
-            or self.backlog_weight < 0
-            or self.backlog_growth_scale <= 0
-            or self.backlog_growth_weight < 0
-            or self.idle_reserve_target < 0
-            or self.idle_reserve_scale <= 0
-            or self.idle_reserve_weight < 0
-            or self.local_predicted_oht_weight < 0
-            or self.local_oht_weight < 0
-            or self.local_stop_weight < 0
-            or self.local_idle_weight < 0
-            or self.local_capacity_weight < 0
-            or self.reward_rail_tat_weight < 0
-        ):
-            raise ValueError("invalid raw reward scaling configuration")
-        if self.reward_rail_tat_clip is not None and (
-            not np.isfinite(self.reward_rail_tat_clip)
-            or self.reward_rail_tat_clip <= 0
-        ):
-            raise ValueError("reward_rail_tat_clip must be positive or None")
-        if self.tat_raw_clip is not None and (
-            not np.isfinite(self.tat_raw_clip) or self.tat_raw_clip <= 0
-        ):
-            raise ValueError("tat_raw_clip must be positive or None")
-        if (
-            isinstance(self.backlog_growth_horizon, bool)
-            or not isinstance(self.backlog_growth_horizon, Integral)
-            or self.backlog_growth_horizon <= 0
-        ):
-            raise ValueError("backlog_growth_horizon must be a positive integer")
-        if self.rail_reward_mode not in RAIL_REWARD_MODES:
-            raise ValueError(
-                f"rail_reward_mode must be one of {RAIL_REWARD_MODES}"
-            )
-        if (
-            not np.isfinite(self.rail_free_flow_neutral_ratio)
-            or self.rail_free_flow_neutral_ratio <= 0
-        ):
-            raise ValueError(
-                "rail_free_flow_neutral_ratio must be finite and positive"
-            )
-        parse_diagnostic_windows(self.reward_diagnostic_windows)
-        if self.minimum_sign_sample_count <= 0:
-            raise ValueError("minimum_sign_sample_count must be positive")
-        if (
-            not np.isfinite(self.exploration_noise_std)
-            or self.exploration_noise_std < 0
-            or not np.isfinite(self.exploration_noise_final_std)
-            or self.exploration_noise_final_std < 0
-        ):
-            raise ValueError("exploration noise stds must be finite and non-negative")
-        positive = (
-            self.replay_capacity_env_steps, self.batch_size,
-            self.minimum_replay_env_steps,
-            self.minimum_action_enabled_env_steps,
-            self.updates_per_env_step, self.learn_every_env_steps,
-            self.exploration_noise_anneal_steps,
-            self.latest_checkpoint_interval,
-            self.periodic_checkpoint_interval, self.wandb_log_interval,
-        )
-        if any(int(value) <= 0 for value in positive):
-            raise ValueError("training counts/intervals must be positive")
-        if (
-            self.early_stop_queued_threshold <= 0
-            or not np.isfinite(self.early_stop_tat_threshold)
-            or self.early_stop_tat_threshold <= 0
-            or self.max_stale_sim_time_ticks <= 0
-        ):
-            raise ValueError("early-stop/watchdog settings are invalid")
-        if (
-            isinstance(self.tat_termination_grace_steps, bool)
-            or not isinstance(self.tat_termination_grace_steps, Integral)
-            or self.tat_termination_grace_steps < 0
-            or isinstance(self.tat_termination_start_episode, bool)
-            or not isinstance(self.tat_termination_start_episode, Integral)
-            or self.tat_termination_start_episode <= 0
-            or isinstance(self.tat_above_threshold_patience, bool)
-            or not isinstance(self.tat_above_threshold_patience, Integral)
-            or self.tat_above_threshold_patience <= 0
-        ):
-            raise ValueError("TAT termination counts are invalid")
-        if (
-            not np.isfinite(self.terminal_tat_penalty)
-            or self.terminal_tat_penalty > 0.0
-        ):
-            raise ValueError(
-                "terminal_tat_penalty must be finite and non-positive"
-            )
-        if self.rail_tat_diagnostic_max_step < 0:
-            raise ValueError(
-                "rail_tat_diagnostic_max_step must be non-negative"
-            )
-        if (
-            not np.isfinite(self.tat_confidence_n0)
-            or self.tat_confidence_n0 <= 0
-        ):
-            raise ValueError("tat_confidence_n0 must be finite and positive")
-        self.make_reward_config()
-
-    def make_reward_config(self) -> ContextualRewardConfig:
-        """Resolve and validate the complete named reward contract."""
-        profile = ContextualRewardConfig.for_version(
-            self.reward_version,
-            action_mode=self.action_mode,
-        )
-        runtime_to_reward = self._runtime_to_reward_fields()
-        mismatches = [
-            (
-                runtime_name,
-                getattr(self, runtime_name),
-                getattr(profile, reward_name),
-            )
-            for runtime_name, reward_name in runtime_to_reward.items()
-            if getattr(self, runtime_name) != getattr(profile, reward_name)
-        ]
-        if mismatches:
-            details = ", ".join(
-                f"{name}={actual!r} (expected {expected!r})"
-                for name, actual, expected in mismatches
-            )
-            raise ValueError(
-                f"Reward {self.reward_version} is a locked full reward "
-                f"profile; incompatible overrides: {details}"
-            )
-        return profile
 
 
-class ClientAlgorithm:
+class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
     def __init__(self, config: ContextualRuntimeConfig | None = None):
         self.config = config or ContextualRuntimeConfig()
         self.device = torch.device(self.config.device)
@@ -685,10 +149,6 @@ class ClientAlgorithm:
         self.action_enabled_env_steps = 0
         self.state_normalizer_loaded = False
         self.state_normalizer_saved = False
-        self.reward_normalizer_loaded = False
-        self.reward_normalizer_saved = False
-        self.resolved_load_reward_normalizer_path = None
-        self.resolved_save_reward_normalizer_path = None
         self.warmup_episode_boundary_sent = False
         self.exploration_rng = np.random.default_rng(self.config.seed)
         self.wandb_logger = ContextualWandbLogger(self.config)
@@ -755,8 +215,6 @@ class ClientAlgorithm:
             f"{self.config.curriculum_shape}_"
             f"{WARMUP_EPISODE_TRANSITION_VERSION}_"
             f"warmterm{int(self.config.terminate_on_warmup_complete)}_"
-            f"{REWARD_NORMALIZER_SNAPSHOT_VERSION}_"
-            f"rewardnormreuse{int(self.config.reward_normalizer_reuse)}_"
             f"{TAT_TERMINATION_POLICY_VERSION}_"
             f"{self.config.tat_termination_policy}_"
             f"ep{self.config.effective_tat_termination_start_episode}_"
@@ -830,54 +288,6 @@ class ClientAlgorithm:
             flush=True,
         )
 
-    def _resolve_reward_normalizer_path(self, configured: str) -> Path:
-        if configured == AUTO_REWARD_NORMALIZER_PATH:
-            return self.reward_builder.default_normalizer_snapshot_path(
-                seed=self.config.seed
-            )
-        return Path(configured)
-
-    def _maybe_load_reward_normalizer(self) -> None:
-        source = self.config.load_reward_normalizer_path
-        if source is None or self.reward_normalizer_loaded:
-            return
-        if self.reward_builder is None:
-            raise ContextualTrainingFailure(
-                "reward normalizer load requested before reward builder "
-                "initialization"
-            )
-        resolved = self._resolve_reward_normalizer_path(source)
-        self.reward_builder.load_normalizers(resolved, require_frozen=True)
-        self.reward_normalizer_loaded = True
-        self.resolved_load_reward_normalizer_path = str(resolved)
-        print(
-            "[reward-normalizer] loaded compatible frozen local/global "
-            f"snapshot: path={resolved}, "
-            f"reward_steps={self.reward_builder.reward_steps}",
-            flush=True,
-        )
-
-    def _maybe_save_reward_normalizer(self) -> None:
-        target = self.config.save_reward_normalizer_path
-        if target is None or self.reward_normalizer_saved:
-            return
-        if self.reward_builder is None:
-            return
-        if not self.reward_builder.normalizers_ready_for_snapshot():
-            return
-        resolved = self._resolve_reward_normalizer_path(target)
-        saved = self.reward_builder.save_normalizers(
-            resolved, require_frozen=True
-        )
-        self.reward_normalizer_saved = True
-        self.resolved_save_reward_normalizer_path = str(saved)
-        print(
-            "[reward-normalizer] saved populated frozen local/global "
-            f"snapshot: path={saved}, "
-            f"reward_steps={self.reward_builder.reward_steps}",
-            flush=True,
-        )
-
     def _ensure_initialized(self, pclient):
         if self.topology is not None:
             self._maybe_load_state_normalizer()
@@ -896,7 +306,6 @@ class ClientAlgorithm:
                     self.topology, self.reward_builder
                 )
                 self.transition_aligner.episode_id = self.episode_id
-            self._maybe_load_reward_normalizer()
             if self.config.mode == "training" and self.learner is None:
                 self._initialize_training()
             return
@@ -923,7 +332,6 @@ class ClientAlgorithm:
             ),
             reward_diagnostic_writer=self.reward_diagnostic_writer,
         )
-        self._maybe_load_reward_normalizer()
         self.transition_aligner = ContextualTransitionAligner(
             self.topology, self.reward_builder
         )
@@ -1022,12 +430,6 @@ class ClientAlgorithm:
                     ),
                     "terminate_on_warmup_complete": (
                         self.config.terminate_on_warmup_complete
-                    ),
-                    "reward_normalizer_snapshot_version": (
-                        REWARD_NORMALIZER_SNAPSHOT_VERSION
-                    ),
-                    "reward_normalizer_reuse": (
-                        self.config.reward_normalizer_reuse
                     ),
                     "tat_termination_policy_version": (
                         TAT_TERMINATION_POLICY_VERSION
@@ -1280,24 +682,6 @@ class ClientAlgorithm:
             ),
             "state_normalizer_loaded": self.state_normalizer_loaded,
             "state_normalizer_saved": self.state_normalizer_saved,
-            "reward_normalizer_snapshot_version": (
-                REWARD_NORMALIZER_SNAPSHOT_VERSION
-            ),
-            "reward_normalizer_load_requested": bool(
-                self.config.load_reward_normalizer_path
-            ),
-            "reward_normalizer_reuse": self.config.reward_normalizer_reuse,
-            "reward_normalizer_save_requested": bool(
-                self.config.save_reward_normalizer_path
-            ),
-            "reward_normalizer_loaded": self.reward_normalizer_loaded,
-            "reward_normalizer_saved": self.reward_normalizer_saved,
-            "load_reward_normalizer_path": (
-                self.resolved_load_reward_normalizer_path
-            ),
-            "save_reward_normalizer_path": (
-                self.resolved_save_reward_normalizer_path
-            ),
             "exploration_schedule_version": (
                 EXPLORATION_SCHEDULE_VERSION
             ),
@@ -2668,7 +2052,6 @@ class ClientAlgorithm:
                 self.reward_builder.config.rail_free_flow_neutral_ratio
             )
             self.last_diagnostics.update(cycle_summary)
-        self._maybe_save_reward_normalizer()
         checkpoint_started = time.perf_counter()
         if self.config.mode == "training" and not self.training_failed:
             self._maybe_checkpoint(force_latest=done_by_warmup)
@@ -2681,431 +2064,6 @@ class ClientAlgorithm:
         })
         return action_result
 
-    def _update_phase2_reward_diagnostics(self, batch) -> None:
-        """Maintain bounded, run-local diagnostics for provisional scaling."""
-        global_scale = abs(float(batch.global_component))
-        local_scale = float(np.mean(np.abs(batch.local_component)))
-        rail_active = np.abs(batch.rail_reward_postclip[
-            ~np.isclose(batch.rail_reward_postclip, 0.0)
-        ])
-        self._phase2_global_scales.append(global_scale)
-        self._phase2_local_scales.append(local_scale)
-        self._phase2_rail_active_scales.extend(float(x) for x in rail_active)
-        self._phase2_backlogs.append(float(batch.backlog))
-
-        backlog_p50 = float(np.median(self._phase2_backlogs))
-        total_mean = float(batch.total.mean())
-        if batch.total_tat_level < self.reward_builder.config.tat_reference and (
-            batch.backlog <= backlog_p50
-        ):
-            self._phase2_good_rewards.append(total_mean)
-        if batch.total_tat_level > self.reward_builder.config.tat_reference and (
-            batch.backlog >= backlog_p50
-        ):
-            self._phase2_bad_rewards.append(total_mean)
-
-        def median(values):
-            return float(np.median(values)) if values else 0.0
-
-        sg = median(self._phase2_global_scales)
-        sl = median(self._phase2_local_scales)
-        sr = median(self._phase2_rail_active_scales)
-        scale_array = np.asarray([sg, sl, sr], dtype=np.float64)
-        positive = scale_array[scale_array > 0.0]
-        scale_mean = float(positive.mean()) if positive.size else 0.0
-        balance_error = (
-            float(np.mean(np.abs(positive - scale_mean)) / scale_mean)
-            if scale_mean > 0.0 else 0.0
-        )
-        good_count = len(self._phase2_good_rewards)
-        bad_count = len(self._phase2_bad_rewards)
-        good_mean = (
-            float(np.mean(self._phase2_good_rewards)) if good_count else 0.0
-        )
-        bad_mean = (
-            float(np.mean(self._phase2_bad_rewards)) if bad_count else 0.0
-        )
-        smooth_scale = float(np.mean(np.abs(batch.smooth_penalty)))
-        main_scale_mean = float(scale_array.mean())
-        self.last_diagnostics.update({
-            "reward/scale/global_representative": sg,
-            "reward/scale/local_representative": sl,
-            "reward/scale/rail_active_representative": sr,
-            "reward/scale/global_to_local": sg / sl if sl > 0.0 else 0.0,
-            "reward/scale/global_to_rail": sg / sr if sr > 0.0 else 0.0,
-            "reward/scale/local_to_rail": sl / sr if sr > 0.0 else 0.0,
-            "reward/scale/main_balance_error": balance_error,
-            "reward/scale/smooth_excess_warning": float(
-                main_scale_mean > 0.0
-                and smooth_scale > 0.1 * main_scale_mean
-            ),
-            "reward/sign/good_state_sample_count": float(good_count),
-            "reward/sign/good_state_total_mean": good_mean,
-            "reward/sign/bad_state_sample_count": float(bad_count),
-            "reward/sign/bad_state_total_mean": bad_mean,
-            "reward/sign/good_minus_bad": good_mean - bad_mean,
-            "reward/sign/good_state_sufficient": float(
-                good_count >= self.config.minimum_sign_sample_count
-            ),
-            "reward/sign/bad_state_sufficient": float(
-                bad_count >= self.config.minimum_sign_sample_count
-            ),
-        })
-        q1 = self.last_diagnostics.get("critic/q1_mean")
-        q2 = self.last_diagnostics.get("critic/q2_mean")
-        if q1 is not None and q2 is not None:
-            q_mean = 0.5 * (float(q1) + float(q2))
-            if np.isfinite(q_mean):
-                self._phase2_q_means.append(q_mean)
-        for lag in (100, 1_000):
-            self.last_diagnostics[f"critic/q_mean_delta_{lag}"] = (
-                self._phase2_q_means[-1] - self._phase2_q_means[-lag - 1]
-                if len(self._phase2_q_means) > lag else 0.0
-            )
-
-    def _write_reward_step_diagnostic(self, pclient, completed) -> None:
-        writer = self.reward_diagnostic_writer
-        global_step = self.total_steps - 1
-        if (
-            writer is None
-            or not writer.writes_json
-            or writer.window_name(global_step) is None
-        ):
-            return
-        batch = completed.reward
-
-        def stats(record, prefix, values, *, abs_mean=False):
-            array = np.asarray(values, dtype=np.float64)
-            record[prefix + "_mean"] = float(array.mean())
-            record[prefix + "_std"] = float(array.std())
-            record[prefix + "_min"] = float(array.min())
-            record[prefix + "_max"] = float(array.max())
-            if abs_mean:
-                record[prefix + "_abs_mean"] = float(np.abs(array).mean())
-
-        rail_raw = batch.rail_reward_raw
-        rail_weighted = batch.rail_reward_weighted_preclip
-        rail_postclip = batch.rail_reward_postclip
-        clip_mask = ~np.isclose(rail_weighted, rail_postclip)
-        nonzero = ~np.isclose(rail_postclip, 0.0)
-        top_count = min(10, len(rail_postclip))
-        top_rows = np.argsort(np.abs(rail_postclip))[-top_count:][::-1]
-        policy = np.asarray(completed.action, dtype=np.float64).reshape(-1)
-        applied = np.asarray(
-            completed.applied_action, dtype=np.float64
-        ).reshape(-1)
-        b_rl = 0.5 + 0.5 * applied
-        global_vector = np.full_like(
-            batch.local_component, batch.global_component
-        )
-        components = (
-            global_vector,
-            batch.local_component,
-            batch.rail_reward_postclip,
-            -batch.smooth_penalty,
-        )
-        abs_means = np.asarray([
-            np.mean(np.abs(value)) for value in components
-        ], dtype=np.float64)
-        shares = abs_means / (abs_means.sum() + np.finfo(np.float64).eps)
-        reconstructed = sum(components)
-        reward_error = np.abs(batch.total - reconstructed)
-        diagnostics = self.last_diagnostics
-        learner_available = bool(
-            diagnostics.get("update/learner_count", 0.0) > 0
-            and "critic/q1_mean" in diagnostics
-        )
-
-        record = {
-            "reward_version": self.reward_builder.reward_version,
-            "reward_contract_version": (
-                self.reward_builder.reward_contract_version
-            ),
-            "reward_tat_version": self.reward_builder.reward_tat_version,
-            "reward_normalization_version": (
-                self.reward_builder.reward_normalization_version
-            ),
-            "global_step": int(global_step),
-            "episode_id": int(completed.episode_id),
-            "episode_step": int(completed.env_step),
-            "sim_time": float(getattr(pclient, "SimTime", 0.0)),
-            "total_tat": batch.total_tat_level,
-            "tat_reference": self.reward_builder.config.tat_reference,
-            "tat_weight": self.reward_builder.config.tat_weight,
-            "tat_signal_available": bool(batch.tat_signal_available),
-            "completion_count": batch.completion_count,
-            "completion_valid_count": batch.completion_valid_count,
-            "completion_invalid_count": batch.completion_invalid_count,
-            "completion_duplicate_count": batch.completion_duplicate_count,
-            "completion_tat_mean": batch.completion_tat_mean,
-            "completion_tat_std": batch.completion_tat_std,
-            "completion_tat_min": batch.completion_tat_min,
-            "completion_tat_max": batch.completion_tat_max,
-            "completion_tat_raw": batch.completion_tat_raw,
-            "completion_tat_weighted_raw": batch.completion_tat_weighted_raw,
-            "tat_raw_preclip": batch.tat_raw_preclip,
-            "tat_raw_postclip": batch.tat_raw_postclip,
-            "tat_clip_applied": not np.isclose(
-                batch.tat_raw_preclip, batch.tat_raw_postclip
-            ),
-            "op_rate": batch.op_rate,
-            "op_reference": batch.op_reference,
-            "op_error": batch.op_error,
-            "op_raw": batch.op_raw,
-            "waiting": batch.waiting,
-            "queued": batch.queued,
-            "backlog": batch.backlog,
-            "backlog_weight": self.reward_builder.config.backlog_weight,
-            "backlog_raw": batch.backlog_raw,
-            "backlog_growth_signal": batch.backlog_growth_signal,
-            "backlog_growth_raw": batch.backlog_growth_raw,
-            "idle_oht_count": batch.idle_oht_count,
-            "idle_reserve_signal": batch.idle_reserve_signal,
-            "idle_reserve_raw": batch.idle_reserve_raw,
-            "global_raw": batch.global_raw,
-            "global_normalized": batch.global_normalized,
-            "global_normalization_enabled": (
-                self.reward_builder.config.global_normalization_enabled
-            ),
-            "global_alpha": self.reward_builder.config.global_alpha,
-            "global_component": batch.global_component,
-            "global_decomposition_error": abs(
-                batch.global_raw - batch.tat_raw_postclip
-                - batch.op_raw
-                - batch.backlog_raw
-                - batch.backlog_growth_raw
-                - batch.idle_reserve_raw
-            ),
-            "completion_tat_raw_abs": diagnostics.get(
-                "reward/budget/completion_tat_raw_abs", 0.0
-            ),
-            "backlog_raw_abs": diagnostics.get(
-                "reward/budget/backlog_raw_abs", 0.0
-            ),
-            "completion_tat_contribution_abs": diagnostics.get(
-                "reward/contribution/completion_tat_abs", 0.0
-            ),
-            "backlog_contribution_abs": diagnostics.get(
-                "reward/contribution/backlog_abs", 0.0
-            ),
-            "global_component_abs": diagnostics.get(
-                "reward/budget/global_abs", 0.0
-            ),
-            "local_component_abs_mean": diagnostics.get(
-                "reward/budget/local_abs", 0.0
-            ),
-            "rail_component_abs_mean": diagnostics.get(
-                "reward/budget/rail_abs", 0.0
-            ),
-            "smooth_component_abs_mean": diagnostics.get(
-                "reward/budget/smooth_abs", 0.0
-            ),
-            "terminal_penalty": batch.terminal_penalty,
-            "reward_budget_shares": {
-                name: diagnostics.get(f"reward/budget/{name}_share", 0.0)
-                for name in (
-                    "completion_tat", "backlog", "local", "rail", "smooth"
-                )
-            },
-            "leading_indicator_snapshot": {
-                key: value
-                for key, value in diagnostics.items()
-                if key.startswith("lead/") or key.startswith("leadlag/")
-            },
-            "idle_oht_observation_mean": float(
-                batch.idle_oht_observation.mean()
-            ),
-            "idle_oht_observation_max": float(
-                batch.idle_oht_observation.max()
-            ),
-            "local_idle_reward_mean": float(batch.local_idle_raw.mean()),
-            "local_idle_reward_max": float(batch.local_idle_raw.max()),
-            "local_reward_scale": self.reward_builder.config.local_reward_scale,
-            "local_normalization_enabled": (
-                self.reward_builder.config.local_normalization_enabled
-            ),
-            "local_predicted_oht_weight": (
-                self.reward_builder.config.local_predicted_oht_weight
-            ),
-            "local_alpha": self.reward_builder.config.local_alpha,
-            "rail_tat_cycle_count": int(
-                self.reward_builder._last_rail_tat_cycle_count
-            ),
-            "rail_tat_controlled_assignment_count": int(
-                self.reward_builder._last_rail_tat_controlled_assignment_count
-            ),
-            "rail_tat_uncontrolled_assignment_count": int(
-                self.reward_builder._last_rail_tat_uncontrolled_assignment_count
-            ),
-            "rail_tat_weight": self.reward_builder.config.rail_tat_weight,
-            "rail_tat_clip": self.reward_builder.config.rail_tat_clip,
-            "rail_reward_mode": self.reward_builder.config.rail_reward_mode,
-            "rail_free_flow_neutral_ratio": (
-                self.reward_builder.config.rail_free_flow_neutral_ratio
-            ),
-            "rail_tat_clip_fraction": float(clip_mask.mean()),
-            "rail_tat_clip_removed_abs_mean": float(
-                np.abs(rail_weighted - rail_postclip).mean()
-            ),
-            "rail_tat_clip_removed_abs_sum": float(
-                np.abs(rail_weighted - rail_postclip).sum()
-            ),
-            "rail_tat_positive_ratio": float((rail_postclip > 0).mean()),
-            "rail_tat_negative_ratio": float((rail_postclip < 0).mean()),
-            "rail_tat_nonzero_ratio": float(nonzero.mean()),
-            "rail_tat_raw_nonzero_ratio": float(
-                (~np.isclose(rail_raw, 0.0)).mean()
-            ),
-            "rail_tat_top_abs": [
-                {
-                    "rail_id": int(batch.controlled_rail_ids[row]),
-                    "raw": float(rail_raw[row]),
-                    "weighted_preclip": float(rail_weighted[row]),
-                    "postclip": float(rail_postclip[row]),
-                    "clip_applied": bool(clip_mask[row]),
-                }
-                for row in top_rows if not np.isclose(rail_postclip[row], 0.0)
-            ],
-            "smooth_weight": batch.smooth_weight_effective,
-            "control_delta_nonzero_ratio": float(
-                (~np.isclose(batch.smooth_control_delta, 0.0)).mean()
-            ),
-            "action_clipped_fraction": diagnostics.get(
-                "action/clipped_fraction", 0.0
-            ),
-            "policy_saturation_ratio": diagnostics.get(
-                "action/policy_saturation_ratio", 0.0
-            ),
-            "curriculum_action_scale": diagnostics.get(
-                "curriculum/action_scale", 0.0
-            ),
-            "exploration_noise_std": diagnostics.get(
-                "action/exploration_noise_std", 0.0
-            ),
-            "env_tat": diagnostics.get("env/tat", batch.total_tat_level),
-            "operation_rate": diagnostics.get("env/operation_rate", batch.op_rate),
-            "completed_delta": batch.completed_delta,
-            "transfer_count": diagnostics.get("env/transferring", 0.0),
-            "oht_idle": diagnostics.get("oht/idle_count", 0.0),
-            "oht_move_to_load": diagnostics.get("oht/move_to_load", 0.0),
-            "oht_loading": diagnostics.get("oht/loading", 0.0),
-            "oht_move_to_unload": diagnostics.get("oht/move_to_unload", 0.0),
-            "oht_unloading": diagnostics.get("oht/unloading", 0.0),
-            "mean_reassign": diagnostics.get("job/mean_reassign", 0.0),
-            "learner_available": learner_available,
-            "learner_updates": diagnostics.get("learner/updates", 0.0),
-            "reward_total_abs_mean": float(np.abs(batch.total).mean()),
-            "reward_finite_ratio": float(np.isfinite(batch.total).mean()),
-            "global_component_abs_mean": float(abs_means[0]),
-            "local_component_abs_mean": float(abs_means[1]),
-            "rail_tat_component_abs_mean": float(abs_means[2]),
-            "smooth_component_abs_mean": float(abs_means[3]),
-            "global_abs_share": float(shares[0]),
-            "local_abs_share": float(shares[1]),
-            "rail_tat_abs_share": float(shares[2]),
-            "smooth_abs_share": float(shares[3]),
-            "reward_decomposition_error_mean": float(reward_error.mean()),
-            "reward_decomposition_error_max": float(reward_error.max()),
-            "phase2_global_representative": diagnostics.get(
-                "reward/scale/global_representative", 0.0
-            ),
-            "phase2_local_representative": diagnostics.get(
-                "reward/scale/local_representative", 0.0
-            ),
-            "phase2_rail_active_representative": diagnostics.get(
-                "reward/scale/rail_active_representative", 0.0
-            ),
-            "phase2_main_balance_error": diagnostics.get(
-                "reward/scale/main_balance_error", 0.0
-            ),
-            "good_state_sample_count": diagnostics.get(
-                "reward/sign/good_state_sample_count", 0.0
-            ),
-            "good_state_total_mean": diagnostics.get(
-                "reward/sign/good_state_total_mean", 0.0
-            ),
-            "bad_state_sample_count": diagnostics.get(
-                "reward/sign/bad_state_sample_count", 0.0
-            ),
-            "bad_state_total_mean": diagnostics.get(
-                "reward/sign/bad_state_total_mean", 0.0
-            ),
-            "good_minus_bad": diagnostics.get(
-                "reward/sign/good_minus_bad", 0.0
-            ),
-            "q_mean_delta_100": diagnostics.get(
-                "critic/q_mean_delta_100", 0.0
-            ),
-            "q_mean_delta_1000": diagnostics.get(
-                "critic/q_mean_delta_1000", 0.0
-            ),
-        }
-        for prefix, values in (
-            ("local_raw", batch.local_raw),
-            ("local_oht_raw", batch.local_oht_raw),
-            ("local_predicted_raw", batch.local_predicted_raw),
-            ("local_stop_raw", batch.local_stop_raw),
-            ("local_capacity_raw", batch.local_capacity_raw),
-            ("local_normalized", batch.local_normalized),
-            ("local_component", batch.local_component),
-            ("rail_tat_raw", rail_raw),
-            ("rail_tat_weighted_preclip", rail_weighted),
-            ("rail_tat_postclip", rail_postclip),
-            ("control_delta", batch.smooth_control_delta),
-            ("smooth_penalty", batch.smooth_penalty),
-            ("policy_action", policy),
-            ("applied_action", applied),
-            ("b_rl", b_rl),
-            ("b_rl_temporal_delta", batch.smooth_control_delta),
-            ("reward_total", batch.total),
-        ):
-            stats(record, prefix, values, abs_mean=prefix in {
-                "rail_tat_raw", "rail_tat_weighted_preclip",
-                "rail_tat_postclip", "smooth_penalty", "reward_total",
-            })
-        learner_fields = {
-            "q1_mean": "critic/q1_mean",
-            "q2_mean": "critic/q2_mean",
-            "target_q_mean": "critic/target_q_mean",
-            "q_min": "critic/q_min",
-            "q_max": "critic/q_max",
-            "q1_q2_abs_diff_mean": "critic/q_abs_diff_mean",
-            "critic_loss": "learner/critic_loss",
-            "q1_loss": "critic/q1_loss",
-            "q2_loss": "critic/q2_loss",
-            "td_error_mean": "critic/td_error_mean",
-            "td_error_max": "critic/td_error_max",
-            "critic_grad_norm": "grad/critic_norm",
-            "encoder_grad_norm": "grad/encoder_norm",
-            "actor_loss": "learner/actor_loss_last",
-            "actor_grad_norm": "learner/actor_grad_norm_last",
-        }
-        for output, source in learner_fields.items():
-            record[output] = diagnostics.get(source) if learner_available else None
-        writer.append_step(global_step, record)
-
-    def record_send_cost_ms(self, elapsed_ms: float):
-        send_ms = float(elapsed_ms)
-        self.last_diagnostics["runtime/send_cost_ms"] = send_ms
-        self.last_diagnostics["runtime/total_ms"] = (
-            float(self.last_diagnostics.get("runtime/total_algorithm_ms", 0.0))
-            + send_ms
-        )
-
-    def log_wandb_tick(self):
-        trace_command_completed = (
-            float(self.last_diagnostics.get("trace/command/completed", 0.0))
-            == 1.0
-        )
-        if (
-            self.config.mode == "training"
-            and not self.training_failed
-            and (
-                self.total_steps % self.config.wandb_log_interval == 0
-                or trace_command_completed
-            )
-        ):
-            self.wandb_logger.log(self.last_diagnostics, self.total_steps)
 
     def AlgorithmAfter(self, pclient):
         if self.pending_failure is not None:

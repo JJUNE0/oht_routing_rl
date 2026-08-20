@@ -36,7 +36,7 @@ class ContextualTransitionTests(unittest.TestCase):
         self.topology = make_topology()
         self.builder = ContextualRewardBuilder(
             self.topology,
-            ContextualRewardConfig(rail_reward_mode="fixed_tat_reference"),
+            ContextualRewardConfig(),
         )
         self.items = []
         self.aligner = ContextualTransitionAligner(
