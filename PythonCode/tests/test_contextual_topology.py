@@ -19,28 +19,34 @@ from oht_routing.mdp.topology import (
 class FakeRail:
     ID: int
     DistancePerVelocity: float = 1.0
+    Distance: float = 1_000.0
+    PortCount: int = 1
     DivergingLineIDList: list[int] = field(default_factory=list)
     LevelJoiningLineIDList: list[int] = field(default_factory=list)
 
 
-def make_graph(successors, travel_time=None):
+def make_graph(successors, travel_time=None, distance=None, port_count=None):
     ids = sorted(successors)
     predecessor = {rail_id: [] for rail_id in ids}
     for source, targets in successors.items():
         for target in targets:
             predecessor[target].append(source)
     travel_time = travel_time or {}
+    distance = distance or {}
+    port_count = port_count or {}
     return {
         rail_id: FakeRail(
             ID=rail_id,
             DistancePerVelocity=float(travel_time.get(rail_id, 1.0)),
+            Distance=float(distance.get(rail_id, 1_000.0)),
+            PortCount=int(port_count.get(rail_id, 1)),
             DivergingLineIDList=list(successors[rail_id]),
             LevelJoiningLineIDList=sorted(predecessor[rail_id]),
         )
         for rail_id in ids
     }
 
-def make_controlled_boundary_graph(boundary=(3250, 3251, 3252), controlled_size=12):
+def make_controlled_boundary_graph(boundary=(3250, 3251, 3252), controlled_size=16):
     """Three-node entry chain feeding a strongly connected controlled core."""
     controlled = list(range(4000, 4000 + controlled_size))
     successors = {
@@ -61,11 +67,11 @@ def make_controlled_boundary_graph(boundary=(3250, 3251, 3252), controlled_size=
 
 class DirectionalRankingTests(unittest.TestCase):
     def test_straight_graph_orders_by_hop(self):
-        adjacency = {i: ([i + 1] if i < 12 else []) for i in range(1, 13)}
+        adjacency = {i: ([i + 1] if i < 17 else []) for i in range(1, 18)}
         times = {i: 1.0 for i in adjacency}
         ranked = rank_directional_neighbors(1, adjacency, times)
-        self.assertEqual([item.rail_id for item in ranked[:10]], list(range(2, 12)))
-        self.assertEqual([item.hop for item in ranked[:10]], list(range(1, 11)))
+        self.assertEqual([item.rail_id for item in ranked[:15]], list(range(2, 17)))
+        self.assertEqual([item.hop for item in ranked[:15]], list(range(1, 16)))
 
     def test_divergence_same_hop_uses_travel_time_then_id(self):
         adjacency = {1: [2, 3, 4], 2: [], 3: [], 4: []}
@@ -93,18 +99,18 @@ class DirectionalRankingTests(unittest.TestCase):
         ranked = rank_directional_neighbors(1, adjacency, times)
         self.assertEqual([item.rail_id for item in ranked], [2, 3])
 
-    def test_more_than_ten_same_hop_is_deterministic(self):
-        targets = list(range(2, 15))
+    def test_more_than_fifteen_same_hop_is_deterministic(self):
+        targets = list(range(2, 22))
         adjacency = {1: list(reversed(targets))}
         adjacency.update({target: [] for target in targets})
         times = {rail_id: 1.0 for rail_id in adjacency}
         ranked = rank_directional_neighbors(1, adjacency, times)
-        self.assertEqual([item.rail_id for item in ranked[:10]], list(range(2, 12)))
+        self.assertEqual([item.rail_id for item in ranked[:15]], list(range(2, 17)))
 
 
 class FullTopologyAuditTests(unittest.TestCase):
-    def test_directed_cycle_passes_fixed_ten_contract(self):
-        size = 25
+    def test_directed_cycle_passes_fixed_fifteen_contract(self):
+        size = 35
         successors = {
             rail_id: [rail_id + 1 if rail_id < size else 1]
             for rail_id in range(1, size + 1)
@@ -112,15 +118,15 @@ class FullTopologyAuditTests(unittest.TestCase):
         result = build_contextual_topology(
             make_graph(successors), expected_boundary_rail_ids=()
         )
-        self.assertEqual(result.incoming_neighbor_ids.shape, (size, 10))
-        self.assertEqual(result.outgoing_neighbor_ids.shape, (size, 10))
+        self.assertEqual(result.incoming_neighbor_ids.shape, (size, 15))
+        self.assertEqual(result.outgoing_neighbor_ids.shape, (size, 15))
         self.assertTrue((result.incoming_hops >= 1).all())
         self.assertTrue((result.outgoing_hops >= 1).all())
         self.assertEqual(result.audit["status"], "passed")
         self.assertEqual(result.audit["topology_version"], TOPOLOGY_VERSION)
 
     def test_mapping_hash_reproducible_across_input_order(self):
-        size = 25
+        size = 35
         successors = {
             rail_id: [rail_id + 1 if rail_id < size else 1]
             for rail_id in range(1, size + 1)
@@ -138,7 +144,7 @@ class FullTopologyAuditTests(unittest.TestCase):
         )
 
     def test_passed_audit_and_cache_are_written(self):
-        size = 25
+        size = 35
         successors = {
             rail_id: [rail_id + 1 if rail_id < size else 1]
             for rail_id in range(1, size + 1)
@@ -154,12 +160,12 @@ class FullTopologyAuditTests(unittest.TestCase):
             )
             audit = json.loads(audit_path.read_text(encoding="utf-8"))
             self.assertEqual(audit["status"], "passed")
-            self.assertEqual(audit["neighbor_count"], 10)
+            self.assertEqual(audit["neighbor_count"], 15)
             self.assertEqual(audit["mapping_hash"], result.mapping_hash)
             self.assertEqual(audit["topology_hash"], result.topology_hash)
             with np.load(cache_path, allow_pickle=False) as cache:
-                self.assertEqual(cache["incoming_neighbor_ids"].shape, (size, 10))
-                self.assertEqual(cache["outgoing_neighbor_ids"].shape, (size, 10))
+                self.assertEqual(cache["incoming_neighbor_ids"].shape, (size, 15))
+                self.assertEqual(cache["outgoing_neighbor_ids"].shape, (size, 15))
                 self.assertEqual(cache["mapping_hash"].item(), result.mapping_hash)
 
     def test_insufficient_reachable_fails_and_writes_audit(self):
@@ -184,7 +190,7 @@ class FullTopologyAuditTests(unittest.TestCase):
             self.assertEqual(len(audit["deficient_rails"]), 5)
 
     def test_declared_predecessor_mismatch_fails(self):
-        size = 25
+        size = 35
         successors = {
             rail_id: [rail_id + 1 if rail_id < size else 1]
             for rail_id in range(1, size + 1)
@@ -204,13 +210,13 @@ class FullTopologyAuditTests(unittest.TestCase):
 
     def test_neighbor_count_cannot_silently_change(self):
         graph = make_graph({1: [2], 2: [1]})
-        with self.assertRaisesRegex(TopologyAuditError, "exactly 10"):
+        with self.assertRaisesRegex(TopologyAuditError, "exactly 15"):
             build_contextual_topology(
                 graph, neighbor_count=1, expected_boundary_rail_ids=()
             )
 
     def test_cache_refuses_another_mapping(self):
-        size = 25
+        size = 35
         cycle = {
             rail_id: [rail_id + 1 if rail_id < size else 1]
             for rail_id in range(1, size + 1)
@@ -233,19 +239,19 @@ class FullTopologyAuditTests(unittest.TestCase):
 
     def test_controlled_centers_exclude_exact_boundary_and_keep_fixed_shape(self):
         result = build_contextual_topology(make_controlled_boundary_graph())
-        self.assertEqual(result.all_rail_ids.shape, (15,))
-        self.assertEqual(result.controlled_rail_ids.shape, (12,))
+        self.assertEqual(result.all_rail_ids.shape, (19,))
+        self.assertEqual(result.controlled_rail_ids.shape, (16,))
         self.assertEqual(result.boundary_rail_ids.tolist(), [3250, 3251, 3252])
-        self.assertEqual(result.incoming_neighbor_ids.shape, (12, 10))
-        self.assertEqual(result.outgoing_neighbor_ids.shape, (12, 10))
+        self.assertEqual(result.incoming_neighbor_ids.shape, (16, 15))
+        self.assertEqual(result.outgoing_neighbor_ids.shape, (16, 15))
         self.assertTrue(
             set(result.boundary_rail_ids).isdisjoint(result.controlled_rail_ids)
         )
         self.assertGreaterEqual(
-            result.audit["controlled_reachable_incoming"]["min"], 10
+            result.audit["controlled_reachable_incoming"]["min"], 15
         )
         self.assertGreaterEqual(
-            result.audit["controlled_reachable_outgoing"]["min"], 10
+            result.audit["controlled_reachable_outgoing"]["min"], 15
         )
 
     def test_boundary_remains_available_as_neighbor_source(self):
@@ -292,13 +298,15 @@ class FullTopologyAuditTests(unittest.TestCase):
             ).all()
         )
 
-    def test_v1_cache_is_incompatible(self):
+    def test_v2_cache_is_incompatible(self):
         result = build_contextual_topology(make_controlled_boundary_graph())
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "contextual_topology_cache.npz"
             np.savez_compressed(
                 path,
-                topology_version=np.asarray("directed_10in_10out_v1"),
+                topology_version=np.asarray(
+                    "directed_10in_10out_controlled_centers_v2"
+                ),
                 topology_hash=np.asarray(result.topology_hash),
                 mapping_hash=np.asarray(result.mapping_hash),
             )
@@ -333,6 +341,34 @@ class FullTopologyAuditTests(unittest.TestCase):
                 TopologyAuditError, "live topology hash does not match"
             ):
                 load_cached_contextual_topology(graph, cache_path=path)
+
+    def test_topology_hash_covers_density_distance(self):
+        graph = make_controlled_boundary_graph()
+        original = build_contextual_topology(graph)
+        graph[4000].Distance += 1.0
+        changed = build_contextual_topology(graph)
+        self.assertNotEqual(original.topology_hash, changed.topology_hash)
+
+    def test_topology_hash_covers_port_count(self):
+        graph = make_controlled_boundary_graph()
+        original = build_contextual_topology(graph)
+        graph[4000].PortCount += 1
+        changed = build_contextual_topology(graph)
+        self.assertNotEqual(original.topology_hash, changed.topology_hash)
+
+    def test_invalid_static_observation_topology_fields_fail_closed(self):
+        for field_name, value in (
+            ("Distance", 0.0),
+            ("Distance", np.inf),
+            ("PortCount", -1),
+        ):
+            graph = make_controlled_boundary_graph()
+            setattr(graph[4000], field_name, value)
+            with self.subTest(field=field_name, value=value):
+                with self.assertRaisesRegex(
+                    TopologyAuditError, f"{field_name}|finite|positive|non-negative"
+                ):
+                    build_contextual_topology(graph)
 
 
 if __name__ == "__main__":

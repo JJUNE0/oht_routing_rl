@@ -5,6 +5,7 @@ import numpy as np
 import torch
 
 from oht_routing.algorithms.rl.contextual_td7.replay_buffer import (
+    ACTION_FIXED_POINT_MAX_ABS_ERROR,
     ContextualReplayError,
     ContextualStepReplayBuffer,
     REPLAY_SAMPLING_RANDOM_RAIL,
@@ -14,7 +15,7 @@ from oht_routing.algorithms.rl.contextual_td7.replay_buffer import (
 from oht_routing.algorithms.rl.contextual_td7.replay_types import ContextualStepSnapshot
 from oht_routing.mdp.observation import (
     GLOBAL_DIM,
-    LOCAL_DIM,
+    LOCAL_PHYSICAL_DIM,
 )
 from oht_routing.mdp.reward.config import REWARD_VERSION
 from test_contextual_observation import (
@@ -43,6 +44,10 @@ class FakeObservationBuilder:
     def __init__(self, topology):
         self.local_normalizer = IdentityNormalizer()
         self.global_normalizer = IdentityNormalizer()
+        physical_rows = np.arange(len(topology.all_rail_ids), dtype=np.int64)
+        self.physical_distance_mm = np.ascontiguousarray(
+            1_000.0 * (1.0 + physical_rows % 4), dtype=np.float64
+        )
         shape = topology.incoming_neighbor_ids.shape + (2,)
         self._incoming_relation = np.arange(
             np.prod(shape), dtype=np.float32
@@ -50,19 +55,48 @@ class FakeObservationBuilder:
         self._outgoing_relation = self._incoming_relation + 100.0
 
 
+def make_physical_local_state(topology, step):
+    """Build a packing-valid, exactly reconstructable physical snapshot."""
+    physical_count = len(topology.all_rail_ids)
+    rows = np.arange(physical_count, dtype=np.int64)
+    physical = np.zeros((physical_count, LOCAL_PHYSICAL_DIM), np.float32)
+
+    # Static rail fields remain bit-identical for every environment step.
+    physical[:, 0] = np.asarray(topology.all_rail_ids, dtype=np.float32)
+    physical[:, 1] = 1 + rows % 4
+    physical[:, 2] = rows % 3
+    physical[:, 3] = rows % 2
+
+    # Packed integer fields exercise both uint8 and uint16 storage.
+    physical[:, 5] = (rows + int(step)) % 251
+    physical[:, 6] = (7 * rows + int(step)) % 60_001
+    physical[:, 7] = (11 * rows + 2 * int(step)) % 50_001
+    occupancy = ((rows + int(step)) % 4).astype(np.uint8)
+    state = (rows + int(step)) % 6
+    physical[rows, 8 + state] = occupancy
+    stopped = np.where((rows + int(step)) % 5 == 0, occupancy, 0)
+    physical[:, 14] = stopped * ((rows + int(step)) % 251)
+    physical[:, 15] = stopped
+
+    distance_mm = 1_000.0 * (1.0 + rows % 4)
+    physical[:, 4] = (
+        occupancy.astype(np.float64) / (distance_mm / 1_000.0)
+    ).astype(np.float32)
+    return np.ascontiguousarray(physical)
+
+
 def make_snapshot(topology, step, episode=0, done=False):
-    physical = np.empty((PHYSICAL_COUNT, LOCAL_DIM), np.float32)
-    for row, rail_id in enumerate(topology.all_rail_ids):
-        physical[row] = float(rail_id) + np.arange(LOCAL_DIM) / 100
+    physical = make_physical_local_state(topology, step)
+    next_physical = make_physical_local_state(topology, step + 1)
     rows = np.arange(CONTROLLED_COUNT, dtype=np.float32)
     return ContextualStepSnapshot(
-        physical_local_state=physical + step,
+        physical_local_state=physical,
         global_state=np.arange(GLOBAL_DIM, dtype=np.float32) + step,
         previous_applied_action=(rows / CONTROLLED_COUNT * 0.25)[:, None],
         policy_action=(rows / CONTROLLED_COUNT)[:, None],
         applied_action=(rows / CONTROLLED_COUNT * 0.25)[:, None],
         reward=rows + step * 10,
-        next_physical_local_state=physical + (step + 1),
+        next_physical_local_state=next_physical,
         next_global_state=np.arange(GLOBAL_DIM, dtype=np.float32) + step + 1.0,
         next_previous_applied_action=(
             rows / CONTROLLED_COUNT * 0.25
@@ -87,27 +121,35 @@ class ContextualReplayTests(unittest.TestCase):
         replay = ContextualStepReplayBuffer(
             self.topology, self.builder, capacity_env_steps=4, seed=5
         )
-        replay.push(make_snapshot(self.topology, 0, done=True))
+        snapshot = make_snapshot(self.topology, 0, done=True)
+        replay.push(snapshot)
         self.assertEqual(replay.size_env_steps, 1)
         self.assertEqual(
             replay.diagnostics()["replay/size_logical_transitions"],
             CONTROLLED_COUNT,
         )
         batch = replay.sample(16)
+        self.assertEqual(LOCAL_PHYSICAL_DIM, 16)
+        self.assertEqual(GLOBAL_DIM, 17)
+        self.assertEqual(self.topology.incoming_neighbor_ids.shape[1], 15)
+        self.assertEqual(self.topology.outgoing_neighbor_ids.shape[1], 15)
         expected_shapes = {
-            "center_local": (16, 8),
-            "incoming_local": (16, 10, 8),
-            "outgoing_local": (16, 10, 8),
-            "incoming_relation": (16, 10, 2),
-            "outgoing_relation": (16, 10, 2),
-            "global_state": (16, 6),
+            "center_local": (16, 16),
+            "incoming_local": (16, 15, 16),
+            "outgoing_local": (16, 15, 16),
+            "center_rail_index": (16,),
+            "incoming_rail_indices": (16, 15),
+            "outgoing_rail_indices": (16, 15),
+            "incoming_relation": (16, 15, 2),
+            "outgoing_relation": (16, 15, 2),
+            "global_state": (16, 17),
             "previous_applied_action": (16, 1),
             "policy_action": (16, 1),
             "applied_action": (16, 1),
             "reward": (16, 1),
-            "next_center_local": (16, 8),
-            "next_incoming_local": (16, 10, 8),
-            "next_outgoing_local": (16, 10, 8),
+            "next_center_local": (16, 16),
+            "next_incoming_local": (16, 15, 16),
+            "next_outgoing_local": (16, 15, 16),
             "next_previous_applied_action": (16, 1),
             "done": (16, 1),
             "controlled_rail_id": (16,),
@@ -117,8 +159,18 @@ class ContextualReplayTests(unittest.TestCase):
             self.assertEqual(tuple(value.shape), shape)
             self.assertTrue(value.is_contiguous())
             self.assertTrue(torch.isfinite(value).all())
+        for name in (
+            "center_rail_index",
+            "incoming_rail_indices",
+            "outgoing_rail_indices",
+        ):
+            self.assertEqual(getattr(batch, name).dtype, torch.int64)
         self.assertTrue(torch.all(batch.done == 1))
 
+        physical_index_by_id = {
+            int(rail_id): index
+            for index, rail_id in enumerate(self.topology.all_rail_ids)
+        }
         for index, key in enumerate(batch.sample_keys):
             row = key.controlled_row
             rail_id = int(self.topology.controlled_rail_ids[row])
@@ -126,14 +178,57 @@ class ContextualReplayTests(unittest.TestCase):
                 self.topology.controlled_row_to_physical_index[row]
             )
             self.assertEqual(int(batch.controlled_rail_id[index]), rail_id)
+            self.assertEqual(
+                int(batch.center_rail_index[index]), physical_row
+            )
+            np.testing.assert_array_equal(
+                batch.incoming_rail_indices[index].numpy(),
+                np.asarray([
+                    physical_index_by_id[int(neighbor_id)]
+                    for neighbor_id in self.topology.incoming_neighbor_ids[row]
+                ], dtype=np.int64),
+            )
+            np.testing.assert_array_equal(
+                batch.outgoing_rail_indices[index].numpy(),
+                np.asarray([
+                    physical_index_by_id[int(neighbor_id)]
+                    for neighbor_id in self.topology.outgoing_neighbor_ids[row]
+                ], dtype=np.int64),
+            )
             self.assertAlmostEqual(
                 float(batch.center_local[index, 0]), float(physical_row)
             )
-            self.assertAlmostEqual(
-                float(batch.policy_action[index, 0]),
-                row / CONTROLLED_COUNT,
+            np.testing.assert_array_equal(
+                batch.center_local[index].numpy(),
+                snapshot.physical_local_state[physical_row],
+            )
+            incoming_rows = batch.incoming_rail_indices[index].numpy()
+            outgoing_rows = batch.outgoing_rail_indices[index].numpy()
+            np.testing.assert_array_equal(
+                batch.incoming_local[index].numpy(),
+                snapshot.physical_local_state[incoming_rows],
+            )
+            np.testing.assert_array_equal(
+                batch.outgoing_local[index].numpy(),
+                snapshot.physical_local_state[outgoing_rows],
+            )
+            np.testing.assert_array_equal(
+                batch.next_center_local[index].numpy(),
+                snapshot.next_physical_local_state[physical_row],
+            )
+            self.assertLessEqual(
+                abs(
+                    float(batch.policy_action[index, 0])
+                    - row / CONTROLLED_COUNT
+                ),
+                ACTION_FIXED_POINT_MAX_ABS_ERROR
+                + float(np.finfo(np.float32).eps),
             )
             self.assertAlmostEqual(float(batch.reward[index, 0]), float(row))
+
+        self.assertEqual(replay._physical_uint8.dtype, np.uint8)
+        self.assertEqual(replay._physical_uint16.dtype, np.uint16)
+        self.assertEqual(replay._physical_static.dtype, np.float32)
 
     def test_neighbor_gather_uses_id_mapping_and_boundary_can_be_source(self):
         replay = ContextualStepReplayBuffer(
@@ -146,9 +241,16 @@ class ContextualReplayTests(unittest.TestCase):
             batch = replay.sample(256)
             for i, key in enumerate(batch.sample_keys):
                 if key.controlled_row == 0:
+                    boundary_index = int(np.flatnonzero(
+                        self.topology.all_rail_ids == BOUNDARY_IDS[0]
+                    )[0])
                     self.assertEqual(
                         float(batch.incoming_local[i, 0, 0]),
                         float(BOUNDARY_IDS[0]),
+                    )
+                    self.assertEqual(
+                        int(batch.incoming_rail_indices[i, 0]),
+                        boundary_index,
                     )
                     self.assertNotIn(
                         int(batch.controlled_rail_id[i]), BOUNDARY_IDS
@@ -199,6 +301,20 @@ class ContextualReplayTests(unittest.TestCase):
             applied_action=zeros, baseline_cost=costs, final_cost=costs,
             env_step=1, episode_id=0,
         )
+        packed = make_snapshot(self.topology, 0)
+        completed = replace(
+            completed,
+            state=replace(
+                completed.state,
+                physical_local_raw=packed.physical_local_state,
+                global_raw=packed.global_state,
+            ),
+            next_state=replace(
+                completed.next_state,
+                physical_local_raw=packed.next_physical_local_state,
+                global_raw=packed.next_global_state,
+            ),
+        )
         snapshot = snapshot_from_transition(completed)
         replay = ContextualStepReplayBuffer(
             self.topology, self.builder, capacity_env_steps=2
@@ -231,6 +347,146 @@ class ContextualReplayTests(unittest.TestCase):
         bad_reward[0] = np.nan
         with self.assertRaises(ContextualReplayError):
             replay.push(replace(base, reward=bad_reward))
+
+    def test_packed_integer_features_reject_fractional_and_overflow(self):
+        base = make_snapshot(self.topology, 0)
+        cases = (
+            (5, 1.5, "uint8 physical replay features must be exactly integral"),
+            (5, 256.0, "uint8 physical replay feature overflow"),
+            (6, 1.5, "uint16 physical replay features must be exactly integral"),
+            (6, 65_536.0, "uint16 physical replay feature overflow"),
+        )
+        for feature, value, message in cases:
+            with self.subTest(feature=feature, value=value):
+                physical = base.physical_local_state.copy()
+                physical[0, feature] = value
+                replay = ContextualStepReplayBuffer(
+                    self.topology, self.builder, capacity_env_steps=2
+                )
+                with self.assertRaisesRegex(ContextualReplayError, message):
+                    replay.push(replace(base, physical_local_state=physical))
+
+    def test_static_physical_feature_drift_is_rejected(self):
+        replay = ContextualStepReplayBuffer(
+            self.topology, self.builder, capacity_env_steps=2
+        )
+        replay.push(make_snapshot(self.topology, 0))
+        second = make_snapshot(self.topology, 1)
+        physical = second.physical_local_state.copy()
+        physical[0, 0] += 0.5
+        with self.assertRaisesRegex(
+            ContextualReplayError,
+            "static physical replay features changed after initialization",
+        ):
+            replay.push(replace(second, physical_local_state=physical))
+
+    def test_contiguous_previous_action_mismatch_is_rejected(self):
+        replay = ContextualStepReplayBuffer(
+            self.topology, self.builder, capacity_env_steps=2
+        )
+        replay.push(make_snapshot(self.topology, 0))
+        second = make_snapshot(self.topology, 1)
+        previous = second.previous_applied_action.copy()
+        previous[0, 0] += 0.1
+        with self.assertRaisesRegex(
+            ContextualReplayError,
+            "contiguous transition previous_applied_action differs",
+        ):
+            replay.push(
+                replace(second, previous_applied_action=previous)
+            )
+
+    def test_duplicate_live_transition_is_rejected_before_state_packing(self):
+        replay = ContextualStepReplayBuffer(
+            self.topology, self.builder, capacity_env_steps=2
+        )
+        snapshot = make_snapshot(self.topology, 0)
+        replay.push(snapshot)
+        state_cursor = replay._state_cursor
+        transition_cursor = replay._transition_cursor
+        key_to_state = replay._key_to_state.copy()
+        key_to_transition = replay._key_to_transition.copy()
+
+        # A packed-column violation would fail later in _pack_physical.  The
+        # duplicate live transition key must be rejected before any state is
+        # packed, inserted, or overwritten.
+        duplicate_physical = snapshot.physical_local_state.copy()
+        duplicate_physical[0, 5] = 1.5
+        with self.assertRaisesRegex(
+            ContextualReplayError, "duplicate live transition"
+        ):
+            replay.push(
+                replace(
+                    snapshot,
+                    physical_local_state=duplicate_physical,
+                )
+            )
+
+        self.assertEqual(replay.push_count, 1)
+        self.assertEqual(replay.size_env_steps, 1)
+        self.assertEqual(replay._state_cursor, state_cursor)
+        self.assertEqual(replay._transition_cursor, transition_cursor)
+        self.assertEqual(replay._key_to_state, key_to_state)
+        self.assertEqual(replay._key_to_transition, key_to_transition)
+
+    def test_overwrite_prunes_episode_without_live_transitions(self):
+        replay = ContextualStepReplayBuffer(
+            self.topology, self.builder, capacity_env_steps=1
+        )
+        replay.push(make_snapshot(self.topology, 0, episode=0, done=True))
+        self.assertEqual(replay._episode_first_step, {0: 0})
+
+        replay.push(make_snapshot(self.topology, 0, episode=1, done=True))
+
+        self.assertEqual(replay.size_env_steps, 1)
+        self.assertEqual(replay._episode_first_step, {1: 0})
+        batch = replay.sample(16)
+        self.assertTrue(torch.all(batch.episode_id == 1))
+
+    def test_int16_actions_round_trip_within_fixed_point_error(self):
+        replay = ContextualStepReplayBuffer(
+            self.topology,
+            self.builder,
+            capacity_env_steps=2,
+            sampling_mode=REPLAY_SAMPLING_SNAPSHOT,
+        )
+        snapshot = make_snapshot(self.topology, 0)
+        previous = np.linspace(
+            -1.0, 1.0, CONTROLLED_COUNT, dtype=np.float32
+        )[:, None]
+        policy = previous[::-1].copy()
+        applied = np.sin(
+            np.linspace(-np.pi / 2, np.pi / 2, CONTROLLED_COUNT)
+        ).astype(np.float32)[:, None]
+        snapshot = replace(
+            snapshot,
+            previous_applied_action=previous,
+            policy_action=policy,
+            applied_action=applied,
+            next_previous_applied_action=applied.copy(),
+        )
+        replay.push(snapshot)
+        batch = replay.sample(1)
+        tolerance = (
+            ACTION_FIXED_POINT_MAX_ABS_ERROR
+            + float(np.finfo(np.float32).eps)
+        )
+        for actual, expected in (
+            (batch.previous_applied_action[:, 0].numpy(), previous[:, 0]),
+            (batch.policy_action[:, 0].numpy(), policy[:, 0]),
+            (batch.applied_action[:, 0].numpy(), applied[:, 0]),
+            (batch.next_previous_applied_action[:, 0].numpy(), applied[:, 0]),
+        ):
+            self.assertLessEqual(
+                float(np.max(np.abs(actual - expected))), tolerance
+            )
+        np.testing.assert_array_equal(
+            batch.next_previous_applied_action.numpy(),
+            batch.applied_action.numpy(),
+        )
+        self.assertEqual(replay._previous_applied_action.dtype, np.int16)
+        self.assertEqual(replay._policy_action.dtype, np.int16)
+        self.assertEqual(replay._applied_action.dtype, np.int16)
 
     def test_replay_is_locked_to_reward_n(self):
         with self.assertRaisesRegex(ValueError, "only reward_version='N'"):
@@ -287,9 +543,17 @@ class ContextualReplayTests(unittest.TestCase):
 
         batch = replay.sample(2)
         expected_rows = 2 * CONTROLLED_COUNT
-        self.assertEqual(tuple(batch.center_local.shape), (expected_rows, 8))
         self.assertEqual(
-            tuple(batch.incoming_local.shape), (expected_rows, 10, 8)
+            tuple(batch.center_local.shape), (expected_rows, 16)
+        )
+        self.assertEqual(
+            tuple(batch.incoming_local.shape), (expected_rows, 15, 16)
+        )
+        self.assertEqual(
+            tuple(batch.center_rail_index.shape), (expected_rows,)
+        )
+        self.assertEqual(
+            tuple(batch.incoming_rail_indices.shape), (expected_rows, 15)
         )
         self.assertEqual(len(batch.sample_keys), expected_rows)
 

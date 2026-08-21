@@ -59,8 +59,31 @@ WARMUP_BOUNDARY_EXPORT_COLUMNS = {
 }
 RUNTIME_SAFETY_EXPORT_COLUMNS = {
     "cost/all_baseline_abs_error_max",
+    "runtime/state_collection_ms",
+    "runtime/observation_build_ms",
+    "runtime/tensor_conversion_ms",
+    "runtime/host_to_device_ms",
+    "runtime/encoder_actor_ms",
+    "runtime/actor_inference_ms",
+    "runtime/device_to_host_ms",
+    "runtime/cost_apply_ms",
+    "runtime/checkpoint_ms",
+    "runtime/send_cost_ms",
+    "runtime/total_algorithm_ms",
+    "runtime/total_ms",
+    "runtime/data_capture_ms",
     "runtime/observation_build_calls_per_tick",
     "runtime/nonfinite_count",
+}
+OBSERVATION_EXPORT_COLUMNS = {
+    "observation/predicted_route10_pearson",
+    "observation/predicted_route10_mae",
+    "observation/predicted_route10_nonzero_agreement",
+    "observation/predicted_route10_both_nonzero",
+    "observation/predicted_route10_pearson_available",
+    "observation/predicted_route10_union_nonzero_pearson",
+    "observation/predicted_route10_union_nonzero_pearson_available",
+    "observation/predicted_route10_union_nonzero_ratio",
 }
 
 
@@ -74,6 +97,8 @@ if not WARMUP_BOUNDARY_EXPORT_COLUMNS <= set(WANDB_METRIC_KEYS):
     raise RuntimeError("warm-up boundary diagnostics are missing from W&B export schema")
 if not RUNTIME_SAFETY_EXPORT_COLUMNS <= set(WANDB_METRIC_KEYS):
     raise RuntimeError("runtime safety diagnostics are missing from W&B export schema")
+if not OBSERVATION_EXPORT_COLUMNS <= set(WANDB_METRIC_KEYS):
+    raise RuntimeError("observation diagnostics are missing from W&B export schema")
 
 EXPORT_COLUMNS = ("_step",) + WANDB_METRIC_KEYS
 EXPORT_SCHEMA_VERSION = EXP_META["version"]

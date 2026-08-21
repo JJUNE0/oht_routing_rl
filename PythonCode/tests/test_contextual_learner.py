@@ -15,6 +15,11 @@ from test_contextual_replay import FakeObservationBuilder, make_snapshot
 
 
 SMALL_NETWORK = ContextualNetworkConfig(
+    local_physical_dim=16,
+    rail_embedding_dim=8,
+    num_rails=4_999,
+    global_dim=17,
+    neighbor_count=15,
     d_model=16, num_heads=4, global_emb_dim=8,
     context_dim=32, hidden_dim=64,
 )
@@ -127,6 +132,39 @@ class ContextualLearnerTests(unittest.TestCase):
         self.assertTrue(fourth.target_updated)
         self.assertEqual(
             fourth.diagnostics["target/encoder_distance"], 0.0
+        )
+
+    def test_rail_embedding_is_critic_trained_and_hard_targeted(self):
+        learner = ContextualTD7Learner(
+            make_replay(),
+            network_config=SMALL_NETWORK,
+            config=replace(self.config(), target_update_interval=2),
+            seed=29,
+        )
+        online_before = learner.encoder.rail_embedding.weight.detach().clone()
+        target_before = (
+            learner.target_encoder.rail_embedding.weight.detach().clone()
+        )
+
+        first = learner.update()
+        self.assertFalse(first.target_updated)
+        self.assertFalse(torch.equal(
+            learner.encoder.rail_embedding.weight.detach(), online_before
+        ))
+        torch.testing.assert_close(
+            learner.target_encoder.rail_embedding.weight,
+            target_before,
+            rtol=0,
+            atol=0,
+        )
+
+        second = learner.update()
+        self.assertTrue(second.target_updated)
+        torch.testing.assert_close(
+            learner.target_encoder.rail_embedding.weight,
+            learner.encoder.rail_embedding.weight,
+            rtol=0,
+            atol=0,
         )
 
     def test_online_critic_receives_replay_applied_action(self):
@@ -279,6 +317,9 @@ class ContextualLearnerTests(unittest.TestCase):
         self.assertFalse(groups[0] & groups[1])
         self.assertFalse(groups[0] & groups[2])
         self.assertFalse(groups[1] & groups[2])
+        self.assertIn(id(learner.encoder.rail_embedding.weight), groups[0])
+        self.assertNotIn(id(learner.encoder.rail_embedding.weight), groups[1])
+        self.assertNotIn(id(learner.encoder.rail_embedding.weight), groups[2])
         ownership = learner.optimizer_parameter_ownership()
         self.assertFalse(ownership["q1"] & ownership["q2"])
         self.assertEqual(

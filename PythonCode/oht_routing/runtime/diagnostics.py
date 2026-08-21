@@ -389,7 +389,7 @@ class ContextualRuntimeDiagnosticsMixin:
 
     def log_wandb_tick(self):
         if (
-            self.config.mode == "training"
+            self.config.mode in {"training", "actor_inference"}
             and not self.training_failed
             and self.total_steps % self.config.wandb_log_interval == 0
         ):

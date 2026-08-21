@@ -1,8 +1,11 @@
 import unittest
 
+import numpy as np
+
 from oht_routing.algorithms.rl.contextual_td7.replay_buffer import (
     ContextualReplayError,
     ContextualStepReplayBuffer,
+    REPLAY_SAMPLING_SNAPSHOT,
 )
 from test_contextual_observation import CONTROLLED_COUNT, make_topology
 from test_contextual_replay import FakeObservationBuilder, make_snapshot
@@ -40,11 +43,21 @@ class ContextualReplayMemoryTests(unittest.TestCase):
 
     def test_full_capacity_survives_one_transition_per_episode(self):
         replay = ContextualStepReplayBuffer(
-            self.topology, self.builder, capacity_env_steps=4
+            self.topology,
+            self.builder,
+            capacity_env_steps=4,
+            sampling_mode=REPLAY_SAMPLING_SNAPSHOT,
         )
         for episode in range(4):
-            replay.push(make_snapshot(self.topology, 0, episode=episode))
+            replay.push(
+                make_snapshot(
+                    self.topology, 0, episode=episode, done=True
+                )
+            )
         self.assertEqual(replay.size_env_steps, 4)
+        self.assertEqual(replay.state_capacity, 2 * replay.capacity)
+        sampled = replay.sample(4)
+        self.assertEqual(set(sampled.episode_id.tolist()), set(range(4)))
 
     def test_storage_estimate_and_actual_allocation(self):
         replay = ContextualStepReplayBuffer(
@@ -57,6 +70,45 @@ class ContextualReplayMemoryTests(unittest.TestCase):
         self.assertLess(abs(actual - estimated) / estimated, 0.01)
         for capacity in (1_000, 5_000, 10_000, 45_000):
             self.assertGreater(replay.estimate_capacity_bytes(capacity), 0)
+
+        estimate_100k = replay.estimate_capacity_bytes(
+            100_000, lap_enabled=True
+        )
+        estimate_100k_gib = estimate_100k / (1024.0 ** 3)
+        self.assertLess(estimate_100k_gib, 20.0)
+        self.assertAlmostEqual(estimate_100k_gib, 18.642525, places=5)
+        estimate_100k_no_lap_gib = replay.estimate_capacity_bytes(
+            100_000, lap_enabled=False
+        ) / (1024.0 ** 3)
+        self.assertAlmostEqual(
+            estimate_100k_no_lap_gib, 17.710085, places=5
+        )
+
+    def test_packed_storage_dtypes_match_capacity_estimate_contract(self):
+        replay = ContextualStepReplayBuffer(
+            self.topology,
+            self.builder,
+            capacity_env_steps=3,
+            lap_enabled=True,
+        )
+        self.assertEqual(replay._physical_static.dtype, np.float32)
+        self.assertEqual(replay._physical_distance_mm.dtype, np.float64)
+        self.assertEqual(replay._physical_uint8.dtype, np.uint8)
+        self.assertEqual(replay._physical_uint16.dtype, np.uint16)
+        self.assertEqual(replay._global.dtype, np.float32)
+        self.assertEqual(replay._previous_applied_action.dtype, np.int16)
+        self.assertEqual(replay._policy_action.dtype, np.int16)
+        self.assertEqual(replay._applied_action.dtype, np.int16)
+        self.assertEqual(replay._reward.dtype, np.float32)
+        self.assertEqual(replay._priority.dtype, np.float16)
+        self.assertEqual(
+            replay._physical_uint8.shape,
+            (2 * replay.capacity, len(self.topology.all_rail_ids), 8),
+        )
+        self.assertEqual(
+            replay._physical_uint16.shape,
+            (2 * replay.capacity, len(self.topology.all_rail_ids), 3),
+        )
 
     def test_repeated_overwrite_has_fixed_storage(self):
         replay = ContextualStepReplayBuffer(

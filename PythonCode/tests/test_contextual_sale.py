@@ -58,15 +58,26 @@ def sale_config(lap=False, interval=4):
     )
 
 
+def batch_observation(batch, *, next_state=False):
+    prefix = "next_" if next_state else ""
+    return (
+        getattr(batch, f"{prefix}center_local"),
+        getattr(batch, f"{prefix}incoming_local"),
+        getattr(batch, f"{prefix}outgoing_local"),
+        batch.center_rail_index,
+        batch.incoming_rail_indices,
+        batch.outgoing_rail_indices,
+        getattr(batch, f"{prefix}incoming_relation"),
+        getattr(batch, f"{prefix}outgoing_relation"),
+        getattr(batch, f"{prefix}global_state"),
+    )
+
+
 class ContextualSALETests(unittest.TestCase):
     def test_avg_l1_and_sale_shapes_zero_finite(self):
         module = SALEOnline(SMALL_NETWORK, embedding_dim=16)
         batch = sale_replay().sample(4)
-        observation = (
-            batch.center_local, batch.incoming_local, batch.outgoing_local,
-            batch.incoming_relation, batch.outgoing_relation,
-            batch.global_state,
-        )
+        observation = batch_observation(batch)
         zs = module.state(observation)
         zsa = module.state_action(zs, batch.applied_action)
         self.assertEqual(zs.shape, (4, 16))
@@ -83,16 +94,8 @@ class ContextualSALETests(unittest.TestCase):
             config=sale_config(), seed=8,
         )
         batch = learner.replay.sample(8)
-        obs = (
-            batch.center_local, batch.incoming_local, batch.outgoing_local,
-            batch.incoming_relation, batch.outgoing_relation,
-            batch.global_state,
-        )
-        nxt = (
-            batch.next_center_local, batch.next_incoming_local,
-            batch.next_outgoing_local, batch.next_incoming_relation,
-            batch.next_outgoing_relation, batch.next_global_state,
-        )
+        obs = batch_observation(batch)
+        nxt = batch_observation(batch, next_state=True)
         zs = learner.sale_online.state(obs)
         pred = learner.sale_online.state_action(zs, batch.applied_action)
         with torch.no_grad():
@@ -110,12 +113,21 @@ class ContextualSALETests(unittest.TestCase):
             sale_replay(), network_config=SMALL_NETWORK,
             config=sale_config(), seed=2,
         )
+        embedding_before = (
+            learner.sale_online.state_encoder.context.rail_embedding.weight
+            .detach()
+            .clone()
+        )
         fixed_before = copy.deepcopy(learner.sale_fixed.state_dict())
         target_before = copy.deepcopy(learner.sale_target_fixed.state_dict())
         learner.update()
         self.assertTrue(any(
             not torch.equal(value, fixed_before[name])
             for name, value in learner.sale_online.state_dict().items()
+        ))
+        self.assertFalse(torch.equal(
+            learner.sale_online.state_encoder.context.rail_embedding.weight,
+            embedding_before,
         ))
         for name, value in learner.sale_fixed.state_dict().items():
             torch.testing.assert_close(value, fixed_before[name])
@@ -166,11 +178,7 @@ class ContextualSALETests(unittest.TestCase):
             config=sale_config(), seed=12,
         )
         batch = learner.replay.sample(4)
-        observation = (
-            batch.center_local, batch.incoming_local, batch.outgoing_local,
-            batch.incoming_relation, batch.outgoing_relation,
-            batch.global_state,
-        )
+        observation = batch_observation(batch)
         with torch.no_grad():
             task_state = learner.encoder(*observation).state
             zs = learner.sale_fixed.state(observation)

@@ -50,6 +50,7 @@ from oht_routing.utils.reward_diagnostic import (
     RewardDiagnosticWriter,
     parse_diagnostic_windows,
 )
+from oht_routing.utils.environment_capture import ActorEnvironmentCapture
 from oht_routing.mdp.transition import ContextualTransitionAligner
 from oht_routing.utils.wandb_logging import ContextualWandbLogger
 from oht_routing.runtime.console import print_entries, print_header
@@ -153,6 +154,13 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
         self.warmup_episode_boundary_sent = False
         self.exploration_rng = np.random.default_rng(self.config.seed)
         self.wandb_logger = ContextualWandbLogger(self.config)
+        self.environment_capture = (
+            ActorEnvironmentCapture(
+                PROJECT_ROOT / "results" / "environment_capture"
+            )
+            if self.config.save_data_enabled
+            else None
+        )
         self.training_failed = False
         self.pending_failure: Exception | None = None
         self.failure_type: str | None = None
@@ -359,6 +367,8 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
             critic_loss_mode=self.config.critic_loss_mode,
         )
         network_config = ContextualNetworkConfig(
+            num_rails=len(self.topology.all_rail_ids),
+            neighbor_count=int(self.topology.incoming_neighbor_ids.shape[1]),
             num_stacks=self.config.num_stacks,
             stack_interval=self.config.stack_interval,
         )
@@ -612,6 +622,9 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
             self.transition_aligner.reset(self.episode_id)
         if self.reward_builder is not None:
             self.reward_builder.reset_episode()
+        observation_builder = getattr(self, "observation_builder", None)
+        if observation_builder is not None:
+            observation_builder.reset_episode()
 
     def _clear_training_temporal_state(self) -> None:
         """Idempotently remove state that could create a post-failure transition."""
@@ -758,8 +771,7 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
         self._stale_sim_time_ticks = 0
         self._burnin_last_applied_action = None
         self._burnin_previous_applied_action = None
-        # Delay-estimator state is episode-local because it affects both the
-        # actor observation and the baseline congestion cost.
+        # Delay-estimator state is episode-local and affects baseline cost.
         self.parameterDw.clear()
         self.parameterPassTimes.clear()
         self.parameterC.clear()
@@ -770,11 +782,43 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
             self.transition_aligner.reset(self.episode_id)
         if self.reward_builder is not None:
             self.reward_builder.reset_episode()
+        observation_builder = getattr(self, "observation_builder", None)
+        if observation_builder is not None:
+            observation_builder.reset_episode()
 
     def on_terminal(self):
         """Record terminal signal; no terminal state is available at protocol v=1."""
         if self.transition_aligner is not None:
             self.last_diagnostics["transition/terminal_without_observation"] = 1.0
+
+    def capture_environment_tick(self, pclient):
+        if (
+            self.environment_capture is None
+            or self.environment_capture.completed
+        ):
+            return
+        started = time.perf_counter()
+        captured = self.environment_capture.capture(pclient, self)
+        self.last_diagnostics["runtime/data_capture_ms"] = (
+            time.perf_counter() - started
+        ) * 1000.0
+        if captured and self.environment_capture.record_count == 1:
+            print(
+                "[environment-capture] started: "
+                f"{self.environment_capture.output_dir}",
+                flush=True,
+            )
+        if captured and self.environment_capture.completed:
+            print(
+                "[environment-capture] completed: "
+                f"steps={self.environment_capture.record_count}, "
+                f"path={self.environment_capture.output_dir}",
+                flush=True,
+            )
+
+    def close_environment_capture(self, *, status="stopped"):
+        if self.environment_capture is not None:
+            self.environment_capture.close(status=status)
 
     def attach_replay_buffer(self, replay_buffer):
         """Attach Phase 5 storage without enabling any learner or updates."""
@@ -940,6 +984,9 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
                 torch.from_numpy(frame.center_local),
                 torch.from_numpy(frame.incoming_local),
                 torch.from_numpy(frame.outgoing_local),
+                torch.from_numpy(frame.center_rail_index),
+                torch.from_numpy(frame.incoming_rail_indices),
+                torch.from_numpy(frame.outgoing_rail_indices),
                 torch.from_numpy(frame.incoming_relation),
                 torch.from_numpy(frame.outgoing_relation),
                 torch.from_numpy(frame.global_state),
@@ -953,6 +1000,9 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
                 "center_local",
                 "incoming_local",
                 "outgoing_local",
+                "center_rail_index",
+                "incoming_rail_indices",
+                "outgoing_rail_indices",
                 "incoming_relation",
                 "outgoing_relation",
             )
@@ -1187,8 +1237,7 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
         t0 = time.perf_counter()
         observation = self.observation_builder.build(
             pclient,
-            parameter_dw=self.parameterDw,
-            parameter_c=self.parameterC,
+            next_10_route_oht_count=self.parameterC,
             previous_applied_action=(
                 np.zeros(
                     (len(self.topology.controlled_rail_ids), 1),
@@ -1290,9 +1339,13 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
         raw_exploration_noise = np.zeros_like(deterministic_policy)
         preclip_action = deterministic_policy.copy()
         exploration_noise_std = (
-            0.0
-            if burnin_active or self._resume_deterministic_episode_active
-            else self._exploration_noise_std()
+            self._exploration_noise_std()
+            if (
+                self.config.mode == "training"
+                and not burnin_active
+                and not self._resume_deterministic_episode_active
+            )
+            else 0.0
         )
         should_apply = (
             self.config.action_enabled
@@ -1443,6 +1496,7 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
         self.episode_steps += 1
         self.last_diagnostics = {
             **action_result.diagnostics,
+            **self.observation_builder.diagnostics(),
             **timing,
             "action/finite_ratio": float(
                 np.isfinite(controlled_action).mean()

@@ -10,15 +10,13 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from oht_routing.version import CONTEXTUAL_VERSION
+from oht_routing.version import (
+    CONTEXTUAL_VERSION,
+    is_compatible_contextual_version,
+)
 
 
-PROMOTED_CHECKPOINTS = {
-    # checkpoints/ctx_td7_reward_n_detep1_b2048/periodic/step_400000.pt
-    "7c2d6a19184060584efeb69f52be57c3e7fffad33da52c8c1c879ed39db8bc2b": (
-        "contextual_td7_checkpoint_v7_locked_reward_profile"
-    ),
-}
+PROMOTED_CHECKPOINTS: dict[str, str] = {}
 CRITIC_INITIALIZATION = "independent"
 
 
@@ -40,33 +38,36 @@ def _resolve_checkpoint_version(
     *,
     announce_promotion: bool = False,
 ) -> str:
-    """Return the unified version, allowing one fingerprinted promotion."""
+    """Return the compatible v3 version; v2 observation artifacts are rejected."""
     saved_version = payload.get("version")
-    if saved_version == CONTEXTUAL_VERSION:
+    if is_compatible_contextual_version(saved_version):
         return CONTEXTUAL_VERSION
 
-    target = Path(path)
     legacy_version = payload.get("checkpoint_version")
-    fingerprint = _checkpoint_sha256(target)
-    promoted_legacy_version = PROMOTED_CHECKPOINTS.get(fingerprint)
-    if (
-        promoted_legacy_version is not None
-        and promoted_legacy_version == legacy_version
-    ):
-        if announce_promotion:
-            print(
-                "[checkpoint-compat] promoted checkpoint artifact: "
-                f"{legacy_version} -> {CONTEXTUAL_VERSION}, "
-                f"sha256={fingerprint}",
-                flush=True,
-            )
-        return CONTEXTUAL_VERSION
+    if PROMOTED_CHECKPOINTS:
+        target = Path(path)
+        fingerprint = _checkpoint_sha256(target)
+        promoted_legacy_version = PROMOTED_CHECKPOINTS.get(fingerprint)
+        if (
+            promoted_legacy_version is not None
+            and promoted_legacy_version == legacy_version
+        ):
+            if announce_promotion:
+                print(
+                    "[checkpoint-compat] promoted checkpoint artifact: "
+                    f"{legacy_version} -> {CONTEXTUAL_VERSION}, "
+                    f"sha256={fingerprint}",
+                    flush=True,
+                )
+            return CONTEXTUAL_VERSION
 
     raise ContextualCheckpointError(
         "checkpoint version mismatch: "
         f"saved={saved_version or legacy_version!r}, "
-        f"runtime={CONTEXTUAL_VERSION!r}. Only the explicitly fingerprinted "
-        "step_400000.pt legacy artifact is promoted."
+        f"runtime={CONTEXTUAL_VERSION!r}. A checkpoint must use the current "
+        "major version without being newer than the runtime. The former v2 "
+        "step_400000.pt promotion is intentionally incompatible with the v3 "
+        "observation and network contract."
     )
 
 
@@ -74,8 +75,8 @@ def read_contextual_runtime_config(path) -> tuple[dict, bool]:
     """Read saved runtime settings before constructing the runtime.
 
     Current checkpoints contain the complete ContextualRuntimeConfig.
-    The one explicitly promoted legacy artifact also contains this complete
-    runtime configuration.
+    Older-major artifacts are rejected before their runtime configuration is
+    applied.
     """
     target = Path(path)
     payload = torch.load(target, map_location="cpu", weights_only=False)

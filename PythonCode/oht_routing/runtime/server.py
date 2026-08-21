@@ -85,15 +85,19 @@ def serve_contextual(args, client):
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind((HOST, port))
     server.listen(1)
+    capture_status = "stopped"
     try:
         _accept_sessions(server, port, args, client)
     except ContextualTrainingFailure as error:
+        capture_status = "failed"
         client.wandb_logger.finish_failed(error, client.failure_env_step)
         raise
     except KeyboardInterrupt:
+        capture_status = "interrupted"
         client.wandb_logger.finish_interrupted()
         raise
     finally:
+        client.close_environment_capture(status=capture_status)
         if not client.training_failed:
             client.wandb_logger.finish_success()
         server.close()

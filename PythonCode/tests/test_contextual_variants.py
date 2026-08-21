@@ -6,6 +6,10 @@ import torch
 
 from oht_dispatching.config import DISPATCH_COST, DISPATCH_FIRST_MATCH
 from oht_routing.runtime.client import ContextualRuntimeConfig
+from oht_routing.runtime.config import (
+    RESUME_LAUNCH_CONTROL_FIELDS,
+    restore_checkpoint_runtime_config,
+)
 from oht_routing.runtime.config_validation import make_reward_config
 from oht_routing.mdp.reward.config import (
     RAIL_REWARD_FREE_FLOW_NEUTRAL_2,
@@ -73,11 +77,37 @@ class ContextualVariantTests(unittest.TestCase):
         self.assertEqual(parsed.curriculum_scale_start, 1.0)
         self.assertEqual(parsed.curriculum_scale_end, 1.0)
         self.assertEqual(parsed.replay_capacity_env_steps, 100_000)
+        self.assertIn("replay_capacity_env_steps", RESUME_LAUNCH_CONTROL_FIELDS)
+        self.assertIn("lap_enabled", RESUME_LAUNCH_CONTROL_FIELDS)
         self.assertEqual(parsed.batch_size, 1_024)
         self.assertEqual(parsed.warmup_steps, 10_000)
         self.assertTrue(parsed.terminate_on_warmup_complete)
         self.assertIsNone(parsed.load_state_normalizer)
         self.assertIsNone(parsed.save_state_normalizer)
+
+        self.assertFalse(parsed.wandb)
+        self.assertTrue(self.parse("--mode", "training").wandb)
+        self.assertTrue(self.parse("--mode", "actor_inference").wandb)
+        self.assertFalse(
+            self.parse("--mode", "actor_inference", "--no-wandb").wandb
+        )
+        self.assertTrue(self.parse("--wandb").wandb)
+        self.assertTrue(
+            self.parse(
+                "--mode", "actor_inference", "--save_data"
+            ).save_data_enabled
+        )
+        self.assertTrue(
+            self.parse(
+                "--mode", "actor_inference", "--save-data"
+            ).save_data_enabled
+        )
+        with self.assertRaisesRegex(ValueError, "only supported in actor_inference"):
+            ContextualRuntimeConfig(
+                mode="training",
+                action_enabled=True,
+                save_data_enabled=True,
+            )
 
         no_boundary = self.parse("--no-terminate-on-warmup-complete")
         self.assertFalse(no_boundary.terminate_on_warmup_complete)
@@ -109,6 +139,28 @@ class ContextualVariantTests(unittest.TestCase):
         )
         self.assertEqual(config.effective_warmup_steps, 0)
         self.assertTrue(config.state_normalizer_warmup_bypass)
+
+    @patch("oht_routing.runtime.config.read_contextual_runtime_config")
+    def test_resume_keeps_current_lap_and_capacity_controls(self, read_config):
+        read_config.return_value = (
+            {
+                "lap_enabled": True,
+                "replay_capacity_env_steps": 10_000,
+                "warmup_steps": 321,
+            },
+            True,
+        )
+        restored = restore_checkpoint_runtime_config(
+            {
+                "lap_enabled": False,
+                "replay_capacity_env_steps": 100_000,
+                "warmup_steps": 10_000,
+            },
+            "checkpoint.pt",
+        )
+        self.assertFalse(restored["lap_enabled"])
+        self.assertEqual(restored["replay_capacity_env_steps"], 100_000)
+        self.assertEqual(restored["warmup_steps"], 321)
 
     def test_cli_diagnostics_are_opt_in(self):
         parsed = self.parse()

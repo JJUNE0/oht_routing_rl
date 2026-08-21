@@ -18,7 +18,13 @@ from oht_routing.algorithms.rl.contextual_td7 import (
 from oht_routing.algorithms.rl.contextual_td7.learner_types import (
     ContextualLearnerUpdate,
 )
+from oht_routing.algorithms.rl.contextual_td7.replay_buffer import (
+    ACTION_FIXED_POINT_MAX_ABS_ERROR,
+    ACTION_FIXED_POINT_SCALE,
+)
 from oht_routing.mdp.observation import (
+    GLOBAL_DIM,
+    LOCAL_PHYSICAL_DIM,
     ContextualObservationBatch,
     RunningFeatureNormalizer,
 )
@@ -27,8 +33,12 @@ from test_contextual_observation import (
     PHYSICAL_COUNT,
     make_topology,
 )
+from test_contextual_replay import make_physical_local_state
 from test_contextual_runtime import make_runtime_pclient
 from oht_routing.utils.wandb_logging import (
+    ACTOR_INFERENCE_EXCLUDED_WANDB_KEYS,
+    ACTOR_INFERENCE_EXCLUDED_WANDB_PREFIXES,
+    ACTOR_INFERENCE_WANDB_METRIC_KEYS,
     WANDB_METRIC_KEYS,
     ContextualWandbLogger,
     runtime_exp_meta,
@@ -45,22 +55,44 @@ class TrainingObservationBuilder:
         self.env_steps = 0
         self.load_calls = []
         self.save_calls = []
-        self.local_normalizer = RunningFeatureNormalizer(8)
-        self.global_normalizer = RunningFeatureNormalizer(6)
+        self.local_normalizer = RunningFeatureNormalizer(LOCAL_PHYSICAL_DIM)
+        self.global_normalizer = RunningFeatureNormalizer(GLOBAL_DIM)
+        self.neighbor_count = topology.incoming_neighbor_ids.shape[1]
+        physical_rows = np.arange(
+            len(topology.all_rail_ids), dtype=np.int64
+        )
+        self.physical_distance_mm = np.ascontiguousarray(
+            1_000.0 * (1.0 + physical_rows % 4), dtype=np.float64
+        )
+        physical_by_id = {
+            int(rail_id): row
+            for row, rail_id in enumerate(topology.all_rail_ids)
+        }
+        self.center_rail_index = np.ascontiguousarray(
+            topology.controlled_row_to_physical_index.copy()
+        )
+        self.incoming_rail_indices = np.ascontiguousarray(np.asarray([
+            [physical_by_id[int(rail_id)] for rail_id in row]
+            for row in topology.incoming_neighbor_ids
+        ], dtype=np.int64))
+        self.outgoing_rail_indices = np.ascontiguousarray(np.asarray([
+            [physical_by_id[int(rail_id)] for rail_id in row]
+            for row in topology.outgoing_neighbor_ids
+        ], dtype=np.int64))
         self._incoming_relation = np.zeros(
-            (CONTROLLED_COUNT, 10, 2), np.float32
+            (CONTROLLED_COUNT, self.neighbor_count, 2), np.float32
         )
         self._outgoing_relation = np.ones(
-            (CONTROLLED_COUNT, 10, 2), np.float32
+            (CONTROLLED_COUNT, self.neighbor_count, 2), np.float32
         )
 
     def build(
-        self, pclient, *, parameter_dw, parameter_c,
+        self, pclient, *, next_10_route_oht_count,
         previous_applied_action=None,
     ):
         step = self.calls
-        physical = np.full((PHYSICAL_COUNT, 8), step, np.float32)
-        global_raw = np.full(6, step, np.float32)
+        physical = make_physical_local_state(self.topology, step)
+        global_raw = np.full(GLOBAL_DIM, step, np.float32)
         if not self.local_normalizer.frozen:
             self.local_normalizer.update(physical)
             self.global_normalizer.update(global_raw)
@@ -69,14 +101,33 @@ class TrainingObservationBuilder:
         if self.calls >= self.freeze_steps:
             self.local_normalizer.freeze()
             self.global_normalizer.freeze()
-        zeros = np.zeros((CONTROLLED_COUNT, 8), np.float32)
+        zeros = np.zeros(
+            (CONTROLLED_COUNT, LOCAL_PHYSICAL_DIM), np.float32
+        )
         return ContextualObservationBatch(
             center_local=zeros,
-            incoming_local=np.zeros((CONTROLLED_COUNT, 10, 8), np.float32),
-            outgoing_local=np.zeros((CONTROLLED_COUNT, 10, 8), np.float32),
+            incoming_local=np.zeros(
+                (
+                    CONTROLLED_COUNT,
+                    self.neighbor_count,
+                    LOCAL_PHYSICAL_DIM,
+                ),
+                np.float32,
+            ),
+            outgoing_local=np.zeros(
+                (
+                    CONTROLLED_COUNT,
+                    self.neighbor_count,
+                    LOCAL_PHYSICAL_DIM,
+                ),
+                np.float32,
+            ),
+            center_rail_index=self.center_rail_index,
+            incoming_rail_indices=self.incoming_rail_indices,
+            outgoing_rail_indices=self.outgoing_rail_indices,
             incoming_relation=self._incoming_relation,
             outgoing_relation=self._outgoing_relation,
-            global_state=np.zeros(6, np.float32),
+            global_state=np.zeros(GLOBAL_DIM, np.float32),
             previous_applied_action=np.ascontiguousarray(
                 np.zeros((CONTROLLED_COUNT, 1), np.float32)
                 if previous_applied_action is None
@@ -92,8 +143,12 @@ class TrainingObservationBuilder:
     def load_normalizers(self, path, *, require_frozen=False):
         self.load_calls.append((str(path), bool(require_frozen)))
         if self.local_normalizer.count == 0:
-            self.local_normalizer.update(np.zeros((1, 8), np.float32))
-            self.global_normalizer.update(np.zeros((1, 6), np.float32))
+            self.local_normalizer.update(
+                np.zeros((1, LOCAL_PHYSICAL_DIM), np.float32)
+            )
+            self.global_normalizer.update(
+                np.zeros((1, GLOBAL_DIM), np.float32)
+            )
         self.local_normalizer.freeze()
         self.global_normalizer.freeze()
         self.env_steps = 10_000
@@ -101,6 +156,12 @@ class TrainingObservationBuilder:
     def save_normalizers(self, path, *, require_frozen=False):
         self.save_calls.append((str(path), bool(require_frozen)))
         return Path(path)
+
+    def diagnostics(self):
+        return {}
+
+    def reset_episode(self):
+        pass
 
 
 class FakeLearner:
@@ -304,6 +365,94 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
         self.assertEqual(len(captured), 1)
         self.assertEqual(captured[0][0]["reward/total_mean"], 1.0)
         self.assertEqual(captured[0][1], 10)
+
+    def test_actor_inference_logs_evaluation_tick_without_noise(self):
+        runtime, pclient = training_runtime(
+            mode="actor_inference",
+            warmup_steps=0,
+            normalizer_freeze_steps=1,
+            wandb_log_interval=1,
+        )
+        runtime._actor_inference = lambda *args, **kwargs: (
+            np.full(CONTROLLED_COUNT, 0.25, np.float32),
+            {
+                "runtime/tensor_conversion_ms": 1.0,
+                "runtime/host_to_device_ms": 2.0,
+                "runtime/encoder_actor_ms": 3.0,
+                "runtime/device_to_host_ms": 4.0,
+            },
+        )
+        captured = []
+        runtime.wandb_logger.log = lambda diagnostics, step: captured.append(
+            (dict(diagnostics), step)
+        )
+
+        runtime.Algorithm(pclient)
+        runtime.Algorithm(pclient)
+        runtime.record_send_cost_ms(5.0)
+        runtime.log_wandb_tick()
+
+        self.assertEqual(len(captured), 1)
+        diagnostics, step = captured[0]
+        self.assertEqual(step, runtime.total_steps)
+        self.assertIn("env/tat", diagnostics)
+        self.assertIn("reward/total_mean", diagnostics)
+        self.assertIn("action/policy_mean", diagnostics)
+        self.assertIn("runtime/actor_inference_ms", diagnostics)
+        self.assertIn("runtime/send_cost_ms", diagnostics)
+        self.assertEqual(diagnostics["action/exploration_noise_std"], 0.0)
+
+    def test_actor_inference_wandb_payload_excludes_training_metrics(self):
+        config = ContextualRuntimeConfig(
+            mode="actor_inference",
+            action_enabled=True,
+            wandb_enabled=True,
+            device="cpu",
+        )
+        captured = {}
+
+        class Run:
+            def __init__(self):
+                self.summary = {}
+
+            def log(self, payload, step):
+                captured["payload"] = payload
+                captured["step"] = step
+
+            def finish(self):
+                pass
+
+        fake_wandb = SimpleNamespace(init=lambda **kwargs: Run())
+        with patch.dict("sys.modules", {"wandb": fake_wandb}):
+            logger = ContextualWandbLogger(config)
+        logger.log(
+            {
+                "env/tat": 123.0,
+                "reward/total_mean": -0.5,
+                "action/policy_mean": 0.25,
+                "runtime/actor_inference_ms": 3.0,
+                "critic/q1_mean": 1.0,
+                "learner/critic_loss": 2.0,
+                "replay/size_env_steps": 3.0,
+                "grad/critic_norm": 4.0,
+                "sale/loss": 5.0,
+                "numeric/learner_finite_ratio": 1.0,
+                "runtime/replay_sample_ms": 6.0,
+                "runtime/learner_update_ms": 7.0,
+            },
+            400_010,
+        )
+
+        self.assertEqual(
+            captured["payload"],
+            {
+                "env/tat": 123.0,
+                "reward/total_mean": -0.5,
+                "action/policy_mean": 0.25,
+                "runtime/actor_inference_ms": 3.0,
+            },
+        )
+        self.assertEqual(captured["step"], 400_010)
 
     def test_rich_compatibility_diagnostics_stay_out_of_compact_wandb(self):
         runtime, pclient = training_runtime(
@@ -540,9 +689,18 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
         )
         runtime.Algorithm(pclient)
         self.assertEqual(runtime.replay_buffer.push_count, 1)
-        np.testing.assert_array_equal(
-            runtime.replay_buffer._policy_action[0],
+        decoded_policy = (
+            runtime.replay_buffer._policy_action[0].astype(np.float32)
+            / np.float32(ACTION_FIXED_POINT_SCALE)
+        )
+        np.testing.assert_allclose(
+            decoded_policy,
             np.full(CONTROLLED_COUNT, 0.7, dtype=np.float32),
+            rtol=0,
+            atol=(
+                ACTION_FIXED_POINT_MAX_ABS_ERROR
+                + float(np.finfo(np.float32).eps)
+            ),
         )
 
     def test_episode_burnin_untrained_fallback_skips_actor(self):
@@ -890,14 +1048,29 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
             atol=1e-7,
         )
         runtime.Algorithm(pclient)
-        np.testing.assert_array_equal(
-            runtime.replay_buffer._policy_action[0], policy
+        decoded_policy = (
+            runtime.replay_buffer._policy_action[0].astype(np.float32)
+            / np.float32(ACTION_FIXED_POINT_SCALE)
+        )
+        decoded_applied = (
+            runtime.replay_buffer._applied_action[0].astype(np.float32)
+            / np.float32(ACTION_FIXED_POINT_SCALE)
+        )
+        tolerance = (
+            ACTION_FIXED_POINT_MAX_ABS_ERROR
+            + float(np.finfo(np.float32).eps)
         )
         np.testing.assert_allclose(
-            runtime.replay_buffer._applied_action[0],
+            decoded_policy,
+            policy,
+            rtol=0,
+            atol=tolerance,
+        )
+        np.testing.assert_allclose(
+            decoded_applied,
             0.05 * policy,
             rtol=0,
-            atol=1e-7,
+            atol=tolerance,
         )
 
     def test_exploration_reproducible_and_boundary_always_baseline(self):
@@ -1378,9 +1551,11 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
     def test_wandb_schema_matches_export_and_runtime_config(self):
         self.assertEqual(set(WANDB_METRIC_KEYS), set(EXPORT_COLUMNS) - {"_step"})
         expected = {
-            "env/step", "env/episode", "episode/step", "env/tat",
+            "env/step", "env/episode", "episode/step", "env/sim_time",
+            "env/tat",
             "env/operation_rate", "env/queued", "env/waiting",
-            "env/transferring", "oht/idle_count", "termination/done",
+            "env/transferring", "env/completed", "oht/idle_count",
+            "termination/done", "termination/by_queue",
             "termination/by_tat", "termination/by_warmup",
             "warmup/episode_boundary_sent", "env/termination_reason",
             "action/policy_mean", "action/policy_std",
@@ -1389,6 +1564,14 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
             "action/exploration_noise_std", "action/applied_mean",
             "action/applied_std", "curriculum/action_scale", "b_rl/mean",
             "b_rl/std", "cost/all_baseline_abs_error_max",
+            "observation/predicted_route10_pearson",
+            "observation/predicted_route10_mae",
+            "observation/predicted_route10_nonzero_agreement",
+            "observation/predicted_route10_both_nonzero",
+            "observation/predicted_route10_pearson_available",
+            "observation/predicted_route10_union_nonzero_pearson",
+            "observation/predicted_route10_union_nonzero_pearson_available",
+            "observation/predicted_route10_union_nonzero_ratio",
             "reward/total_mean", "reward/total_std",
             "reward/terminal_penalty",
             "reward/global/tat_component_raw",
@@ -1427,6 +1610,22 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
             "learner/updates", "replay/size_env_steps",
             "replay/reward_mean", "replay/reward_std",
             "numeric/learner_finite_ratio",
+            "runtime/state_collection_ms",
+            "runtime/observation_build_ms",
+            "runtime/tensor_conversion_ms",
+            "runtime/host_to_device_ms",
+            "runtime/encoder_actor_ms",
+            "runtime/actor_inference_ms",
+            "runtime/device_to_host_ms",
+            "runtime/cost_apply_ms",
+            "runtime/replay_push_ms",
+            "runtime/replay_sample_ms",
+            "runtime/learner_update_ms",
+            "runtime/checkpoint_ms",
+            "runtime/send_cost_ms",
+            "runtime/total_algorithm_ms",
+            "runtime/total_ms",
+            "runtime/data_capture_ms",
             "runtime/observation_build_calls_per_tick",
             "runtime/nonfinite_count", "sale/loss",
             "sale/prediction_error_mean", "sale/online_grad_norm",
@@ -1453,6 +1652,23 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
         self.assertFalse(any(
             key.startswith(removed_prefixes) for key in WANDB_METRIC_KEYS
         ))
+        self.assertTrue(set(ACTOR_INFERENCE_WANDB_METRIC_KEYS) < expected)
+        self.assertTrue(
+            {
+                key for key in expected
+                if key.startswith("observation/")
+            }
+            <= set(ACTOR_INFERENCE_WANDB_METRIC_KEYS)
+        )
+        self.assertFalse(any(
+            key.startswith(ACTOR_INFERENCE_EXCLUDED_WANDB_PREFIXES)
+            for key in ACTOR_INFERENCE_WANDB_METRIC_KEYS
+        ))
+        self.assertTrue(
+            ACTOR_INFERENCE_EXCLUDED_WANDB_KEYS.isdisjoint(
+                ACTOR_INFERENCE_WANDB_METRIC_KEYS
+            )
+        )
         config = ContextualRuntimeConfig(
             mode="training", action_enabled=True, action_scale=0.05,
             wandb_enabled=True, device="cpu",

@@ -11,7 +11,9 @@ from oht_routing.utils import check_rail_topology
 @dataclass
 class FakeRail:
     ID: int
+    Distance: float = 1_000.0
     DistancePerVelocity: float = 1.0
+    PortCount: int = 1
     DivergingLineIDList: list[int] = field(default_factory=list)
     LevelJoiningLineIDList: list[int] = field(default_factory=list)
 
@@ -31,7 +33,7 @@ def make_graph(successors):
     }
 
 def make_controlled_boundary_graph():
-    controlled = list(range(4000, 4012))
+    controlled = list(range(4000, 4016))
     successors = {
         3250: [3251],
         3251: [3252],
@@ -157,7 +159,7 @@ class CheckRailTopologyTests(unittest.TestCase):
             self.assertTrue(server.closed)
             self.assertEqual(audit["status"], "passed")
             self.assertEqual(audit["expected_rail_count"], len(graph))
-            self.assertEqual(audit["controlled_rail_count"], 12)
+            self.assertEqual(audit["controlled_rail_count"], 16)
             self.assertEqual(audit["boundary_rail_count"], 3)
             self.assertTrue(cache_path.is_file())
 

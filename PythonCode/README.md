@@ -12,6 +12,18 @@ python .\PythonCode\main.py `
   --resume-checkpoint ".\checkpoints\ctx_td7_reward_n_detep1_b2048\periodic\step_400000.pt"
 ```
 
+병목 분석용 원본 환경 snapshot도 함께 저장하려면 `--save_data`를 추가합니다.
+actor 평가 시작 후 첫 2,000 tick의 모든 rail/OHT/active job과 action/cost를
+`results/environment_capture/` 아래의 압축 JSONL로 저장합니다.
+
+```powershell
+python .\PythonCode\main.py `
+  --mode actor_inference `
+  --action-enabled `
+  --save_data `
+  --resume-checkpoint ".\checkpoints\ctx_td7_reward_n_detep1_b2048\periodic\step_400000.pt"
+```
+
 The checkpoint is loaded after simulator topology initialization. Confirm the
 `[checkpoint-loaded]` block reports the expected environment step, action
 scale, and restored normalizers before using evaluation results.
@@ -128,14 +140,35 @@ python .\PythonCode\main.py `
 불러오면 effective warm-up은 0이 됩니다. actor, critic, replay, reward
 상태는 복원하지 않습니다.
 
+## Replay 메모리
+
+기본 replay capacity는 100,000 environment step입니다. v3.1은 매 state의
+정적 rail feature를 한 번만 저장하고, protocol 범위가 보장되는 local count를
+`uint8`/`uint16`으로 lossless packing합니다. density는 정적 rail 거리와 상태별
+OHT count에서 복원합니다. policy/applied/previous action은 Q15 `int16`으로
+저장하며 최대 절대 복원 오차는 약 `1.53e-5`입니다. reward는 `float32`, LAP
+priority는 `float16`을 사용합니다.
+
+4,999 physical rail, 4,996 controlled rail 기준 100,000-step numeric replay
+예상치는 LAP 활성 약 18.64 GiB, `--no-lap` 약 17.71 GiB입니다. 시작 요약의
+`estimated full replay RAM`과 W&B `replay/storage_bytes`에서 실제 설정 기준
+값을 확인할 수 있습니다.
+
+LAP은 기본 활성입니다. 균등 rail sampling으로 학습하려면 `--no-lap`을
+명시합니다. resume에서도 현재 CLI의 LAP 설정을 유지하며, 체크포인트가 다른
+LAP 사용 계약으로 저장됐다면 호환성 검사에서 명시적으로 거부합니다.
+
 ## Checkpoint와 resume
 
-통합 runtime/checkpoint 버전은 `v2.0.0`입니다. checkpoint 로드는
+통합 runtime/checkpoint 버전은 `v3.1.0`입니다. 같은 major의 이전
+버전 artifact만 현재 runtime보다 새 버전이 아닌 경우 호환될 수 있습니다.
+checkpoint 로드는
 통합 버전, topology/mapping hash, network config, action mode,
 SALE/LAP 사용 여부, Reward N만 호환성으로 검사합니다. replay payload는
 저장하지 않으므로 training resume 후에는 replay를 다시 채워야 합니다.
-기존 `step_400000.pt`는 정확한 SHA-256 fingerprint으로만
-`v2.0.0`으로 예외 승격됩니다.
+v3는 observation과 network 입력 계약이 바뀐 breaking version입니다.
+기존 v2 artifact와 `step_400000.pt`, v2 normalizer 및 10-neighbor topology
+cache는 예외 승격 없이 거부됩니다.
 
 ```powershell
 python .\PythonCode\main.py `

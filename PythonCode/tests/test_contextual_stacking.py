@@ -16,6 +16,9 @@ from oht_routing.algorithms.rl.contextual_td7 import (
     ContextualTwinCritic,
     interleave_state_action,
 )
+from oht_routing.algorithms.rl.contextual_td7.replay_buffer import (
+    ACTION_FIXED_POINT_MAX_ABS_ERROR,
+)
 from test_contextual_learner import SMALL_NETWORK
 from test_contextual_observation import CONTROLLED_COUNT, make_topology
 from test_contextual_replay import (
@@ -36,14 +39,18 @@ def stacked_replay(*, capacity=12, count=12, stacks=3, interval=2):
         stack_interval=interval,
     )
     rows = np.arange(CONTROLLED_COUNT, dtype=np.float32)
+    row_fraction = (rows + 1.0) / CONTROLLED_COUNT
+
+    def applied_at(step):
+        return -0.75 + 0.08 * float(step) + 0.02 * row_fraction
+
     for step in range(count):
         snapshot = make_snapshot(topology, step)
-        policy = (step + 0.02 * (rows + 1))[:, None]
-        applied = (step + 0.01 * (rows + 1))[:, None]
-        previous_applied = (
-            applied if step == 0
-            else (step - 1 + 0.01 * (rows + 1))[:, None]
-        )
+        policy = (
+            -0.65 + 0.07 * float(step) + 0.03 * row_fraction
+        )[:, None]
+        applied = applied_at(step)[:, None]
+        previous_applied = applied_at(max(step - 1, 0))[:, None]
         replay.push(replace(
             snapshot,
             previous_applied_action=previous_applied,
@@ -92,9 +99,16 @@ class ContextualStackingTests(unittest.TestCase):
     def test_replay_materializes_current_next_and_action_history(self):
         replay = stacked_replay()
         batch = replay.sample(128)
-        self.assertEqual(batch.center_local.shape, (128, 3, 8))
-        self.assertEqual(batch.incoming_local.shape, (128, 3, 10, 8))
-        self.assertEqual(batch.global_state.shape, (128, 3, 6))
+        self.assertEqual(batch.center_local.shape, (128, 3, 16))
+        self.assertEqual(batch.incoming_local.shape, (128, 3, 15, 16))
+        self.assertEqual(batch.outgoing_local.shape, (128, 3, 15, 16))
+        self.assertEqual(batch.center_rail_index.shape, (128, 3))
+        self.assertEqual(batch.incoming_rail_indices.shape, (128, 3, 15))
+        self.assertEqual(batch.outgoing_rail_indices.shape, (128, 3, 15))
+        self.assertEqual(batch.global_state.shape, (128, 3, 17))
+        self.assertEqual(batch.center_rail_index.dtype, torch.long)
+        self.assertEqual(batch.incoming_rail_indices.dtype, torch.long)
+        self.assertEqual(batch.outgoing_rail_indices.dtype, torch.long)
         self.assertEqual(
             batch.previous_applied_action.shape, (128, 3, 1)
         )
@@ -120,57 +134,87 @@ class ContextualStackingTests(unittest.TestCase):
             step = int(batch.env_step[index])
             row = key.controlled_row
             physical_row = int(replay._center_rows[row])
+            np.testing.assert_array_equal(
+                batch.center_rail_index[index].numpy(),
+                np.full(3, physical_row, dtype=np.int64),
+            )
+            np.testing.assert_array_equal(
+                batch.incoming_rail_indices[index].numpy(),
+                np.broadcast_to(replay._incoming_rows[row], (3, 15)),
+            )
+            np.testing.assert_array_equal(
+                batch.outgoing_rail_indices[index].numpy(),
+                np.broadcast_to(replay._outgoing_rows[row], (3, 15)),
+            )
             base = float(replay.topology.all_rail_ids[physical_row])
             expected_state_steps = [max(step - offset, 0) for offset in (0, 2, 4)]
             expected_next_steps = [
                 max(step + 1 - offset, 0) for offset in (0, 2, 4)
             ]
             np.testing.assert_allclose(
-                batch.center_local[index, :, 0].numpy(),
-                base + np.asarray(expected_state_steps),
+                batch.center_local[index, :, 6].numpy(),
+                7.0 * base + np.asarray(expected_state_steps),
             )
             np.testing.assert_allclose(
-                batch.next_center_local[index, :, 0].numpy(),
-                base + np.asarray(expected_next_steps),
+                batch.next_center_local[index, :, 6].numpy(),
+                7.0 * base + np.asarray(expected_next_steps),
             )
-            row_term = 0.01 * (row + 1)
+            row_fraction = (row + 1) / CONTROLLED_COUNT
+
+            def expected_applied(action_step):
+                return (
+                    -0.75
+                    + 0.08 * float(action_step)
+                    + 0.02 * row_fraction
+                )
+
             expected_actions = [
-                max(step - offset, 0) + row_term
+                expected_applied(max(step - offset, 0))
                 for offset in (0, 2, 4)
             ]
             expected_next_actions = [
                 0.0,
-                max(step - 1, 0) + row_term,
-                max(step - 3, 0) + row_term,
+                expected_applied(max(step - 1, 0)),
+                expected_applied(max(step - 3, 0)),
             ]
+            action_tolerance = (
+                ACTION_FIXED_POINT_MAX_ABS_ERROR
+                + float(np.finfo(np.float32).eps)
+            )
             np.testing.assert_allclose(
                 batch.applied_action[index, :, 0].numpy(),
                 expected_actions,
                 rtol=0,
-                atol=5e-6,
+                atol=action_tolerance,
             )
             expected_previous_actions = [
-                max(step - offset - 1, 0) + row_term
+                expected_applied(max(step - offset - 1, 0))
                 for offset in (0, 2, 4)
             ]
             np.testing.assert_allclose(
                 batch.previous_applied_action[index, :, 0].numpy(),
                 expected_previous_actions,
                 rtol=0,
-                atol=5e-6,
+                atol=action_tolerance,
             )
             np.testing.assert_allclose(
                 batch.next_previous_applied_action[index, :, 0].numpy(),
                 expected_actions,
                 rtol=0,
-                atol=5e-6,
+                atol=action_tolerance,
             )
             np.testing.assert_allclose(
                 batch.next_applied_action[index, :, 0].numpy(),
                 expected_next_actions,
                 rtol=0,
-                atol=5e-6,
+                atol=action_tolerance,
             )
+        torch.testing.assert_close(
+            batch.next_previous_applied_action,
+            batch.applied_action,
+            rtol=0,
+            atol=0,
+        )
 
     def test_ring_overwrite_excludes_transitions_with_missing_history(self):
         replay = stacked_replay(

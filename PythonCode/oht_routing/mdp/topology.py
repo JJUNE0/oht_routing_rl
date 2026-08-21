@@ -23,8 +23,8 @@ from typing import Dict, Iterable, Mapping, Sequence
 import numpy as np
 
 
-TOPOLOGY_VERSION = "directed_10in_10out_controlled_centers_v2"
-DEFAULT_NEIGHBOR_COUNT = 10
+TOPOLOGY_VERSION = "directed_15in_15out_controlled_centers_v3"
+DEFAULT_NEIGHBOR_COUNT = 15
 DEFAULT_EXPECTED_BOUNDARY_RAIL_IDS = frozenset({3250, 3251, 3252})
 BOUNDARY_POLICY = "baseline_cost_no_action_reward_replay_loss"
 
@@ -166,6 +166,7 @@ def _extract_live_graph(
     Dict[int, tuple[int, ...]],
     Dict[int, tuple[int, ...]],
     Dict[int, float],
+    Dict[int, tuple[float, int]],
 ]:
     if not rail_lines:
         raise TopologyAuditError("RAILLINE_DIC is empty; topology audit cannot run")
@@ -177,6 +178,7 @@ def _extract_live_graph(
 
     successors: Dict[int, tuple[int, ...]] = {}
     travel_time: Dict[int, float] = {}
+    physical_static: Dict[int, tuple[float, int]] = {}
     for rail_id in rail_ids:
         rail = rail_lines[rail_id]
         object_id = int(getattr(rail, "ID", rail_id))
@@ -191,6 +193,22 @@ def _extract_live_graph(
                 f"invalid DistancePerVelocity: rail={rail_id}, value={value}"
             )
         travel_time[rail_id] = value
+
+        distance_mm = float(getattr(rail, "Distance"))
+        if not math.isfinite(distance_mm) or distance_mm <= 0.0:
+            raise TopologyAuditError(
+                f"invalid Distance: rail={rail_id}, value={distance_mm}"
+            )
+        port_count_value = float(getattr(rail, "PortCount"))
+        if (
+            not math.isfinite(port_count_value)
+            or port_count_value < 0.0
+            or not port_count_value.is_integer()
+        ):
+            raise TopologyAuditError(
+                f"invalid PortCount: rail={rail_id}, value={port_count_value}"
+            )
+        physical_static[rail_id] = (distance_mm, int(port_count_value))
 
         outgoing = _as_unique_int_tuple(
             getattr(rail, "DivergingLineIDList"),
@@ -242,7 +260,7 @@ def _extract_live_graph(
                 f"mismatch_count={len(mismatches)}, first={preview}"
             )
 
-    return rail_ids, successors, predecessors, travel_time
+    return rail_ids, successors, predecessors, travel_time, physical_static
 
 
 def rank_directional_neighbors(
@@ -344,7 +362,13 @@ def build_contextual_topology(
                 f"{DEFAULT_NEIGHBOR_COUNT} neighbors per direction: requested={count}"
             )
 
-        all_rail_ids, successors, predecessors, travel_time = _extract_live_graph(
+        (
+            all_rail_ids,
+            successors,
+            predecessors,
+            travel_time,
+            physical_static,
+        ) = _extract_live_graph(
             rail_lines,
             validate_declared_predecessors=validate_declared_predecessors,
         )
@@ -485,6 +509,8 @@ def build_contextual_topology(
             {
                 "rail_id": rail_id,
                 "distance_per_velocity": travel_time[rail_id],
+                "distance_mm": physical_static[rail_id][0],
+                "port_count": physical_static[rail_id][1],
                 "successors": list(successors[rail_id]),
                 "predecessors": list(predecessors[rail_id]),
             }
@@ -572,6 +598,12 @@ def build_contextual_topology(
             "selected_outgoing_hop_histogram": _hop_histogram(outgoing_hops),
             "selected_incoming_travel_time": _distribution(incoming_times.reshape(-1)),
             "selected_outgoing_travel_time": _distribution(outgoing_times.reshape(-1)),
+            "physical_distance_mm": _distribution(
+                [physical_static[rail_id][0] for rail_id in all_rail_ids]
+            ),
+            "port_count": _distribution(
+                [physical_static[rail_id][1] for rail_id in all_rail_ids]
+            ),
             "topology_hash": topology_hash,
             "mapping_hash": mapping_hash,
             "declared_predecessors_validated": bool(validate_declared_predecessors),
@@ -633,7 +665,13 @@ def load_cached_contextual_topology(
     rail data and refuses any cache whose version, policy, IDs, mapping payload,
     or topology hash differs.
     """
-    all_rail_ids, successors, predecessors, travel_time = _extract_live_graph(
+    (
+        all_rail_ids,
+        successors,
+        predecessors,
+        travel_time,
+        physical_static,
+    ) = _extract_live_graph(
         rail_lines,
         validate_declared_predecessors=validate_declared_predecessors,
     )
@@ -651,6 +689,8 @@ def load_cached_contextual_topology(
         {
             "rail_id": rail_id,
             "distance_per_velocity": travel_time[rail_id],
+            "distance_mm": physical_static[rail_id][0],
+            "port_count": physical_static[rail_id][1],
             "successors": list(successors[rail_id]),
             "predecessors": list(predecessors[rail_id]),
         }

@@ -26,6 +26,7 @@ def send_active_data(pclient, client, log_interval=100):
     started = time.perf_counter()
     pclient.SendRailLineCostMessage()
     client.record_send_cost_ms((time.perf_counter() - started) * 1000.0)
+    client.capture_environment_tick(pclient)
     client.log_wandb_tick()
     client.AlgorithmAfter(pclient)
     diagnostics = client.last_diagnostics

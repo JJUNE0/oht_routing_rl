@@ -1,7 +1,7 @@
 """One-shot live topology audit for contextual per-rail TD7.
 
 Start this script first, then start the simulator. It receives only the
-simulator initialization payload, writes the fixed 10-in/10-out mapping audit
+simulator initialization payload, writes the fixed 15-in/15-out mapping audit
 and cache, and exits without creating a learning algorithm.
 """
 

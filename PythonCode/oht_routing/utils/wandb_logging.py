@@ -1,4 +1,4 @@
-"""Training-only W&B schema and lightweight logger."""
+"""Mode-aware W&B schemas and lightweight contextual runtime logger."""
 
 from __future__ import annotations
 
@@ -23,8 +23,12 @@ EXP_META = {
     "version": CONTEXTUAL_VERSION,
     "cost_structure": "b_rl",
     "action_range": "b_rl_0.0-1.0_resume_curriculum_0.05-1",
-    "topology": "directed_10in_10out_controlled_centers_v2",
-    "observation": "contextual_obs_previous_applied_action_v3",
+    "topology": "directed_15in_15out_controlled_centers_v3",
+    "observation": "physical16_embedding8_global17_v3",
+    "local_physical_dim": 16,
+    "rail_embedding_dim": 8,
+    "global_dim": 17,
+    "neighbor_count_per_direction": 15,
     "previous_action_input": (
         "actor_and_critic_previous_applied_action_separate_from_encoder"
     ),
@@ -78,7 +82,9 @@ EXP_META = {
     ),
     "centering": False,
     "replay_capacity_env_steps": 100_000,
-    "batch_size": 2_048,
+    "replay_storage": "packed_local_u8_u16_action_q15_lap_fp16_v1",
+    "replay_action_quantization_max_abs_error": 1.0 / (2.0 * 32_767.0),
+    "batch_size": 1_024,
     "seed": 0,
     "tat_early_termination": True,
     "tat_termination_policy": "reward_profile",
@@ -88,12 +94,12 @@ EXP_META = {
     "early_stop_tat_threshold": 200.0,
     "tat_above_threshold_patience": 300,
     "terminal_tat_penalty": -20.0,
-    "note": "n_only_v2",
+    "note": "replay_pack",
     "description": (
-        "Contextual TD7 v2.0.0 executes the single locked Reward N formula. "
-        "Historical reward selectors, completion-event reward, marginal-TAT "
-        "reward, and reward normalizer state are removed. The fingerprinted "
-        "step_400000.pt artifact is promoted to v2.0.0 on load."
+        "Contextual TD7 v3.1.0 restores a 100,000 environment-step replay "
+        "capacity using feature-aware physical-state packing, Q15 action "
+        "storage, and float16 LAP priorities. The v3 observation, network, "
+        "checkpoint, and Reward N contracts are unchanged."
     ),
 }
 
@@ -422,13 +428,16 @@ WANDB_METRIC_KEYS = (
     "env/step",
     "env/episode",
     "episode/step",
+    "env/sim_time",
     "env/tat",
     "env/operation_rate",
     "env/queued",
     "env/waiting",
     "env/transferring",
+    "env/completed",
     "oht/idle_count",
     "termination/done",
+    "termination/by_queue",
     "termination/by_tat",
     "termination/by_warmup",
     "warmup/episode_boundary_sent",
@@ -446,6 +455,15 @@ WANDB_METRIC_KEYS = (
     "b_rl/mean",
     "b_rl/std",
     "cost/all_baseline_abs_error_max",
+    # Observation-contract diagnostics.
+    "observation/predicted_route10_pearson",
+    "observation/predicted_route10_mae",
+    "observation/predicted_route10_nonzero_agreement",
+    "observation/predicted_route10_both_nonzero",
+    "observation/predicted_route10_pearson_available",
+    "observation/predicted_route10_union_nonzero_pearson",
+    "observation/predicted_route10_union_nonzero_pearson_available",
+    "observation/predicted_route10_union_nonzero_ratio",
     # Locked Reward N components and contribution budget.
     "reward/total_mean",
     "reward/total_std",
@@ -508,7 +526,23 @@ WANDB_METRIC_KEYS = (
     "replay/reward_mean",
     "replay/reward_std",
     "numeric/learner_finite_ratio",
-    # Runtime safety checks.
+    # Runtime stages and safety checks.
+    "runtime/state_collection_ms",
+    "runtime/observation_build_ms",
+    "runtime/tensor_conversion_ms",
+    "runtime/host_to_device_ms",
+    "runtime/encoder_actor_ms",
+    "runtime/actor_inference_ms",
+    "runtime/device_to_host_ms",
+    "runtime/cost_apply_ms",
+    "runtime/replay_push_ms",
+    "runtime/replay_sample_ms",
+    "runtime/learner_update_ms",
+    "runtime/checkpoint_ms",
+    "runtime/send_cost_ms",
+    "runtime/total_algorithm_ms",
+    "runtime/total_ms",
+    "runtime/data_capture_ms",
     "runtime/observation_build_calls_per_tick",
     "runtime/nonfinite_count",
     # SALE essentials only.
@@ -550,6 +584,34 @@ if len(WANDB_METRIC_KEYS) != len(set(WANDB_METRIC_KEYS)):
     raise RuntimeError("compact W&B metric schema contains duplicate keys")
 if any(key.startswith(REMOVED_WANDB_PREFIXES) for key in WANDB_METRIC_KEYS):
     raise RuntimeError("removed metric group leaked into compact W&B schema")
+
+
+ACTOR_INFERENCE_EXCLUDED_WANDB_PREFIXES = (
+    "learner/",
+    "critic/",
+    "grad/",
+    "replay/",
+    "sale/",
+    "update/",
+    "numeric/learner",
+)
+ACTOR_INFERENCE_EXCLUDED_WANDB_KEYS = {
+    "runtime/replay_push_ms",
+    "runtime/replay_sample_ms",
+    "runtime/learner_update_ms",
+}
+ACTOR_INFERENCE_WANDB_METRIC_KEYS = tuple(
+    key
+    for key in WANDB_METRIC_KEYS
+    if not key.startswith(ACTOR_INFERENCE_EXCLUDED_WANDB_PREFIXES)
+    and key not in ACTOR_INFERENCE_EXCLUDED_WANDB_KEYS
+)
+
+
+def wandb_metric_keys_for_mode(mode: str) -> tuple[str, ...]:
+    if mode == "training":
+        return WANDB_METRIC_KEYS
+    return ACTOR_INFERENCE_WANDB_METRIC_KEYS
 
 
 def runtime_exp_meta(config) -> dict:
@@ -700,6 +762,11 @@ def runtime_exp_meta(config) -> dict:
     meta["replay_capacity_env_steps"] = int(
         config.replay_capacity_env_steps
     )
+    meta["replay_storage"] = (
+        "packed_local_u8_u16_action_q15_lap_fp16_v1"
+        if config.lap_enabled
+        else "packed_local_u8_u16_action_q15_no_lap_v1"
+    )
     if action_mode == REGION_B_RL:
         meta["cost_structure"] = "b_rl"
         meta["action_range"] = (
@@ -774,6 +841,7 @@ def runtime_exp_meta(config) -> dict:
 class ContextualWandbLogger:
     def __init__(self, config):
         self.enabled = bool(config.wandb_enabled)
+        self.metric_keys = wandb_metric_keys_for_mode(config.mode)
         self.run = None
         self._finished = False
         if not self.enabled:
@@ -809,7 +877,7 @@ class ContextualWandbLogger:
             return
         payload = {
             key: diagnostics[key]
-            for key in WANDB_METRIC_KEYS
+            for key in self.metric_keys
             if key in diagnostics
         }
         self.run.log(payload, step=int(step))

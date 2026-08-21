@@ -20,7 +20,11 @@ from oht_routing.runtime.client import (
 )
 from oht_dispatching.config import DISPATCH_COST
 from oht_routing.mdp.action import EXP_RESIDUAL
-from oht_routing.mdp.observation import ContextualObservationBatch
+from oht_routing.mdp.observation import (
+    GLOBAL_DIM,
+    LOCAL_PHYSICAL_DIM,
+    ContextualObservationBatch,
+)
 from test_contextual_observation import (
     CONTROLLED_COUNT,
     PHYSICAL_COUNT,
@@ -34,21 +38,43 @@ class CountingObservationBuilder:
     def __init__(self, topology):
         self.topology = topology
         self.calls = 0
+        neighbor_count = topology.incoming_neighbor_ids.shape[1]
+        physical_by_id = {
+            int(rail_id): row
+            for row, rail_id in enumerate(topology.all_rail_ids)
+        }
+        incoming_indices = np.asarray([
+            [physical_by_id[int(rail_id)] for rail_id in row]
+            for row in topology.incoming_neighbor_ids
+        ], dtype=np.int64)
+        outgoing_indices = np.asarray([
+            [physical_by_id[int(rail_id)] for rail_id in row]
+            for row in topology.outgoing_neighbor_ids
+        ], dtype=np.int64)
         self.batch = ContextualObservationBatch(
-            center_local=np.zeros((CONTROLLED_COUNT, 8), dtype=np.float32),
+            center_local=np.zeros(
+                (CONTROLLED_COUNT, LOCAL_PHYSICAL_DIM), dtype=np.float32
+            ),
             incoming_local=np.zeros(
-                (CONTROLLED_COUNT, 10, 8), dtype=np.float32
+                (CONTROLLED_COUNT, neighbor_count, LOCAL_PHYSICAL_DIM),
+                dtype=np.float32,
             ),
             outgoing_local=np.zeros(
-                (CONTROLLED_COUNT, 10, 8), dtype=np.float32
+                (CONTROLLED_COUNT, neighbor_count, LOCAL_PHYSICAL_DIM),
+                dtype=np.float32,
             ),
+            center_rail_index=np.ascontiguousarray(
+                topology.controlled_row_to_physical_index.copy()
+            ),
+            incoming_rail_indices=np.ascontiguousarray(incoming_indices),
+            outgoing_rail_indices=np.ascontiguousarray(outgoing_indices),
             incoming_relation=np.zeros(
-                (CONTROLLED_COUNT, 10, 2), dtype=np.float32
+                (CONTROLLED_COUNT, neighbor_count, 2), dtype=np.float32
             ),
             outgoing_relation=np.zeros(
-                (CONTROLLED_COUNT, 10, 2), dtype=np.float32
+                (CONTROLLED_COUNT, neighbor_count, 2), dtype=np.float32
             ),
-            global_state=np.zeros(6, dtype=np.float32),
+            global_state=np.zeros(GLOBAL_DIM, dtype=np.float32),
             previous_applied_action=np.zeros(
                 (CONTROLLED_COUNT, 1), dtype=np.float32
             ),
@@ -58,7 +84,7 @@ class CountingObservationBuilder:
         )
 
     def build(
-        self, pclient, *, parameter_dw, parameter_c,
+        self, pclient, *, next_10_route_oht_count,
         previous_applied_action=None,
     ):
         self.calls += 1
@@ -71,10 +97,19 @@ class CountingObservationBuilder:
             ),
         )
 
+    def diagnostics(self):
+        return {}
+
+    def reset_episode(self):
+        pass
+
 
 def make_runtime_pclient(reverse=False):
     rails = make_rails(reverse=reverse)
     pclient = FakePClient(rails)
+    # Most runtime fixtures represent protocol clients without a monotonic
+    # SimTime field. Stale-packet tests opt in explicitly.
+    del pclient.SimTime
     pclient.RAILINE_COUNT = PHYSICAL_COUNT
     pclient.RAILLINECOST_DIC = {
         rail_id: SimpleNamespace(ID=rail_id, FRailLineCost=0.0)
@@ -310,7 +345,7 @@ class ContextualRuntimeTests(unittest.TestCase):
             action, _ = runtime._actor_inference(
                 runtime.observation_builder.batch
             )
-        self.assertEqual(captured["global_shape"], (4996, 6))
+        self.assertEqual(captured["global_shape"], (4996, GLOBAL_DIM))
         self.assertEqual(action.shape, (4996,))
         self.assertTrue(np.isfinite(action).all())
 

@@ -87,6 +87,8 @@ def _validate_runtime_modes(config: ContextualRuntimeConfig) -> None:
         )
     if config.mode == "training" and not config.action_enabled:
         raise ValueError("training mode requires explicit action_enabled")
+    if config.save_data_enabled and config.mode != "actor_inference":
+        raise ValueError("save_data is only supported in actor_inference mode")
     for name in ("num_stacks", "stack_interval"):
         value = getattr(config, name)
         if isinstance(value, bool) or not isinstance(value, Integral):

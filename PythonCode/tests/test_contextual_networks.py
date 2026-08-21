@@ -17,18 +17,43 @@ from oht_routing.algorithms.rl.contextual_td7 import (
 
 
 def make_inputs(batch=4, *, requires_grad=False, scale=1.0, device="cpu"):
-    shapes = (
-        (batch, 8),
-        (batch, 10, 8),
-        (batch, 10, 8),
-        (batch, 10, 2),
-        (batch, 10, 2),
-        (batch, 6),
+    config = ContextualNetworkConfig()
+    float_shapes = (
+        (batch, config.local_physical_dim),
+        (batch, config.neighbor_count, config.local_physical_dim),
+        (batch, config.neighbor_count, config.local_physical_dim),
+        (batch, config.neighbor_count, config.relation_dim),
+        (batch, config.neighbor_count, config.relation_dim),
+        (batch, config.global_dim),
     )
-    return tuple(
+    floats = tuple(
         (torch.randn(shape, device=device) * scale).requires_grad_(requires_grad)
-        for shape in shapes
+        for shape in float_shapes
     )
+    center_index = torch.arange(batch, device=device, dtype=torch.long)
+    neighbor_offset = torch.arange(
+        1, config.neighbor_count + 1, device=device, dtype=torch.long
+    )
+    incoming_indices = (
+        center_index[:, None] + neighbor_offset[None]
+    ) % config.num_rails
+    outgoing_indices = (
+        center_index[:, None] + 2 * neighbor_offset[None]
+    ) % config.num_rails
+    return (
+        floats[0],
+        floats[1],
+        floats[2],
+        center_index,
+        incoming_indices,
+        outgoing_indices,
+        floats[3],
+        floats[4],
+        floats[5],
+    )
+
+
+FLOAT_INPUT_INDICES = (0, 1, 2, 6, 7, 8)
 
 
 class ContextualNetworkTests(unittest.TestCase):
@@ -98,10 +123,35 @@ class ContextualNetworkTests(unittest.TestCase):
         encoding = self.encoder(*inputs)
         loss = -self.actor(encoding.state).action.mean()
         loss.backward()
-        for value in inputs:
+        for index in FLOAT_INPUT_INDICES:
+            value = inputs[index]
             self.assertIsNotNone(value.grad)
             self.assertTrue(torch.isfinite(value.grad).all())
             self.assertGreater(float(value.grad.abs().sum()), 0.0)
+        embedding_grad = self.encoder.rail_embedding.weight.grad
+        self.assertIsNotNone(embedding_grad)
+        self.assertTrue(torch.isfinite(embedding_grad).all())
+        self.assertGreater(float(embedding_grad.abs().sum()), 0.0)
+
+    def test_rail_identity_changes_encoding_with_identical_physical_state(self):
+        inputs = list(make_inputs(3, scale=0.0))
+        first = self.encoder(*inputs).state
+        changed = list(inputs)
+        changed[3] = (changed[3] + 101) % self.config.num_rails
+        second = self.encoder(*changed).state
+        self.assertFalse(torch.allclose(first, second))
+
+    def test_rail_indices_require_long_dtype_and_valid_range(self):
+        wrong_dtype = list(make_inputs(2))
+        wrong_dtype[3] = wrong_dtype[3].to(torch.float32)
+        with self.assertRaisesRegex(TypeError, "torch.long"):
+            self.encoder(*wrong_dtype)
+
+        out_of_range = list(make_inputs(2))
+        out_of_range[4] = out_of_range[4].clone()
+        out_of_range[4][0, 0] = self.config.num_rails
+        with self.assertRaisesRegex(ValueError, "outside"):
+            self.encoder(*out_of_range)
 
     def test_all_parameter_gradients_are_finite(self):
         inputs = make_inputs(4)

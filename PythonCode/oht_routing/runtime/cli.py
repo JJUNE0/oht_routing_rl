@@ -138,7 +138,15 @@ def parse_args():
     )
     parser.add_argument("--device", default=None)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--replay-capacity-env-steps", type=int, default=100_000)
+    parser.add_argument(
+        "--replay-capacity-env-steps",
+        type=int,
+        default=100_000,
+        help=(
+            "Number of environment-step transitions retained by the packed "
+            "CPU replay (default: 100,000)."
+        ),
+    )
     replay_sampling = parser.add_mutually_exclusive_group()
     replay_sampling.add_argument(
         "--replay-buffer-rail",
@@ -180,7 +188,25 @@ def parse_args():
     )
     parser.add_argument("--updates-per-env-step", type=int, default=1)
     parser.add_argument("--learn-every-env-steps", type=int, default=1)
-    parser.add_argument("--wandb", action="store_true")
+    parser.add_argument(
+        "--wandb",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Enable W&B logging. By default it is enabled for training and "
+            "actor_inference, and disabled for baseline_only."
+        ),
+    )
+    parser.add_argument(
+        "--save_data",
+        "--save-data",
+        dest="save_data_enabled",
+        action="store_true",
+        help=(
+            "Save full rail, OHT, job, action, and environment snapshots for "
+            "the first 2,000 actor_inference ticks."
+        ),
+    )
     parser.add_argument(
         "--sale", action=argparse.BooleanOptionalAction, default=True
     )
@@ -239,4 +265,7 @@ def parse_args():
         default=45_000,
         help="Override PClient's simulator episode end time after every init/reset.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.wandb is None:
+        args.wandb = args.mode in {"training", "actor_inference"}
+    return args

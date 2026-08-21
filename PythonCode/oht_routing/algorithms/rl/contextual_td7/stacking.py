@@ -36,8 +36,8 @@ class EncodedObservationStack:
 
 
 def _canonical_observation_stack(observation: tuple[torch.Tensor, ...]):
-    if len(observation) != 6:
-        raise ValueError("contextual observation must contain six tensors")
+    if len(observation) != 9:
+        raise ValueError("contextual observation must contain nine tensors")
     center = observation[0]
     if center.ndim == 2:
         stacked = tuple(value.unsqueeze(1) for value in observation)

@@ -35,6 +35,9 @@ def _observation_args(batch, *, next_state=False):
         getattr(batch, f"{prefix}center_local"),
         getattr(batch, f"{prefix}incoming_local"),
         getattr(batch, f"{prefix}outgoing_local"),
+        batch.center_rail_index,
+        batch.incoming_rail_indices,
+        batch.outgoing_rail_indices,
         getattr(batch, f"{prefix}incoming_relation"),
         getattr(batch, f"{prefix}outgoing_relation"),
         getattr(batch, f"{prefix}global_state"),
@@ -125,6 +128,23 @@ class ContextualTD7Learner:
             raise ValueError(
                 "replay and network stack configurations must match"
             )
+        topology = getattr(replay, "topology", None)
+        if topology is not None:
+            physical_count = len(topology.all_rail_ids)
+            neighbor_count = int(topology.incoming_neighbor_ids.shape[1])
+            if self.network_config.num_rails != physical_count:
+                raise ValueError(
+                    "network num_rails must match replay physical topology: "
+                    f"network={self.network_config.num_rails}, "
+                    f"topology={physical_count}"
+                )
+            if (
+                self.network_config.neighbor_count != neighbor_count
+                or topology.outgoing_neighbor_ids.shape[1] != neighbor_count
+            ):
+                raise ValueError(
+                    "network neighbor_count must match replay topology"
+                )
         torch.manual_seed(int(seed))
         if self.device.type == "cuda":
             torch.cuda.manual_seed_all(int(seed))

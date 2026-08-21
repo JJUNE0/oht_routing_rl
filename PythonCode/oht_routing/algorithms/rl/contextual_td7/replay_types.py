@@ -41,6 +41,9 @@ class ContextualReplayBatch:
     center_local: torch.Tensor
     incoming_local: torch.Tensor
     outgoing_local: torch.Tensor
+    center_rail_index: torch.Tensor
+    incoming_rail_indices: torch.Tensor
+    outgoing_rail_indices: torch.Tensor
     incoming_relation: torch.Tensor
     outgoing_relation: torch.Tensor
     global_state: torch.Tensor

@@ -65,29 +65,47 @@ class ContextualLAPTests(unittest.TestCase):
     def test_cached_priority_statistics_match_storage_and_duplicates_use_last(self):
         replay = self.replay()
         replay.push(make_snapshot(replay.topology, 0))
+        self.assertEqual(replay._priority.dtype, np.float16)
+        self.assertEqual(replay._priority_min.dtype, np.float16)
+        self.assertEqual(replay._priority_max.dtype, np.float16)
+        self.assertEqual(replay._priority_sum.dtype, np.float64)
+        self.assertEqual(replay._priority_sq_sum.dtype, np.float64)
         generation = int(replay._transition_generation[0])
         key = ReplaySampleKey(0, generation, 3)
         replay.update_priorities([key, key], [100.0, 10.0])
-        expected = max(10.0 ** replay.lap_alpha, replay.lap_min_priority)
-        self.assertAlmostEqual(
-            float(replay._priority[0, 3]), expected, places=6
-        )
-        self.assertAlmostEqual(
+        expected = float(np.float16(max(
+            10.0 ** replay.lap_alpha, replay.lap_min_priority
+        )))
+        self.assertEqual(float(replay._priority[0, 3]), expected)
+        self.assertEqual(
             replay._priority_sum[0],
             replay._priority[0].sum(dtype=np.float64),
         )
-        self.assertAlmostEqual(
+        self.assertEqual(
             replay._priority_sq_sum[0],
             np.square(replay._priority[0].astype(np.float64)).sum(),
         )
         diagnostics = replay.diagnostics()
-        active = replay._priority[replay._valid_transition_slots()]
+        active = replay._priority[
+            replay._valid_transition_slots()
+        ].astype(np.float64)
         self.assertAlmostEqual(
             diagnostics["lap/priority_mean"], float(active.mean()), places=6
         )
         self.assertAlmostEqual(
             diagnostics["lap/priority_std"], float(active.std()), places=6
         )
+
+    def test_priority_overflow_is_rejected_before_float16_storage(self):
+        replay = self.replay()
+        replay.push(make_snapshot(replay.topology, 0))
+        key = ReplaySampleKey(
+            0, int(replay._transition_generation[0]), 0
+        )
+        with self.assertRaisesRegex(
+            ContextualReplayError, "exceeds finite float16 replay storage"
+        ):
+            replay.update_priorities([key], [1e20])
 
     def test_uniform_mode_priority_update_is_explicit_error(self):
         topology = make_topology()

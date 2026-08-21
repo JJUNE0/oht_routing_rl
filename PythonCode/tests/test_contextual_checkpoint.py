@@ -30,13 +30,13 @@ from test_contextual_replay import FakeObservationBuilder, make_snapshot
 class CheckpointObservationBuilder(FakeObservationBuilder):
     def __init__(self, topology):
         super().__init__(topology)
-        self.local_normalizer = RunningFeatureNormalizer(8)
-        self.global_normalizer = RunningFeatureNormalizer(6)
+        self.local_normalizer = RunningFeatureNormalizer(16)
+        self.global_normalizer = RunningFeatureNormalizer(17)
         self.local_normalizer.update(
-            np.ones((4999, 8)), name="checkpoint_local"
+            np.ones((4999, 16)), name="checkpoint_local"
         )
         self.global_normalizer.update(
-            np.ones((1, 6)), name="checkpoint_global"
+            np.ones((1, 17)), name="checkpoint_global"
         )
         self.local_normalizer.freeze()
         self.global_normalizer.freeze()
@@ -156,7 +156,7 @@ class ContextualCheckpointTests(unittest.TestCase):
                 reward_builder=target_reward,
             )
 
-    def test_exact_legacy_artifact_fingerprint_can_be_promoted(self):
+    def test_exact_v2_legacy_artifact_fingerprint_is_rejected(self):
         learner, obs, reward = components()
         with tempfile.TemporaryDirectory() as directory:
             path = save_contextual_checkpoint(
@@ -172,15 +172,54 @@ class ContextualCheckpointTests(unittest.TestCase):
                 "contextual_td7_checkpoint_v7_locked_reward_profile"
             )
             torch.save(payload, path)
-            promoted_hash = next(iter(PROMOTED_CHECKPOINTS))
+            old_v2_fingerprint = (
+                "7c2d6a19184060584efeb69f52be57c3e7fffad33da52c8c1c879ed39db8bc2b"
+            )
+            self.assertNotIn(old_v2_fingerprint, PROMOTED_CHECKPOINTS)
             with patch(
                 "oht_routing.algorithms.rl.contextual_td7.checkpoint."
                 "_checkpoint_sha256",
-                return_value=promoted_hash,
+                return_value=old_v2_fingerprint,
             ):
-                restored, complete = read_contextual_runtime_config(path)
-                self.assertTrue(complete)
-                self.assertEqual(restored, {"reward_version": "N"})
+                with self.assertRaisesRegex(
+                    ContextualCheckpointError,
+                    "former v2 step_400000.pt promotion is intentionally "
+                    "incompatible",
+                ):
+                    read_contextual_runtime_config(path)
+                with self.assertRaisesRegex(
+                    ContextualCheckpointError,
+                    "former v2 step_400000.pt promotion is intentionally "
+                    "incompatible",
+                ):
+                    load_contextual_checkpoint(
+                        path,
+                        learner,
+                        observation_builder=obs,
+                        reward_builder=reward,
+                    )
+
+    def test_v2_semver_checkpoint_is_rejected(self):
+        learner, obs, reward = components()
+        with tempfile.TemporaryDirectory() as directory:
+            path = save_contextual_checkpoint(
+                Path(directory) / "v2_0.pt",
+                learner,
+                observation_builder=obs,
+                reward_builder=reward,
+                runtime_config={"reward_version": "N"},
+            )
+            payload = torch.load(path, weights_only=False)
+            payload["version"] = "v2.0.0"
+            torch.save(payload, path)
+
+            with self.assertRaisesRegex(
+                ContextualCheckpointError, "checkpoint version mismatch"
+            ):
+                read_contextual_runtime_config(path)
+            with self.assertRaisesRegex(
+                ContextualCheckpointError, "checkpoint version mismatch"
+            ):
                 load_contextual_checkpoint(
                     path,
                     learner,
@@ -303,13 +342,19 @@ class ContextualCheckpointTests(unittest.TestCase):
             with torch.no_grad():
                 source_z = source.encoder(
                     fixed.center_local, fixed.incoming_local,
-                    fixed.outgoing_local, fixed.incoming_relation,
-                    fixed.outgoing_relation, fixed.global_state,
+                    fixed.outgoing_local, fixed.center_rail_index,
+                    fixed.incoming_rail_indices,
+                    fixed.outgoing_rail_indices,
+                    fixed.incoming_relation, fixed.outgoing_relation,
+                    fixed.global_state,
                 ).state
                 restored_z = restored.encoder(
                     fixed.center_local, fixed.incoming_local,
-                    fixed.outgoing_local, fixed.incoming_relation,
-                    fixed.outgoing_relation, fixed.global_state,
+                    fixed.outgoing_local, fixed.center_rail_index,
+                    fixed.incoming_rail_indices,
+                    fixed.outgoing_rail_indices,
+                    fixed.incoming_relation, fixed.outgoing_relation,
+                    fixed.global_state,
                 ).state
                 torch.testing.assert_close(source_z, restored_z, rtol=0, atol=0)
                 torch.testing.assert_close(
@@ -517,6 +562,8 @@ class ContextualCheckpointTests(unittest.TestCase):
         batch = source.replay.sample(4)
         observation = (
             batch.center_local, batch.incoming_local, batch.outgoing_local,
+            batch.center_rail_index, batch.incoming_rail_indices,
+            batch.outgoing_rail_indices,
             batch.incoming_relation, batch.outgoing_relation,
             batch.global_state,
         )

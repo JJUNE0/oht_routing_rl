@@ -1,5 +1,6 @@
 """Human-readable startup diagnostics for the contextual runtime."""
 
+from oht_routing.algorithms.rl.contextual_td7 import ContextualStepReplayBuffer
 from oht_routing.mdp.action import REGION_B_RL
 from oht_routing.runtime.console import print_header, print_section
 from oht_routing.runtime.config_validation import make_reward_config
@@ -9,6 +10,17 @@ from oht_routing.version import CONTEXTUAL_VERSION
 def print_runtime_summary(args, client):
     """Print the resolved runtime contract once before accepting a simulator."""
     config = client.config
+    network = client.encoder.config
+    estimated_replay_gib = ContextualStepReplayBuffer.estimate_capacity_bytes(
+        config.replay_capacity_env_steps,
+        physical_count=network.num_rails,
+        controlled_count=network.num_rails - 3,
+        neighbor_count=network.neighbor_count,
+        lap_enabled=config.lap_enabled,
+    ) / (1024.0 ** 3)
+    replay_storage = "packed local u8/u16, Q15 actions"
+    if config.lap_enabled:
+        replay_storage += ", fp16 LAP"
     reward = make_reward_config(config)
     refill_mode = (
         "full capacity"
@@ -40,6 +52,12 @@ def print_runtime_summary(args, client):
         if client.checkpoint_loaded
         else "not requested"
     )
+    environment_capture = (
+        f"enabled: {client.environment_capture.output_dir} "
+        f"(first {client.environment_capture.max_steps} actor ticks)"
+        if client.environment_capture is not None
+        else "disabled"
+    )
 
     print_header("contextual-runtime")
     print_section(
@@ -58,6 +76,14 @@ def print_runtime_summary(args, client):
         (
             ("action mode", config.action_mode),
             ("action scale schedule", action_scale),
+            ("local physical features", network.local_physical_dim),
+            ("rail embedding dimensions", network.rail_embedding_dim),
+            ("global features", network.global_dim),
+            (
+                "context rails",
+                f"center + {network.neighbor_count} incoming + "
+                f"{network.neighbor_count} outgoing",
+            ),
             ("observation stacks", config.num_stacks),
             ("stack interval", config.stack_interval),
             ("episode burn-in steps", config.episode_burnin_steps),
@@ -79,6 +105,12 @@ def print_runtime_summary(args, client):
             ("resume checkpoint", config.resume_checkpoint_path),
             ("load status", checkpoint_status),
             ("sampling mode", config.replay_sampling_mode),
+            ("capacity (environment steps)", config.replay_capacity_env_steps),
+            (
+                "storage format",
+                replay_storage,
+            ),
+            ("estimated full replay RAM", f"{estimated_replay_gib:.2f} GiB"),
             ("batch size", config.batch_size),
             (
                 "resume refill",
@@ -139,6 +171,16 @@ def print_runtime_summary(args, client):
     print_section(
         "diagnostics",
         (
+            (
+                "W&B",
+                (
+                    f"enabled ({config.mode} profile, every "
+                    f"{config.wandb_log_interval} steps)"
+                    if config.wandb_enabled
+                    else "disabled"
+                ),
+            ),
+            ("environment capture", environment_capture),
             ("reward directory", config.reward_diagnostic_dir),
             ("rail TAT", rail_tat_diagnostic),
         ),

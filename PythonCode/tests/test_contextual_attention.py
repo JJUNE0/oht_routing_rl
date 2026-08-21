@@ -11,18 +11,43 @@ from oht_routing.algorithms.rl.contextual_td7 import (
 
 
 def make_inputs(batch=4, *, requires_grad=False, scale=1.0, device="cpu"):
-    shapes = (
-        (batch, 8),
-        (batch, 10, 8),
-        (batch, 10, 8),
-        (batch, 10, 2),
-        (batch, 10, 2),
-        (batch, 6),
+    config = ContextualNetworkConfig()
+    float_shapes = (
+        (batch, config.local_physical_dim),
+        (batch, config.neighbor_count, config.local_physical_dim),
+        (batch, config.neighbor_count, config.local_physical_dim),
+        (batch, config.neighbor_count, config.relation_dim),
+        (batch, config.neighbor_count, config.relation_dim),
+        (batch, config.global_dim),
     )
-    return tuple(
+    floats = tuple(
         (torch.randn(shape, device=device) * scale).requires_grad_(requires_grad)
-        for shape in shapes
+        for shape in float_shapes
     )
+    center_index = torch.arange(batch, device=device, dtype=torch.long)
+    neighbor_offset = torch.arange(
+        1, config.neighbor_count + 1, device=device, dtype=torch.long
+    )
+    incoming_indices = (
+        center_index[:, None] + neighbor_offset[None]
+    ) % config.num_rails
+    outgoing_indices = (
+        center_index[:, None] + 2 * neighbor_offset[None]
+    ) % config.num_rails
+    return (
+        floats[0],
+        floats[1],
+        floats[2],
+        center_index,
+        incoming_indices,
+        outgoing_indices,
+        floats[3],
+        floats[4],
+        floats[5],
+    )
+
+
+FLOAT_INPUT_INDICES = (0, 1, 2, 6, 7, 8)
 
 
 class ContextualAttentionTests(unittest.TestCase):
@@ -41,10 +66,10 @@ class ContextualAttentionTests(unittest.TestCase):
                 self.assertEqual(output.incoming_context.shape, (batch, 64))
                 self.assertEqual(output.outgoing_context.shape, (batch, 64))
                 self.assertEqual(
-                    output.incoming_attention.shape, (batch, 4, 1, 10)
+                    output.incoming_attention.shape, (batch, 4, 1, 15)
                 )
                 self.assertEqual(
-                    output.outgoing_attention.shape, (batch, 4, 1, 10)
+                    output.outgoing_attention.shape, (batch, 4, 1, 15)
                 )
 
     def test_production_batch_4996_is_supported(self):
@@ -119,10 +144,13 @@ class ContextualAttentionTests(unittest.TestCase):
     def test_paired_neighbor_relation_permutation_is_invariant(self):
         inputs = list(make_inputs(4))
         base = self.encoder(*inputs)
-        permutation = torch.tensor([7, 2, 9, 1, 5, 0, 8, 4, 6, 3])
+        permutation = torch.tensor(
+            [12, 2, 14, 1, 5, 0, 8, 11, 6, 3, 13, 4, 10, 9, 7]
+        )
         permuted = list(inputs)
         permuted[1] = permuted[1][:, permutation]
-        permuted[3] = permuted[3][:, permutation]
+        permuted[4] = permuted[4][:, permutation]
+        permuted[6] = permuted[6][:, permutation]
         result = self.encoder(*permuted)
         torch.testing.assert_close(
             base.incoming_context, result.incoming_context, rtol=1e-5, atol=1e-6
@@ -131,7 +159,9 @@ class ContextualAttentionTests(unittest.TestCase):
     def test_local_only_permutation_can_change_context(self):
         inputs = list(make_inputs(4))
         base = self.encoder(*inputs)
-        permutation = torch.tensor([7, 2, 9, 1, 5, 0, 8, 4, 6, 3])
+        permutation = torch.tensor(
+            [12, 2, 14, 1, 5, 0, 8, 11, 6, 3, 13, 4, 10, 9, 7]
+        )
         permuted = list(inputs)
         permuted[1] = permuted[1][:, permutation]
         result = self.encoder(*permuted)
@@ -146,9 +176,12 @@ class ContextualAttentionTests(unittest.TestCase):
             inputs[0],
             inputs[2],
             inputs[1],
-            inputs[4],
             inputs[3],
             inputs[5],
+            inputs[4],
+            inputs[7],
+            inputs[6],
+            inputs[8],
         )
         self.assertFalse(
             torch.allclose(base.incoming_context, swapped.outgoing_context)
@@ -158,10 +191,15 @@ class ContextualAttentionTests(unittest.TestCase):
         inputs = make_inputs(3, requires_grad=True)
         output = self.encoder(*inputs)
         output.state.square().mean().backward()
-        for value in inputs:
+        for index in FLOAT_INPUT_INDICES:
+            value = inputs[index]
             self.assertIsNotNone(value.grad)
             self.assertTrue(torch.isfinite(value.grad).all())
             self.assertGreater(float(value.grad.abs().sum()), 0.0)
+        embedding_grad = self.encoder.rail_embedding.weight.grad
+        self.assertIsNotNone(embedding_grad)
+        self.assertTrue(torch.isfinite(embedding_grad).all())
+        self.assertGreater(float(embedding_grad.abs().sum()), 0.0)
         for module in (
             self.encoder.incoming_attention,
             self.encoder.outgoing_attention,
@@ -177,7 +215,8 @@ class ContextualAttentionTests(unittest.TestCase):
         single_output = self.encoder(*single_inputs).state[0]
         torch.testing.assert_close(batch_output, single_output, rtol=1e-5, atol=1e-6)
         batch_output.sum().backward()
-        for value in inputs:
+        for index in FLOAT_INPUT_INDICES:
+            value = inputs[index]
             self.assertEqual(float(value.grad[1].abs().sum()), 0.0)
 
     def test_no_padding_mask_argument(self):
@@ -187,10 +226,12 @@ class ContextualAttentionTests(unittest.TestCase):
         self.assertFalse(signature.parameters["return_attention"].default)
 
     def test_global_encoder_is_separate_from_neighbor_token_encoder(self):
+        first_center_linear = self.encoder.center_encoder.network[0]
         first_neighbor_linear = self.encoder.neighbor_encoder.network[0]
         first_global_linear = self.encoder.global_encoder.network[0]
-        self.assertEqual(first_neighbor_linear.in_features, 10)
-        self.assertEqual(first_global_linear.in_features, 6)
+        self.assertEqual(first_center_linear.in_features, 24)
+        self.assertEqual(first_neighbor_linear.in_features, 26)
+        self.assertEqual(first_global_linear.in_features, 17)
         self.assertIsNot(first_neighbor_linear, first_global_linear)
 
 

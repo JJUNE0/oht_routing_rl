@@ -16,10 +16,12 @@ def contextual_algorithm_variant(sale_enabled: bool, lap_enabled: bool) -> str:
 
 @dataclass(frozen=True)
 class ContextualNetworkConfig:
-    local_dim: int = 8
+    local_physical_dim: int = 16
+    rail_embedding_dim: int = 8
+    num_rails: int = 4_999
     relation_dim: int = 2
-    global_dim: int = 6
-    neighbor_count: int = 10
+    global_dim: int = 17
+    neighbor_count: int = 15
     d_model: int = 64
     num_heads: int = 4
     attention_layers: int = 1
@@ -33,7 +35,9 @@ class ContextualNetworkConfig:
 
     def __post_init__(self):
         positive = (
-            "local_dim",
+            "local_physical_dim",
+            "rail_embedding_dim",
+            "num_rails",
             "relation_dim",
             "global_dim",
             "neighbor_count",
@@ -57,8 +61,12 @@ class ContextualNetworkConfig:
         validate_stack_config(self.num_stacks, self.stack_interval)
 
     @property
+    def center_token_dim(self) -> int:
+        return self.local_physical_dim + self.rail_embedding_dim
+
+    @property
     def neighbor_token_dim(self) -> int:
-        return self.local_dim + self.relation_dim
+        return self.center_token_dim + self.relation_dim
 
     @property
     def fusion_input_dim(self) -> int:

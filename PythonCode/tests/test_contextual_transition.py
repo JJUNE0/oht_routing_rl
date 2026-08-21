@@ -2,7 +2,11 @@ import unittest
 
 import numpy as np
 
-from oht_routing.mdp.observation import ContextualObservationBatch
+from oht_routing.mdp.observation import (
+    GLOBAL_DIM,
+    LOCAL_PHYSICAL_DIM,
+    ContextualObservationBatch,
+)
 from oht_routing.mdp.reward.builder import ContextualRewardBuilder, ContextualRewardConfig
 from oht_routing.mdp.transition import (
     ContextualTransitionAligner,
@@ -13,21 +17,49 @@ from test_contextual_reward import reward_client
 
 
 def observation(topology, suffix=0):
+    neighbor_count = topology.incoming_neighbor_ids.shape[1]
+    physical_by_id = {
+        int(rail_id): row
+        for row, rail_id in enumerate(topology.all_rail_ids)
+    }
+    incoming_indices = np.asarray([
+        [physical_by_id[int(rail_id)] for rail_id in row]
+        for row in topology.incoming_neighbor_ids
+    ], dtype=np.int64)
+    outgoing_indices = np.asarray([
+        [physical_by_id[int(rail_id)] for rail_id in row]
+        for row in topology.outgoing_neighbor_ids
+    ], dtype=np.int64)
     return ContextualObservationBatch(
-        center_local=np.full((CONTROLLED_COUNT, 8), suffix, np.float32),
-        incoming_local=np.zeros((CONTROLLED_COUNT, 10, 8), np.float32),
-        outgoing_local=np.zeros((CONTROLLED_COUNT, 10, 8), np.float32),
-        incoming_relation=np.zeros((CONTROLLED_COUNT, 10, 2), np.float32),
-        outgoing_relation=np.zeros((CONTROLLED_COUNT, 10, 2), np.float32),
-        global_state=np.zeros(6, np.float32),
+        center_local=np.full(
+            (CONTROLLED_COUNT, LOCAL_PHYSICAL_DIM), suffix, np.float32
+        ),
+        incoming_local=np.zeros(
+            (CONTROLLED_COUNT, neighbor_count, LOCAL_PHYSICAL_DIM), np.float32
+        ),
+        outgoing_local=np.zeros(
+            (CONTROLLED_COUNT, neighbor_count, LOCAL_PHYSICAL_DIM), np.float32
+        ),
+        center_rail_index=np.ascontiguousarray(
+            topology.controlled_row_to_physical_index.copy()
+        ),
+        incoming_rail_indices=np.ascontiguousarray(incoming_indices),
+        outgoing_rail_indices=np.ascontiguousarray(outgoing_indices),
+        incoming_relation=np.zeros(
+            (CONTROLLED_COUNT, neighbor_count, 2), np.float32
+        ),
+        outgoing_relation=np.zeros(
+            (CONTROLLED_COUNT, neighbor_count, 2), np.float32
+        ),
+        global_state=np.zeros(GLOBAL_DIM, np.float32),
         previous_applied_action=np.zeros((CONTROLLED_COUNT, 1), np.float32),
         controlled_rail_ids=topology.controlled_rail_ids.copy(),
         topology_hash=topology.topology_hash,
         mapping_hash=topology.mapping_hash,
         physical_local_raw=np.full(
-            (PHYSICAL_COUNT, 8), suffix, np.float32
+            (PHYSICAL_COUNT, LOCAL_PHYSICAL_DIM), suffix, np.float32
         ),
-        global_raw=np.full(6, suffix, np.float32),
+        global_raw=np.full(GLOBAL_DIM, suffix, np.float32),
     )
 
 

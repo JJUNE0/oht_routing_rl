@@ -1,4 +1,4 @@
-"""Validated runtime configuration for contextual TD7 v2."""
+"""Validated runtime configuration for contextual TD7 v3."""
 
 from __future__ import annotations
 
@@ -41,8 +41,11 @@ RESUME_LAUNCH_CONTROL_FIELDS = {
     "reward_diagnostic_dir",
     "reward_diagnostic_windows",
     "wandb_enabled",
+    "save_data_enabled",
     "dispatch_mode",
     "batch_size",
+    "replay_capacity_env_steps",
+    "lap_enabled",
     "resume_inference_until_replay_full",
     "resume_deterministic_first_episode",
 }
@@ -89,7 +92,7 @@ class ContextualRuntimeConfig:
     exploration_noise_final_std: float = 0.02
     exploration_noise_anneal_steps: int = 100_000
     exploration_noise_clip: float = 0.20
-    replay_capacity_env_steps: int = 10_000
+    replay_capacity_env_steps: int = 100_000
     replay_sampling_mode: str = REPLAY_SAMPLING_RAIL
     batch_size: int = 1_024
     minimum_replay_env_steps: int = 100
@@ -106,6 +109,7 @@ class ContextualRuntimeConfig:
     rail_tat_diagnostic_max_step: int = 1_000
     wandb_enabled: bool = False
     wandb_log_interval: int = 10
+    save_data_enabled: bool = False
     sale_enabled: bool = True
     lap_enabled: bool = True
     critic_loss_mode: str = "auto"
@@ -216,6 +220,8 @@ def runtime_config_from_args(args) -> ContextualRuntimeConfig:
     }
     for config_name, argument_name in _ARG_ALIASES.items():
         value = getattr(args, argument_name)
+        if config_name == "wandb_enabled" and value is None:
+            value = args.mode in {"training", "actor_inference"}
         if config_name in _PATH_CONFIG_FIELDS and value is not None:
             value = str(value)
         config_kwargs[config_name] = value

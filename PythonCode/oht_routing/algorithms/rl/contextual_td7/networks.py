@@ -32,6 +32,32 @@ def _require_finite(name: str, value: torch.Tensor):
         raise ContextualNetworkError(f"{name} contains NaN or Inf")
 
 
+def _require_index_tensor(
+    name: str,
+    value: torch.Tensor,
+    shape_tail: tuple[int, ...],
+    *,
+    upper_bound: int,
+):
+    if not torch.is_tensor(value):
+        raise TypeError(f"{name} must be a torch.Tensor")
+    expected_ndim = 1 + len(shape_tail)
+    if value.ndim != expected_ndim or tuple(value.shape[1:]) != shape_tail:
+        raise ValueError(
+            f"{name} shape must be [B"
+            f"{''.join(f', {part}' for part in shape_tail)}], "
+            f"got {tuple(value.shape)}"
+        )
+    if value.dtype != torch.long:
+        raise TypeError(f"{name} must have dtype torch.long")
+    if value.numel() and (
+        int(value.min().item()) < 0 or int(value.max().item()) >= int(upper_bound)
+    ):
+        raise ValueError(
+            f"{name} contains an index outside [0, {int(upper_bound)})"
+        )
+
+
 class FeatureEncoder(nn.Module):
     def __init__(self, input_dim: int, output_dim: int):
         super().__init__()
@@ -61,7 +87,13 @@ class DirectionalContextEncoder(nn.Module):
         super().__init__()
         self.config = config or ContextualNetworkConfig()
         cfg = self.config
-        self.center_encoder = FeatureEncoder(cfg.local_dim, cfg.d_model)
+        self.rail_embedding = nn.Embedding(
+            cfg.num_rails, cfg.rail_embedding_dim
+        )
+        nn.init.normal_(self.rail_embedding.weight, mean=0.0, std=0.02)
+        self.center_encoder = FeatureEncoder(
+            cfg.center_token_dim, cfg.d_model
+        )
         self.neighbor_encoder = FeatureEncoder(
             cfg.neighbor_token_dim, cfg.d_model
         )
@@ -85,6 +117,9 @@ class DirectionalContextEncoder(nn.Module):
         center_local: torch.Tensor,
         incoming_local: torch.Tensor,
         outgoing_local: torch.Tensor,
+        center_rail_index: torch.Tensor,
+        incoming_rail_indices: torch.Tensor,
+        outgoing_rail_indices: torch.Tensor,
         incoming_relation: torch.Tensor,
         outgoing_relation: torch.Tensor,
         global_state: torch.Tensor,
@@ -92,16 +127,36 @@ class DirectionalContextEncoder(nn.Module):
         return_attention: bool = False,
     ) -> ContextualEncoding:
         cfg = self.config
-        _require_tensor("center_local", center_local, (cfg.local_dim,))
+        _require_tensor(
+            "center_local", center_local, (cfg.local_physical_dim,)
+        )
         _require_tensor(
             "incoming_local",
             incoming_local,
-            (cfg.neighbor_count, cfg.local_dim),
+            (cfg.neighbor_count, cfg.local_physical_dim),
         )
         _require_tensor(
             "outgoing_local",
             outgoing_local,
-            (cfg.neighbor_count, cfg.local_dim),
+            (cfg.neighbor_count, cfg.local_physical_dim),
+        )
+        _require_index_tensor(
+            "center_rail_index",
+            center_rail_index,
+            (),
+            upper_bound=cfg.num_rails,
+        )
+        _require_index_tensor(
+            "incoming_rail_indices",
+            incoming_rail_indices,
+            (cfg.neighbor_count,),
+            upper_bound=cfg.num_rails,
+        )
+        _require_index_tensor(
+            "outgoing_rail_indices",
+            outgoing_rail_indices,
+            (cfg.neighbor_count,),
+            upper_bound=cfg.num_rails,
         )
         _require_tensor(
             "incoming_relation",
@@ -120,6 +175,9 @@ class DirectionalContextEncoder(nn.Module):
                 center_local,
                 incoming_local,
                 outgoing_local,
+                center_rail_index,
+                incoming_rail_indices,
+                outgoing_rail_indices,
                 incoming_relation,
                 outgoing_relation,
                 global_state,
@@ -128,12 +186,17 @@ class DirectionalContextEncoder(nn.Module):
         if len(batch_sizes) != 1:
             raise ValueError(f"contextual input batch sizes differ: {batch_sizes}")
 
-        center_embedding = self.center_encoder(center_local)
+        center_identity = self.rail_embedding(center_rail_index)
+        incoming_identity = self.rail_embedding(incoming_rail_indices)
+        outgoing_identity = self.rail_embedding(outgoing_rail_indices)
+        center_embedding = self.center_encoder(
+            torch.cat((center_local, center_identity), dim=-1)
+        )
         incoming_tokens = torch.cat(
-            (incoming_local, incoming_relation), dim=-1
+            (incoming_local, incoming_identity, incoming_relation), dim=-1
         )
         outgoing_tokens = torch.cat(
-            (outgoing_local, outgoing_relation), dim=-1
+            (outgoing_local, outgoing_identity, outgoing_relation), dim=-1
         )
         incoming_neighbor_embedding = self.neighbor_encoder(incoming_tokens)
         outgoing_neighbor_embedding = self.neighbor_encoder(outgoing_tokens)

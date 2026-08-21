@@ -9,7 +9,7 @@ import torch
 
 from oht_routing.mdp.observation import (
     GLOBAL_DIM,
-    LOCAL_DIM,
+    LOCAL_PHYSICAL_DIM,
 )
 from oht_routing.mdp.reward.config import (
     REWARD_VERSION,
@@ -17,7 +17,10 @@ from oht_routing.mdp.reward.config import (
 )
 from oht_routing.mdp.topology import ContextualTopology
 from oht_routing.mdp.transition import CompletedContextualTransition
-from oht_routing.version import CONTEXTUAL_VERSION
+from oht_routing.version import (
+    CONTEXTUAL_VERSION,
+    is_compatible_contextual_version,
+)
 
 from .replay_types import (
     ContextualReplayBatch,
@@ -41,6 +44,17 @@ REPLAY_SAMPLING_MODES = (
 )
 
 
+# Replay storage is deliberately narrower than the learner contract. Samples
+# are always materialized as float32 before normalization/model use.
+STATIC_PHYSICAL_FEATURE_INDICES = (0, 1, 2, 3)
+UINT8_PHYSICAL_FEATURE_INDICES = (5, 8, 9, 10, 11, 12, 13, 15)
+UINT16_PHYSICAL_FEATURE_INDICES = (6, 7, 14)
+STATE_COUNT_UINT8_POSITIONS = (1, 2, 3, 4, 5, 6)
+ACTION_FIXED_POINT_SCALE = float(np.iinfo(np.int16).max)
+ACTION_FIXED_POINT_MAX_ABS_ERROR = 0.5 / ACTION_FIXED_POINT_SCALE
+LAP_PRIORITY_MAX = float(np.finfo(np.float16).max)
+
+
 def _copy_array(name, values, shape, dtype=np.float32):
     array = np.asarray(values, dtype=dtype)
     if array.shape != shape:
@@ -52,6 +66,50 @@ def _copy_array(name, values, shape, dtype=np.float32):
     result = np.ascontiguousarray(array.copy())
     result.setflags(write=False)
     return result
+
+
+def _quantize_action(name, values, shape):
+    """Encode a bounded float action as symmetric signed 16-bit fixed point."""
+    array = np.asarray(values, dtype=np.float32)
+    if array.shape != shape:
+        raise ContextualReplayError(
+            f"{name} shape mismatch: actual={array.shape}, expected={shape}"
+        )
+    if not np.isfinite(array).all():
+        raise ContextualReplayError(f"{name} contains NaN or Inf")
+    if (np.abs(array) > 1.0 + 1e-6).any():
+        raise ContextualReplayError(f"{name} must be in [-1, 1]")
+    clipped = np.clip(array, -1.0, 1.0)
+    return np.ascontiguousarray(
+        np.rint(clipped * ACTION_FIXED_POINT_SCALE).astype(np.int16)
+    )
+
+
+def _decode_action(values):
+    """Decode fixed-point replay actions to the learner's float32 contract."""
+    return np.ascontiguousarray(
+        np.asarray(values, dtype=np.float32)
+        / np.float32(ACTION_FIXED_POINT_SCALE)
+    )
+
+
+def _encode_integral_columns(name, physical, indices, dtype):
+    values = np.asarray(physical, dtype=np.float32)[:, indices]
+    rounded = np.rint(values)
+    if not np.array_equal(values, rounded):
+        raise ContextualReplayError(
+            f"{name} replay features must be exactly integral"
+        )
+    limit = np.iinfo(dtype)
+    if (rounded < limit.min).any() or (rounded > limit.max).any():
+        actual_min = float(rounded.min(initial=0.0))
+        actual_max = float(rounded.max(initial=0.0))
+        raise ContextualReplayError(
+            f"{name} replay feature overflow for {np.dtype(dtype).name}: "
+            f"range=[{actual_min}, {actual_max}], "
+            f"allowed=[{limit.min}, {limit.max}]"
+        )
+    return np.ascontiguousarray(rounded.astype(dtype))
 
 
 def snapshot_from_transition(
@@ -72,7 +130,9 @@ def snapshot_from_transition(
     controlled_count = int(transition.action.shape[0])
     return ContextualStepSnapshot(
         physical_local_state=_copy_array(
-            "physical_local_state", state_raw, (physical_count, LOCAL_DIM)
+            "physical_local_state",
+            state_raw,
+            (physical_count, LOCAL_PHYSICAL_DIM),
         ),
         global_state=_copy_array("global_state", state_global, (GLOBAL_DIM,)),
         previous_applied_action=_copy_array(
@@ -90,7 +150,9 @@ def snapshot_from_transition(
             "reward", transition.reward.total, (controlled_count,)
         ),
         next_physical_local_state=_copy_array(
-            "next_physical_local_state", next_raw, (physical_count, LOCAL_DIM)
+            "next_physical_local_state",
+            next_raw,
+            (physical_count, LOCAL_PHYSICAL_DIM),
         ),
         next_global_state=_copy_array(
             "next_global_state", next_global, (GLOBAL_DIM,)
@@ -163,8 +225,32 @@ class ContextualStepReplayBuffer:
         self._stack_offsets = stack_offsets(
             self.num_stacks, self.stack_interval
         )
+        if (
+            not np.isfinite(self.lap_alpha)
+            or self.lap_alpha <= 0.0
+            or not np.isfinite(self.lap_min_priority)
+            or self.lap_min_priority <= 0.0
+        ):
+            raise ValueError("LAP alpha/min priority must be finite and positive")
+        if self.lap_enabled and self.lap_min_priority > LAP_PRIORITY_MAX:
+            raise ValueError(
+                "lap_min_priority exceeds float16 replay storage range: "
+                f"{self.lap_min_priority} > {LAP_PRIORITY_MAX}"
+            )
+        if self.lap_enabled:
+            stored_min_priority = np.float16(self.lap_min_priority)
+            if (
+                not np.isfinite(stored_min_priority)
+                or stored_min_priority <= 0.0
+            ):
+                raise ValueError(
+                    "lap_min_priority underflows finite positive float16 "
+                    "replay storage"
+                )
+        else:
+            stored_min_priority = self.lap_min_priority
         self._priority = (
-            np.zeros((self.capacity, self.controlled_count), np.float32)
+            np.zeros((self.capacity, self.controlled_count), np.float16)
             if self.lap_enabled else None
         )
         self._priority_sum = (
@@ -176,26 +262,44 @@ class ContextualStepReplayBuffer:
             if self.lap_enabled else None
         )
         self._priority_min = (
-            np.zeros(self.capacity, np.float32)
+            np.zeros(self.capacity, np.float16)
             if self.lap_enabled else None
         )
         self._priority_max = (
-            np.zeros(self.capacity, np.float32)
+            np.zeros(self.capacity, np.float16)
             if self.lap_enabled else None
         )
-        self.max_priority = float(self.lap_min_priority)
+        self.max_priority = float(stored_min_priority)
         self.priority_update_count = 0
 
         # Adjacent transitions share states. The 2C allocation also preserves
         # full transition capacity under pathological reset frequency.
-        self._physical = np.empty(
-            (self.state_capacity, self.physical_count, LOCAL_DIM), np.float32
+        self._physical_static = np.empty(
+            (self.physical_count, len(STATIC_PHYSICAL_FEATURE_INDICES)),
+            np.float32,
+        )
+        self._physical_distance_mm = np.empty(
+            self.physical_count, np.float64
+        )
+        self._physical_static_initialized = False
+        self._physical_uint8 = np.empty(
+            (
+                self.state_capacity,
+                self.physical_count,
+                len(UINT8_PHYSICAL_FEATURE_INDICES),
+            ),
+            np.uint8,
+        )
+        self._physical_uint16 = np.empty(
+            (
+                self.state_capacity,
+                self.physical_count,
+                len(UINT16_PHYSICAL_FEATURE_INDICES),
+            ),
+            np.uint16,
         )
         self._global = np.empty(
             (self.state_capacity, GLOBAL_DIM), np.float32
-        )
-        self._previous_applied_action = np.empty(
-            (self.state_capacity, self.controlled_count), np.float32
         )
         self._state_generation = np.zeros(self.state_capacity, np.int64)
         self._state_valid = np.zeros(self.state_capacity, bool)
@@ -206,8 +310,9 @@ class ContextualStepReplayBuffer:
         self._state_cursor = 0
 
         shape = (self.capacity, self.controlled_count)
-        self._policy_action = np.empty(shape, np.float32)
-        self._applied_action = np.empty(shape, np.float32)
+        self._previous_applied_action = np.empty(shape, np.int16)
+        self._policy_action = np.empty(shape, np.int16)
+        self._applied_action = np.empty(shape, np.int16)
         self._reward = np.empty(shape, np.float32)
         self._done = np.empty(self.capacity, np.float32)
         self._env_step = np.empty(self.capacity, np.int64)
@@ -223,6 +328,7 @@ class ContextualStepReplayBuffer:
         ] * self.capacity
         self._key_to_transition: dict[tuple[int, int], tuple[int, int]] = {}
         self._episode_first_step: dict[int, int] = {}
+        self._episode_transition_counts: dict[int, int] = {}
         self._transition_cursor = 0
 
         id_to_physical = {
@@ -240,6 +346,11 @@ class ContextualStepReplayBuffer:
             [id_to_physical[int(rail_id)] for rail_id in row]
             for row in topology.outgoing_neighbor_ids
         ], dtype=np.int64))
+        if self._incoming_rows.shape != self._outgoing_rows.shape:
+            raise ContextualReplayError(
+                "incoming/outgoing topology mapping shapes differ"
+            )
+        self.neighbor_count = int(self._incoming_rows.shape[1])
 
         self.push_count = 0
         self.sample_count = 0
@@ -250,36 +361,46 @@ class ContextualStepReplayBuffer:
         self._last_sample_diag: dict[str, float] = {}
 
     def _validate_snapshot(self, snapshot: ContextualStepSnapshot) -> None:
-        expected_versions = (
-            (snapshot.version, CONTEXTUAL_VERSION, "runtime"),
-            (snapshot.reward_version, self.reward_version, "reward"),
-        )
+        if not is_compatible_contextual_version(snapshot.version):
+            raise ContextualReplayError(
+                "runtime version mismatch: "
+                f"{snapshot.version} != compatible {CONTEXTUAL_VERSION}"
+            )
         if snapshot.topology_hash != self.topology.topology_hash:
             self.hash_mismatch_count += 1
             raise ContextualReplayError("topology hash mismatch")
         if snapshot.mapping_hash != self.topology.mapping_hash:
             self.hash_mismatch_count += 1
             raise ContextualReplayError("mapping hash mismatch")
-        for actual, expected, name in expected_versions:
-            if actual != expected:
-                raise ContextualReplayError(
-                    f"{name} version mismatch: {actual} != {expected}"
-                )
+        if snapshot.reward_version != self.reward_version:
+            raise ContextualReplayError(
+                "reward version mismatch: "
+                f"{snapshot.reward_version} != {self.reward_version}"
+            )
         if snapshot.next_env_step != snapshot.env_step + 1:
             raise ContextualReplayError("next_env_step must equal env_step + 1")
         _copy_array("physical_local_state", snapshot.physical_local_state,
-                    (self.physical_count, LOCAL_DIM))
+                    (self.physical_count, LOCAL_PHYSICAL_DIM))
         _copy_array("global_state", snapshot.global_state, (GLOBAL_DIM,))
-        _copy_array("previous_applied_action", snapshot.previous_applied_action,
-                    (self.controlled_count, 1))
-        _copy_array("policy_action", snapshot.policy_action,
-                    (self.controlled_count, 1))
-        _copy_array("applied_action", snapshot.applied_action,
-                    (self.controlled_count, 1))
+        _quantize_action(
+            "previous_applied_action",
+            snapshot.previous_applied_action,
+            (self.controlled_count, 1),
+        )
+        _quantize_action(
+            "policy_action",
+            snapshot.policy_action,
+            (self.controlled_count, 1),
+        )
+        _quantize_action(
+            "applied_action",
+            snapshot.applied_action,
+            (self.controlled_count, 1),
+        )
         _copy_array("reward", snapshot.reward, (self.controlled_count,))
         _copy_array("next_physical_local_state",
                     snapshot.next_physical_local_state,
-                    (self.physical_count, LOCAL_DIM))
+                    (self.physical_count, LOCAL_PHYSICAL_DIM))
         _copy_array("next_global_state", snapshot.next_global_state,
                     (GLOBAL_DIM,))
         _copy_array("next_previous_applied_action",
@@ -293,9 +414,104 @@ class ContextualStepReplayBuffer:
                 "next_previous_applied_action must equal applied_action"
             )
 
+    def _pack_physical(self, physical):
+        array = np.asarray(physical, dtype=np.float32)
+        static = np.ascontiguousarray(
+            array[:, STATIC_PHYSICAL_FEATURE_INDICES]
+        )
+        if not self._physical_static_initialized:
+            distance = np.asarray(
+                self.observation_builder.physical_distance_mm,
+                dtype=np.float64,
+            )
+            if distance.shape != (self.physical_count,):
+                raise ContextualReplayError(
+                    "physical_distance_mm shape mismatch: "
+                    f"actual={distance.shape}, "
+                    f"expected=({self.physical_count},)"
+                )
+            if not np.isfinite(distance).all() or (distance <= 0.0).any():
+                raise ContextualReplayError(
+                    "physical_distance_mm must be finite and positive"
+                )
+        else:
+            distance = self._physical_distance_mm
+            if not np.array_equal(self._physical_static, static):
+                raise ContextualReplayError(
+                    "static physical replay features changed after initialization"
+                )
+
+        uint8_values = _encode_integral_columns(
+            "uint8 physical",
+            array,
+            UINT8_PHYSICAL_FEATURE_INDICES,
+            np.uint8,
+        )
+        uint16_values = _encode_integral_columns(
+            "uint16 physical",
+            array,
+            UINT16_PHYSICAL_FEATURE_INDICES,
+            np.uint16,
+        )
+        occupancy = uint8_values[
+            :, STATE_COUNT_UINT8_POSITIONS
+        ].sum(axis=1, dtype=np.uint16)
+        if (occupancy > np.iinfo(np.uint8).max).any():
+            raise ContextualReplayError(
+                "sum of per-state OHT counts exceeds the one-byte rail "
+                "OhtList protocol range"
+            )
+        stopped_count = uint8_values[:, -1].astype(np.uint16)
+        if (stopped_count > occupancy).any():
+            raise ContextualReplayError(
+                "stopped_oht_count exceeds total per-state OHT count"
+            )
+        stop_time_sum = uint16_values[:, -1].astype(np.uint32)
+        if (stop_time_sum > occupancy.astype(np.uint32) * 255).any():
+            raise ContextualReplayError(
+                "stop_time_sum exceeds the one-byte StopTime protocol bound"
+            )
+        density = (
+            occupancy.astype(np.float64)
+            / (distance / 1_000.0)
+        ).astype(np.float32)
+        if not np.array_equal(density, array[:, 4]):
+            error = float(np.max(np.abs(density - array[:, 4]), initial=0.0))
+            raise ContextualReplayError(
+                "oht_density cannot be reconstructed bit-exactly from OHT "
+                f"state counts and rail Distance: max_abs_error={error}"
+            )
+        if not self._physical_static_initialized:
+            self._physical_static[:] = static
+            self._physical_distance_mm[:] = distance
+            self._physical_static_initialized = True
+        return uint8_values, uint16_values
+
+    def _materialize_physical(self, state_slots, physical_rows):
+        uint8_values = self._physical_uint8[state_slots, physical_rows]
+        uint16_values = self._physical_uint16[state_slots, physical_rows]
+        result = np.empty(
+            uint8_values.shape[:-1] + (LOCAL_PHYSICAL_DIM,),
+            dtype=np.float32,
+        )
+        result[..., STATIC_PHYSICAL_FEATURE_INDICES] = (
+            self._physical_static[physical_rows]
+        )
+        result[..., UINT8_PHYSICAL_FEATURE_INDICES] = uint8_values
+        result[..., UINT16_PHYSICAL_FEATURE_INDICES] = uint16_values
+        occupancy = uint8_values[
+            ..., STATE_COUNT_UINT8_POSITIONS
+        ].sum(axis=-1, dtype=np.uint16)
+        distance = self._physical_distance_mm[physical_rows]
+        result[..., 4] = (
+            occupancy.astype(np.float64) / (distance / 1_000.0)
+        ).astype(np.float32)
+        return result
+
     def _store_state(
-        self, key, physical, global_state, previous_applied_action
+        self, key, physical, global_state
     ) -> tuple[int, int]:
+        physical_uint8, physical_uint16 = self._pack_physical(physical)
         existing = self._key_to_state.get(key)
         if existing is not None:
             slot, generation = existing
@@ -304,12 +520,13 @@ class ContextualStepReplayBuffer:
                 and self._state_generation[slot] == generation
             ):
                 if not (
-                    np.array_equal(self._physical[slot], physical)
-                    and np.array_equal(self._global[slot], global_state)
-                    and np.array_equal(
-                        self._previous_applied_action[slot],
-                        np.asarray(previous_applied_action).reshape(-1),
+                    np.array_equal(
+                        self._physical_uint8[slot], physical_uint8
                     )
+                    and np.array_equal(
+                        self._physical_uint16[slot], physical_uint16
+                    )
+                    and np.array_equal(self._global[slot], global_state)
                 ):
                     raise ContextualReplayError(
                         "same episode/env step has different raw state"
@@ -322,11 +539,9 @@ class ContextualStepReplayBuffer:
         if old_key is not None and self._key_to_state.get(old_key, (None,))[0] == slot:
             self._key_to_state.pop(old_key, None)
         generation = int(self._state_generation[slot]) + 1
-        self._physical[slot] = physical
+        self._physical_uint8[slot] = physical_uint8
+        self._physical_uint16[slot] = physical_uint16
         self._global[slot] = global_state
-        self._previous_applied_action[slot] = np.asarray(
-            previous_applied_action, dtype=np.float32
-        ).reshape(-1)
         self._state_generation[slot] = generation
         self._state_valid[slot] = True
         self._state_keys[slot] = key
@@ -378,17 +593,53 @@ class ContextualStepReplayBuffer:
         if state_key[0] != next_key[0]:
             self.episode_crossing_count += 1
             raise ContextualReplayError("episode-crossing snapshot")
-        self._episode_first_step.setdefault(state_key[0], state_key[1])
+        existing = self._key_to_transition.get(state_key)
+        if existing is not None:
+            existing_slot, existing_generation = existing
+            if (
+                self._transition_valid[existing_slot]
+                and self._transition_generation[existing_slot]
+                == existing_generation
+            ):
+                raise ContextualReplayError(
+                    "duplicate live transition key: "
+                    f"episode_id={state_key[0]}, env_step={state_key[1]}"
+                )
+            self._key_to_transition.pop(state_key, None)
+        previous_action_stored = _quantize_action(
+            "previous_applied_action",
+            snapshot.previous_applied_action,
+            (self.controlled_count, 1),
+        )[:, 0]
+        policy_action_stored = _quantize_action(
+            "policy_action",
+            snapshot.policy_action,
+            (self.controlled_count, 1),
+        )[:, 0]
+        applied_action_stored = _quantize_action(
+            "applied_action",
+            snapshot.applied_action,
+            (self.controlled_count, 1),
+        )[:, 0]
+        prior_transition = self._transition_reference(
+            state_key[0], state_key[1] - 1
+        )
+        if prior_transition is not None and not np.array_equal(
+            previous_action_stored,
+            self._applied_action[prior_transition[0]],
+        ):
+            raise ContextualReplayError(
+                "contiguous transition previous_applied_action differs from "
+                "the prior transition applied_action after fixed-point encoding"
+            )
         state_slot, state_gen = self._store_state(
             state_key,
             snapshot.physical_local_state,
             snapshot.global_state,
-            snapshot.previous_applied_action,
         )
         next_slot, next_gen = self._store_state(
             next_key, snapshot.next_physical_local_state,
             snapshot.next_global_state,
-            snapshot.next_previous_applied_action,
         )
 
         slot = self._transition_cursor
@@ -400,9 +651,21 @@ class ContextualStepReplayBuffer:
                 current = self._key_to_transition.get(old_key)
                 if current is not None and current[0] == slot:
                     self._key_to_transition.pop(old_key, None)
+                old_episode = int(old_key[0])
+                remaining = (
+                    self._episode_transition_counts.get(old_episode, 1) - 1
+                )
+                if remaining > 0:
+                    self._episode_transition_counts[old_episode] = remaining
+                else:
+                    self._episode_transition_counts.pop(old_episode, None)
+                    if old_episode != state_key[0]:
+                        self._episode_first_step.pop(old_episode, None)
         generation = int(self._transition_generation[slot]) + 1
-        self._policy_action[slot] = snapshot.policy_action[:, 0]
-        self._applied_action[slot] = snapshot.applied_action[:, 0]
+        self._episode_first_step.setdefault(state_key[0], state_key[1])
+        self._previous_applied_action[slot] = previous_action_stored
+        self._policy_action[slot] = policy_action_stored
+        self._applied_action[slot] = applied_action_stored
         self._reward[slot] = snapshot.reward
         self._done[slot] = float(snapshot.done)
         self._env_step[slot] = snapshot.env_step
@@ -414,16 +677,23 @@ class ContextualStepReplayBuffer:
         self._transition_valid[slot] = True
         self._transition_keys[slot] = state_key
         self._key_to_transition[state_key] = (slot, generation)
+        self._episode_transition_counts[state_key[0]] = (
+            self._episode_transition_counts.get(state_key[0], 0) + 1
+        )
         if self.lap_enabled:
-            self._priority[slot].fill(self.max_priority)
+            stored_priority = np.float16(self.max_priority)
+            self._priority[slot].fill(stored_priority)
+            stored_priority_float = float(stored_priority)
             self._priority_sum[slot] = (
-                self.max_priority * self.controlled_count
+                stored_priority_float * self.controlled_count
             )
             self._priority_sq_sum[slot] = (
-                self.max_priority * self.max_priority * self.controlled_count
+                stored_priority_float
+                * stored_priority_float
+                * self.controlled_count
             )
-            self._priority_min[slot] = self.max_priority
-            self._priority_max[slot] = self.max_priority
+            self._priority_min[slot] = stored_priority
+            self._priority_max[slot] = stored_priority
         self.push_count += 1
         return ReplaySampleKey(slot, generation, 0)
 
@@ -544,10 +814,21 @@ class ContextualStepReplayBuffer:
         values = np.asarray(priorities, dtype=np.float64).reshape(-1)
         if values.shape != (len(sample_keys),) or not np.isfinite(values).all():
             raise ContextualReplayError("priorities must be finite [sample keys]")
-        values = np.maximum(
-            np.power(np.maximum(values, 0.0), self.lap_alpha),
-            self.lap_min_priority,
-        ).astype(np.float32)
+        with np.errstate(over="ignore", invalid="ignore"):
+            values = np.maximum(
+                np.power(np.maximum(values, 0.0), self.lap_alpha),
+                self.lap_min_priority,
+            )
+        if (
+            not np.isfinite(values).all()
+            or (values > LAP_PRIORITY_MAX).any()
+        ):
+            actual_max = float(values.max(initial=0.0))
+            raise ContextualReplayError(
+                "LAP priority exceeds finite float16 replay storage: "
+                f"max={actual_max}, allowed_max={LAP_PRIORITY_MAX}"
+            )
+        stored_values = values.astype(np.float16)
         slots = np.fromiter(
             (key.step_slot for key in sample_keys),
             dtype=np.int64,
@@ -565,10 +846,10 @@ class ContextualStepReplayBuffer:
         positions = len(flat) - 1 - reverse_positions
         slots = slots[positions]
         rows = rows[positions]
-        values = values[positions]
+        stored_values = stored_values[positions]
         old = self._priority[slots, rows].astype(np.float64)
-        values64 = values.astype(np.float64)
-        self._priority[slots, rows] = values
+        values64 = stored_values.astype(np.float64)
+        self._priority[slots, rows] = stored_values
         np.add.at(self._priority_sum, slots, values64 - old)
         np.add.at(
             self._priority_sq_sum,
@@ -766,12 +1047,25 @@ class ContextualStepReplayBuffer:
         batch_count = int(transition_slots.size)
         state_global_raw = self._global[state_slots]
         next_global_raw = self._global[next_slots]
-        previous_applied_action = self._previous_applied_action[
-            state_slots, controlled_rows[:, None]
-        ].astype(np.float32, copy=True)
-        next_previous_applied_action = self._previous_applied_action[
-            next_slots, controlled_rows[:, None]
-        ].astype(np.float32, copy=True)
+        action_rows = controlled_rows[:, None]
+        previous_applied_action = _decode_action(
+            self._previous_applied_action[action_slots, action_rows]
+        )
+        next_previous_applied_action = np.empty_like(
+            previous_applied_action
+        )
+        # The immediate next state's previous action is this transition's
+        # applied action. Older stacked next states have their own transition-
+        # aligned previous-action record (including episode-start padding).
+        next_previous_applied_action[:, 0] = _decode_action(
+            self._applied_action[action_slots[:, 0], controlled_rows]
+        )
+        if self.num_stacks > 1:
+            next_previous_applied_action[:, 1:] = _decode_action(
+                self._previous_applied_action[
+                    next_action_slots[:, 1:], action_rows
+                ]
+            )
         global_norm = self._readonly_normalize(
             self.observation_builder.global_normalizer,
             state_global_raw.reshape(-1, GLOBAL_DIM), "replay_state_global"
@@ -783,53 +1077,64 @@ class ContextualStepReplayBuffer:
         center_rows = self._center_rows[controlled_rows]
         incoming_rows = self._incoming_rows[controlled_rows]
         outgoing_rows = self._outgoing_rows[controlled_rows]
-        current_center_raw = self._physical[
+        center_rail_index = np.broadcast_to(
+            center_rows[:, None], (batch_count, self.num_stacks)
+        )
+        incoming_rail_indices = np.broadcast_to(
+            incoming_rows[:, None, :],
+            (batch_count, self.num_stacks, incoming_rows.shape[1]),
+        )
+        outgoing_rail_indices = np.broadcast_to(
+            outgoing_rows[:, None, :],
+            (batch_count, self.num_stacks, outgoing_rows.shape[1]),
+        )
+        current_center_raw = self._materialize_physical(
             state_slots, center_rows[:, None]
-        ]
-        current_incoming_raw = self._physical[
+        )
+        current_incoming_raw = self._materialize_physical(
             state_slots[:, :, None], incoming_rows[:, None, :]
-        ]
-        current_outgoing_raw = self._physical[
+        )
+        current_outgoing_raw = self._materialize_physical(
             state_slots[:, :, None], outgoing_rows[:, None, :]
-        ]
-        next_center_raw = self._physical[
+        )
+        next_center_raw = self._materialize_physical(
             next_slots, center_rows[:, None]
-        ]
-        next_incoming_raw = self._physical[
+        )
+        next_incoming_raw = self._materialize_physical(
             next_slots[:, :, None], incoming_rows[:, None, :]
-        ]
-        next_outgoing_raw = self._physical[
+        )
+        next_outgoing_raw = self._materialize_physical(
             next_slots[:, :, None], outgoing_rows[:, None, :]
-        ]
+        )
         local_normalizer = self.observation_builder.local_normalizer
         center = self._readonly_normalize(
             local_normalizer,
-            current_center_raw.reshape(-1, LOCAL_DIM),
+            current_center_raw.reshape(-1, LOCAL_PHYSICAL_DIM),
             "replay_center_local",
-        ).reshape(batch_count, self.num_stacks, LOCAL_DIM)
+        ).reshape(batch_count, self.num_stacks, LOCAL_PHYSICAL_DIM)
         incoming = self._readonly_normalize(
             local_normalizer,
-            current_incoming_raw.reshape(-1, LOCAL_DIM),
+            current_incoming_raw.reshape(-1, LOCAL_PHYSICAL_DIM),
             "replay_incoming_local",
         ).reshape(current_incoming_raw.shape)
         outgoing = self._readonly_normalize(
             local_normalizer,
-            current_outgoing_raw.reshape(-1, LOCAL_DIM),
+            current_outgoing_raw.reshape(-1, LOCAL_PHYSICAL_DIM),
             "replay_outgoing_local",
         ).reshape(current_outgoing_raw.shape)
         next_center = self._readonly_normalize(
             local_normalizer,
-            next_center_raw.reshape(-1, LOCAL_DIM),
+            next_center_raw.reshape(-1, LOCAL_PHYSICAL_DIM),
             "replay_next_center_local",
-        ).reshape(batch_count, self.num_stacks, LOCAL_DIM)
+        ).reshape(batch_count, self.num_stacks, LOCAL_PHYSICAL_DIM)
         next_incoming = self._readonly_normalize(
             local_normalizer,
-            next_incoming_raw.reshape(-1, LOCAL_DIM),
+            next_incoming_raw.reshape(-1, LOCAL_PHYSICAL_DIM),
             "replay_next_incoming_local",
         ).reshape(next_incoming_raw.shape)
         next_outgoing = self._readonly_normalize(
             local_normalizer,
-            next_outgoing_raw.reshape(-1, LOCAL_DIM),
+            next_outgoing_raw.reshape(-1, LOCAL_PHYSICAL_DIM),
             "replay_next_outgoing_local",
         ).reshape(next_outgoing_raw.shape)
 
@@ -850,16 +1155,15 @@ class ContextualStepReplayBuffer:
 
         safe_action_slots = np.maximum(action_slots, 0)
         safe_next_action_slots = np.maximum(next_action_slots, 0)
-        action_rows = controlled_rows[:, None]
-        policy_action = self._policy_action[
-            safe_action_slots, action_rows
-        ].astype(np.float32, copy=True)
-        applied_action = self._applied_action[
-            safe_action_slots, action_rows
-        ].astype(np.float32, copy=True)
-        next_applied_action = self._applied_action[
-            safe_next_action_slots, action_rows
-        ].astype(np.float32, copy=True)
+        policy_action = _decode_action(
+            self._policy_action[safe_action_slots, action_rows]
+        )
+        applied_action = _decode_action(
+            self._applied_action[safe_action_slots, action_rows]
+        )
+        next_applied_action = _decode_action(
+            self._applied_action[safe_next_action_slots, action_rows]
+        )
         policy_action[action_slots < 0] = 0.0
         applied_action[action_slots < 0] = 0.0
         next_applied_action[next_action_slots < 0] = 0.0
@@ -868,6 +1172,9 @@ class ContextualStepReplayBuffer:
             center = center[:, 0]
             incoming = incoming[:, 0]
             outgoing = outgoing[:, 0]
+            center_rail_index = center_rail_index[:, 0]
+            incoming_rail_indices = incoming_rail_indices[:, 0]
+            outgoing_rail_indices = outgoing_rail_indices[:, 0]
             incoming_relation = incoming_relation[:, 0]
             outgoing_relation = outgoing_relation[:, 0]
             global_norm = global_norm[:, 0]
@@ -895,6 +1202,9 @@ class ContextualStepReplayBuffer:
             "center_local": center,
             "incoming_local": incoming,
             "outgoing_local": outgoing,
+            "center_rail_index": center_rail_index,
+            "incoming_rail_indices": incoming_rail_indices,
+            "outgoing_rail_indices": outgoing_rail_indices,
             "incoming_relation": incoming_relation,
             "outgoing_relation": outgoing_relation,
             "global_state": global_norm,
@@ -922,7 +1232,14 @@ class ContextualStepReplayBuffer:
         target = torch.device(device)
         tensors = {}
         for name, values in arrays.items():
-            if name in {"controlled_rail_id", "env_step", "episode_id"}:
+            if name in {
+                "center_rail_index",
+                "incoming_rail_indices",
+                "outgoing_rail_indices",
+                "controlled_rail_id",
+                "env_step",
+                "episode_id",
+            }:
                 array = np.array(
                     values, dtype=np.int64, order="C", copy=True
                 )
@@ -973,17 +1290,30 @@ class ContextualStepReplayBuffer:
         capacity_env_steps: int,
         physical_count: int = 4_999,
         controlled_count: int = 4_996,
+        neighbor_count: int = 15,
         lap_enabled: bool = False,
     ) -> int:
         c = int(capacity_env_steps)
-        state = (2 * c) * (
-            physical_count * LOCAL_DIM + GLOBAL_DIM + controlled_count
-        ) * 4
-        vectors = c * controlled_count * 3 * 4
+        state_capacity = 2 * c
+        packed_physical_bytes = (
+            len(UINT8_PHYSICAL_FEATURE_INDICES)
+            + 2 * len(UINT16_PHYSICAL_FEATURE_INDICES)
+        )
+        static_physical = physical_count * (
+            len(STATIC_PHYSICAL_FEATURE_INDICES) * 4 + 8
+        )
+        state = state_capacity * (
+            physical_count * packed_physical_bytes + GLOBAL_DIM * 4
+        ) + static_physical
+        # Previous, deterministic policy, and applied actions use signed
+        # int16 fixed point. Reward remains float32.
+        vectors = c * controlled_count * (3 * 2 + 4)
         metadata = c * (7 * 8 + 4 + 1) + (2 * c) * (8 + 1)
-        static_mapping = controlled_count * (1 + 2 * 10) * 8
+        static_mapping = controlled_count * (
+            1 + 2 * int(neighbor_count)
+        ) * 8
         priority = (
-            c * controlled_count * 4 + c * (2 * 8 + 2 * 4)
+            c * controlled_count * 2 + c * (2 * 8 + 2 * 2)
             if lap_enabled else 0
         )
         return int(state + vectors + metadata + static_mapping + priority)
@@ -1022,9 +1352,25 @@ class ContextualStepReplayBuffer:
             "replay/storage_bytes": float(self.storage_bytes),
             "replay/estimated_capacity_bytes": float(
                 self.estimate_capacity_bytes(
-                    self.capacity, self.physical_count, self.controlled_count
-                    , self.lap_enabled
+                    self.capacity,
+                    self.physical_count,
+                    self.controlled_count,
+                    neighbor_count=self.neighbor_count,
+                    lap_enabled=self.lap_enabled,
                 )
+            ),
+            "replay/storage_physical_bytes_per_rail_state": float(
+                len(UINT8_PHYSICAL_FEATURE_INDICES)
+                + 2 * len(UINT16_PHYSICAL_FEATURE_INDICES)
+            ),
+            "replay/storage_action_fixed_point_scale": float(
+                ACTION_FIXED_POINT_SCALE
+            ),
+            "replay/storage_action_max_abs_error": float(
+                ACTION_FIXED_POINT_MAX_ABS_ERROR
+            ),
+            "replay/storage_lap_priority_bytes": float(
+                np.dtype(np.float16).itemsize if self.lap_enabled else 0
             ),
             "lap/enabled": float(self.lap_enabled),
             "lap/stale_update_reject_count": float(

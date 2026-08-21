@@ -4,7 +4,7 @@
 
 ```python
 EXP_META = {
-    'version':        'v2.0.0',     # oht_routing/version.py의 단일 버전
+    'version':        'v3.1.0',     # oht_routing/version.py의 단일 버전
     'cost_structure': 'b_rl',       # 'b_rl' | 'residual' | 'direct'
     'action_range':   '0.5-1.5',    # 문자열로 명시
     'reward_version': 'N',          # 현재 고정 reward profile
@@ -26,7 +26,7 @@ run_{MMDD_HHMM}_{version}_{cost_structure}_{action_range}_{reward_version}_{note
 ## 변경 기록 규칙
 
 - 프로젝트 버전은 `PythonCode/oht_routing/version.py`의
-  `CONTEXTUAL_VERSION` 하나만 사용한다. 현재 버전은 `v2.0.0`이다.
+  `CONTEXTUAL_VERSION` 하나만 사용한다. 현재 버전은 `v3.1.0`이다.
 - 모든 코드·실험 변경은 `vMAJOR.MINOR.PATCH` 버전으로
   분리하고 `EXPERIMENTS_v2.md`에 해당 버전과 함께 기록한다.
 - MAJOR: 기존 checkpoint와 호환되지 않는 network, topology mapping,
