@@ -3,6 +3,8 @@ import time
 import numpy as np
 import torch
 
+from .numerics import NumericalIntegrityError, assert_finite_arrays
+
 
 class RegionReplayBuffer:
     def __init__(self, capacity, device="cpu", prioritized=True, min_priority=1.0, lap_alpha=0.4):
@@ -26,6 +28,7 @@ class RegionReplayBuffer:
         self.max_priority = 1.0
         self.position = 0
         self.size = 0
+        self.ind = None
 
     def push(self, rail_feat, action, reward, next_rail_feat, done, mask, next_mask, context, next_context):
         rail_feat = np.asarray(rail_feat, dtype=np.float32)
@@ -47,6 +50,20 @@ class RegionReplayBuffer:
             raise ValueError("next_rail/next_mask lengths must match")
         if len(next_rail_feat) == 0:
             raise ValueError("empty next region transition is not allowed")
+
+        assert_finite_arrays(
+            "replay/push",
+            (
+                ("rail_feat", rail_feat),
+                ("action", action),
+                ("reward", np.asarray(reward, dtype=np.float32)),
+                ("next_rail_feat", next_rail_feat),
+                ("done", np.asarray(done, dtype=np.float32)),
+                ("context", context),
+                ("next_context", next_context),
+            ),
+            context=f"position={self.position}, buffer_size={self.size}",
+        )
 
         self.storage[self.position] = {
             "rail_feat": rail_feat.copy(),
@@ -70,11 +87,18 @@ class RegionReplayBuffer:
         batch_size = int(batch_size)
         if self.prioritized:
             p = self.priority[: self.size].astype(np.float64)
+            assert_finite_arrays(
+                "replay/sample_priority",
+                (("priority", p),),
+                context=f"buffer_size={self.size}",
+            )
             total = p.sum()
-            if total <= 0.0 or not np.isfinite(total):
-                probs = None
-            else:
-                probs = p / total
+            if total <= 0.0:
+                raise NumericalIntegrityError(
+                    f"[replay/sample_priority] non-positive priority sum={total} "
+                    f"| buffer_size={self.size}"
+                )
+            probs = p / total
             self.ind = np.random.choice(self.size, size=batch_size, replace=True, p=probs)
         else:
             self.ind = np.random.randint(0, self.size, size=batch_size)
@@ -111,6 +135,25 @@ class RegionReplayBuffer:
             reward[b, 0] = item["reward"]
             done[b, 0] = item["done"]
 
+        assert_finite_arrays(
+            "replay/sample_batch",
+            (
+                ("rail_feat", rail),
+                ("action", action),
+                ("reward", reward),
+                ("next_rail_feat", next_rail),
+                ("done", done),
+                ("context", context),
+                ("next_context", next_context),
+            ),
+            context=f"sample_indices={self.ind[:8].tolist()}",
+        )
+        if not bool(mask.any(axis=1).all()) or not bool(next_mask.any(axis=1).all()):
+            raise NumericalIntegrityError(
+                "[replay/sample_batch] sampled transition has no valid tokens "
+                f"| sample_indices={self.ind[:8].tolist()}"
+            )
+
         device = self.device
         out = {
             "rail_feat": torch.as_tensor(rail, dtype=torch.float32, device=device),
@@ -136,11 +179,50 @@ class RegionReplayBuffer:
         if self.ind is None:
             return
         p = np.asarray(priority.detach().cpu().reshape(-1), dtype=np.float32)
+        assert_finite_arrays(
+            "replay/update_priority",
+            (("priority", p),),
+            context=f"sample_indices={self.ind[:8].tolist()}",
+        )
         p = np.maximum(p, self.min_priority) ** self.lap_alpha
         self.priority[self.ind] = p
         if len(p):
             self.max_priority = max(self.max_priority, float(np.max(p)))
 
+    def diagnostic_priority_snapshot(self):
+        """Return replay priorities and the exact probabilities of the last sample."""
+        active = self.priority[: self.size].astype(np.float32, copy=True)
+        result = {
+            "active_priority": active,
+            "max_priority": float(self.max_priority),
+        }
+        if self.ind is None:
+            return result
+
+        indices = np.asarray(self.ind, dtype=np.int64).copy()
+        sampled = active[indices]
+        total = float(active.astype(np.float64).sum())
+        probabilities = (
+            sampled.astype(np.float64) / total
+            if total > 0.0
+            else np.full(sampled.shape, np.nan, dtype=np.float64)
+        )
+        result.update(
+            {
+                "sample_indices": indices,
+                "sample_priority": sampled,
+                "sample_probability": probabilities,
+                "priority_sum_float64": total,
+            }
+        )
+        return result
+
     def reset_max_priority(self):
         if self.size > 0:
-            self.max_priority = float(np.max(self.priority[: self.size]))
+            active = self.priority[: self.size]
+            assert_finite_arrays(
+                "replay/reset_max_priority",
+                (("priority", active),),
+                context=f"buffer_size={self.size}",
+            )
+            self.max_priority = float(np.max(active))

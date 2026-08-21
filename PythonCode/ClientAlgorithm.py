@@ -16,6 +16,27 @@ from torch.nn.modules.module import T
 
 import wandb
 
+EXP_META = {
+    "cost_structure": "b_rl",
+    "action_range": "0.5-1.5",
+    "reward_version": "K",
+    "centering": False,
+    "note": "obs14_0704rew",
+    "description": (
+        "[ablation] obs_dim 18→14 + 0704 reward 재현. "
+        "step_reward = alpha*g + (1-alpha)*l - rail_tat, alpha=0.7. "
+        "목적: obs 구조 변경(18→14)이 성능에 미치는 영향 단독 측정 (reward는 ozl3xyft와 동일)."
+    ),
+}
+
+
+def _make_run_name(exp_meta):
+    stamp = datetime.now().strftime("%m%d_%H%M")
+    return (
+        f"run_{stamp}_{exp_meta['cost_structure']}_"
+        f"{exp_meta['action_range']}_{exp_meta['reward_version']}_{exp_meta['note']}"
+    )
+
 
 def train_config():
     base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -38,8 +59,8 @@ def train_config():
         "activation_fc": "relu",
         "save_model": True,
         "save_dir": "./checkpoints/",
-        "resume": False,  # 전달본 기본: 처음부터 학습. 이어 학습하려면 True로 바꾸고 아래 경로 지정.
-        "resume_ckpt_dir": "./checkpoints/td7_final",  # (예시) resume=True일 때 불러올 체크포인트 경로 (첨부된 최종 TD7 모델)
+        "resume": True,  # 전달본 기본: 처음부터 학습. 이어 학습하려면 True로 바꾸고 아래 경로 지정.
+        "resume_ckpt_dir": "./checkpoints/20260708-211736/checkpoint_12",  # (예시) resume=True일 때 불러올 체크포인트 경로 (첨부된 최종 TD7 모델)
         "model_checkpoint_freq": 10000,
         "eval_db_dir": results_dir,
         "warmup_episodes": 2,
@@ -76,12 +97,12 @@ def train_config():
             "backlog": 0.01,  # get_global_reward 내 backlog term 가중치
             "smooth": 0.5,    # 액션 스무딩 페널티
             "rail_tat": 1.0,  # step_reward 내 rail_tat_penalty 가중치
-            "global_alpha": 0.3, # step_reward 내 global(g) 가중치
-            "local_alpha": 0.0,     # step_reward 내 local(l) 가중치
+            "global_alpha": 0.7,  # step_reward 내 global(g) 가중치 (= reward_alpha)
+            "local_alpha": 0.3,   # step_reward 내 local(l) 가중치 (= 1 - reward_alpha)
         },
         "reward_components": {
-            "use_global_reward": True,   # g를 step_reward에 포함 (dense signal)
-            "use_local_reward": False,   # l을 step_reward에 포함
+            "use_global_reward": True,   # g를 step_reward에 포함
+            "use_local_reward": True,    # l을 step_reward에 포함
             "use_rail_tat": True,        # rail_tat_penalty를 step_reward에 포함
             "global": {
                 "use_tat": True,         # global 내 marginal TAT term
@@ -185,8 +206,10 @@ class ClientAlgorithm:
     def __init__(self):
         print("ClientAlgorithm 시작")
 
-        # obs = 10 global (job 3개 추가) + 8 rail = 18
-        self.obs_dim = 18
+        # obs = 6 global + 8 rail = 14
+        # global: TotalTat, OpRate, n_queued, n_waiting, n_transferring, mean_reassign
+        # rail:   oht_count, idle_oht, predicted_oht, paramDw, paramC, dist/vel, port, diverge
+        self.obs_dim = 14
         self.act_dim = 1
         self.action_bound = [-1.0, 1.0]
 
@@ -256,10 +279,13 @@ class ClientAlgorithm:
 
         self.wandb_ok = False
         try:
+            wandb_config = dict(self.config)
+            wandb_config["exp_meta"] = dict(EXP_META)
             wandb.init(
                 project="oht-routing-rl",
-                config=self.config,
-                name=f"run_{datetime.now().strftime('%m%d_%H%M')}",
+                config=wandb_config,
+                name=_make_run_name(EXP_META),
+                notes=EXP_META.get("description", ""),
                 resume="allow",
                 mode=os.environ.get("WANDB_MODE", "online"),
             )
@@ -375,29 +401,32 @@ class ClientAlgorithm:
         if not jobs:
             return {
                 "queued": queued,
+                "n_queued": 0.0,
+                "n_waiting": 0.0,
+                "n_transferring": 0.0,
                 "mean_wait_pri": 0.0,
                 "mean_reassign": 0.0,
-                "sum_wait_pri": 0.0,
-                "sum_reassign": 0.0,
             }
+        reassign = [max(0.0, float(getattr(j, "ReAssignCount", 0) or 0)) for j in jobs]
+        states = [getattr(j, "State", 0) for j in jobs]
         wait_pri = [
             max(0.0, float(getattr(j, "Priority", 0) or 0))
             for j in jobs
             if getattr(j, "State", 0) in (1, 3)
         ]
-        reassign = [max(0.0, float(getattr(j, "ReAssignCount", 0) or 0)) for j in jobs]
         return {
             "queued": queued,
+            "n_queued":      float(states.count(1)),  # QUEUED: 미할당
+            "n_waiting":     float(states.count(3)),  # WAITING: 할당됐으나 OHT 대기 중
+            "n_transferring":float(states.count(5)),  # TRANSFERRING: 이송 중
             "mean_wait_pri": float(np.mean(wait_pri)) if wait_pri else 0.0,
             "mean_reassign": float(np.mean(reassign)) if reassign else 0.0,
-            "sum_wait_pri": float(np.sum(wait_pri)) if wait_pri else 0.0,
-            "sum_reassign": float(np.sum(reassign)) if reassign else 0.0,
         }
 
     def _job_pressure(self, pclient):
         """우선순위-가중 대기 + 재할당 churn. 클수록 나쁨. delta로 사용."""
         s = self._job_stats(pclient)
-        return 0.1 * s["mean_wait_pri"] + 1.0 * s["mean_reassign"]
+        return 1.0 * s["mean_reassign"]
 
     # ============================================================
     # Raw observation (정규화 전)
@@ -406,42 +435,34 @@ class ClientAlgorithm:
         sorted_rail_ids = sorted(pclient.RAILLINE_DIC.keys())
         raw_obs_list = []
 
-        oht_all = list(pclient.OHT_DIC.values())
-        oht_states_list = [o.State for o in oht_all]
-
         js = self._job_stats(pclient)
 
+        # global 6: 시스템 수준 지표 (모든 레일에 동일하게 제공)
+        # OHT 상태별 수는 레일 피처로 이동 — 아래 rail_features 참고
         global_features = [
-            # --- 글로벌 시스템 지표 ---
-            float(pclient.TotalTat),  # 전체 평균 TAT
-            float(pclient.TotalOhtOperationRate),  # 전체 OHT 가동률 (낮을수록 좋음)
-            # --- 글로벌 OHT 상태 분포 ---
-            float(oht_states_list.count(0)),  # IDLE
-            float(oht_states_list.count(2)),  # MOVE_TO_LOAD
-            float(oht_states_list.count(3)),  # LOADING
-            float(oht_states_list.count(4)),  # MOVE_TO_UNLOAD
-            float(oht_states_list.count(5)),  # UNLOADING
-            # --- 글로벌 Job 상태 (새 시뮬레이터 추가 정보) ---
-            float(js["queued"]),  # 미할당 Job 수 (backlog)
-            float(js["mean_wait_pri"]),  # 대기 Job 평균 우선순위
-            float(js["mean_reassign"]),  # 활성 Job 평균 재할당 횟수
+            float(pclient.TotalTat),               # 전체 평균 TAT
+            float(pclient.TotalOhtOperationRate),   # 전체 가동률
+            float(js["n_queued"]),                  # 미할당 Job 수 (State=1)
+            float(js["n_waiting"]),                 # OHT 대기 중 Job 수 (State=3)
+            float(js["n_transferring"]),            # 이송 중 Job 수 (State=5)
+            float(js["mean_reassign"]),             # 평균 재할당 횟수 (경로 불안정성)
         ]
 
         for rail_id in sorted_rail_ids:
             rail = pclient.RAILLINE_DIC[rail_id]
 
+            # rail 8: 레일별 동적 혼잡도 + 토폴로지
             rail_features = [
-                # --- 레일 혼잡도 (동적) ---
-                float(rail.PredictedOHTCount),  # 진입 예정 OHT
-                float(self.parameterDw.get(rail_id, 1)),  # 과거 지연 가중치
-                float(self.parameterC.get(rail_id, 0)),  # 미래 OHT 수
-                # --- 레일 물리 속성 (고정) ---
-                float(rail.DistancePerVelocity),  # 빈 레일 통과 시간
-                float(rail.Distance),  # 레일 길이
-                # --- 레일 구조 정보 (고정) ---
-                float(rail.PortCount),  # Port 수
-                float(rail.DivergingLineCount),  # 분기 Line 수
-                float(rail.Level2JoiningLineCount),  # 합류 Line 수
+                # --- 동적: 현재 혼잡도 ---
+                float(len(rail.OhtList)),             # 현재 OHT 수 (직접 혼잡도)
+                float(rail.IdleOHTCount),             # 유휴(blocking) OHT 수
+                float(rail.PredictedOHTCount),        # 진입 예정 OHT (단기, 시뮬 제공)
+                float(self.parameterDw.get(rail_id, 1)),  # 과거 지연 가중치 (EMA)
+                float(self.parameterC.get(rail_id, 0)),   # 경로상 미래 OHT 수 (중기)
+                # --- 고정: 토폴로지 ---
+                float(rail.DistancePerVelocity),      # 통과 시간
+                float(rail.PortCount),                # 용량
+                float(rail.DivergingLineCount),       # 분기 수
             ]
             raw_obs_list.append(
                 np.array(global_features + rail_features, dtype=np.float32)
@@ -833,6 +854,10 @@ class ClientAlgorithm:
     def Algorithm(self, pclient):
         try:
             self._algorithm_impl(pclient)
+        except FloatingPointError:
+            # Numerical corruption is fatal: do not reconnect and continue with
+            # a partially updated learner or a poisoned replay buffer.
+            raise
         except Exception as e:
             # /loop 안정성: 한 step의 예외가 전체 학습을 죽이지 않도록 방어.
             import traceback
@@ -1050,14 +1075,16 @@ class ClientAlgorithm:
                                 else 0.0
                             ),
                             "curriculum/action_scale": float(self._action_scale()),
-                            "system/tat": float(pclient.TotalTat),
-                            "system/op_rate": float(pclient.TotalOhtOperationRate),
-                            "system/queued_jobs": float(pclient.QueuedCommandCount),
-                            "system/completed": float(
+                            "global/tat": float(pclient.TotalTat),
+                            "global/op_rate": float(pclient.TotalOhtOperationRate),
+                            "global/queued_jobs": float(pclient.QueuedCommandCount),
+                            "global/completed": float(
                                 getattr(pclient, "CompletedCommandCount", 0)
                             ),
-                            # Job 지표 (새 정보)
-                            "job/mean_wait_priority": js["mean_wait_pri"],
+                            # Job 지표
+                            "job/n_queued": js["n_queued"],
+                            "job/n_waiting": js["n_waiting"],
+                            "job/n_transferring": js["n_transferring"],
                             "job/mean_reassign": js["mean_reassign"],
                             "job/queued": js["queued"],
                             "oht/idle_count": float(oht_states_list.count(0)),

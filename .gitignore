@@ -6,6 +6,7 @@
 
 # PythonCode 디렉토리만 추적
 !/PythonCode/
+!/contextual_topology_cache.npz
 
 # ── PythonCode 내 런타임 산출물 ─────────────────────────────────
 __pycache__/
@@ -15,6 +16,7 @@ __pycache__/
 
 PythonCode/log/
 PythonCode/checkpoints/
+PythonCode/results/
 PythonCode/wandb/
 PythonCode/*.db
 PythonCode/*.log

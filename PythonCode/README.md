@@ -1,280 +1,483 @@
-# OHT 라우팅 강화학습 (Dynamic Link Weight Control)
+# Contextual TD7 for OHT Routing
 
-반도체 FAB의 OHT(천장 반송차, Overhead Hoist Transport) 혼잡을 완화하기 위한
-**강화학습(RL) 기반 동적 링크 가중치 제어** 코드입니다.
+반도체 FAB OHT의 rail cost를 학습해 혼잡 구간을 우회시키는 contextual TD7 구현입니다.
+기본 학습 구성은 **Directional Context Encoder + TD7 + SALE + LAP**입니다.
 
-매 의사결정 시점에 RL 에이전트가 각 RailLine의 **cost(가중치)** 를 산출하고,
-시뮬레이터는 이 cost를 반영한 최단경로(Dijkstra) 라우팅으로 OHT를 운행합니다.
-가중치를 동적으로 조정해 혼잡 구간을 우회시키는 것이 목표이며,
-핵심 성능지표는 **평균 TAT(반송 소요시간)** 입니다.
+## 핵심 구조
 
----
+- 제어 단위: boundary를 제외한 rail 4,996개
+- 관측: center rail, incoming 10개, outgoing 10개, global state
+- Actor 출력: rail별 raw action `a ∈ [-1, 1]`
+- Critic/SALE 입력: 실제 환경에 적용된 `applied_action`
+- Replay: 한 simulator step을 snapshot으로 저장하고 rail 단위로 sampling
+- TCP: Python server가 simulator와 state/cost를 교환
 
-## 1. 시스템 구성
+주요 파일:
 
-```
- ┌─────────────────────────┐         TCP (127.0.0.1:9100)        ┌──────────────────────────┐
- │  Python (본 코드)        │  ◀───────────────────────────────▶ │  Pinokio.Simulator.exe   │
- │  = TCP 서버              │   상태(state) / cost(action) 교환    │  = TCP 클라이언트 (GUI)  │
- │  main.py / PClient /     │                                     │  (별도 제공)             │
- │  ClientAlgorithm(RL)     │                                     │                          │
- └─────────────────────────┘                                     └──────────────────────────┘
-```
-
-- **Python 쪽이 TCP 서버**입니다. 먼저 `main.py`를 실행해 서버를 띄운 뒤,
-  시뮬레이터(GUI)에서 Python 연동을 켜고 **Run** 하면 시뮬레이터가 클라이언트로 접속합니다.
-- 시뮬레이터는 매 스텝 명령코드 `v`를 보내고, Python은 `v` 종류에 따라 상태를 수신하거나
-  행동(RailLine cost)을 응답합니다(아래 §3 프로토콜 참고).
-- 시뮬레이터 실행파일/모델 DB는 본 코드 패키지에 포함되지 않습니다(별도 전달).
-
----
-
-## 2. 파일 구조
-
-```
-PythonCode/
-├── main.py                     # 진입점. TCP 서버 루프 + v-code 분기 + 재접속 회복
-├── PClient.py                  # 시뮬레이터 통신 계층(바이너리 프로토콜 송수신/파싱)
-├── ClientAlgorithm.py          # per-rail TD7 본체(상태·행동·보상 설계, 학습 루프)
-├── ClientAlgorithm_region.py   # region-token TD7 (ClientAlgorithm 상속, 어텐션 기반)
-├── ClientAlgorithm_0704.py     # 참조용 — global+local 보상 전부 사용, 현재 최고 성능 기록
-├── eval.py                     # 결과 DB(COMMAND_LOG) 기반 성능평가(TAT/가동률/반송건수)
-├── requirements.txt            # 파이썬 의존 패키지
-│
-├── cocel_rl/                   # RL 라이브러리(알고리즘·버퍼·학습기·로거)
-│   ├── algorithms/
-│   │   ├── td3/                #   TD3 구현
-│   │   ├── td7/                #   TD7 구현
-│   │   └── token_td7/          #   Token-TD7 (리전·레일 어텐션 기반 확장 아키텍처)
-│   ├── buffers/                #   off-policy 리플레이 버퍼
-│   ├── core/                   #   learner(학습 루프), logger
-│   ├── configs/                #   알고리즘 하이퍼파라미터(YAML)
-│   └── utils/
-│
-└── (시뮬레이터 데이터 모델 — PClient가 수신 데이터를 담는 클래스)
-    ├── RailLine.py             # 레일 라인 정보(거리/속도/분기·합류 등)
-    ├── RailLineCost.py         # 라인별 cost(= RL 행동이 채우는 출력값)
-    ├── Oht.py                  # OHT 상태(위치/적재/목적지/정체시간 등)
-    ├── Job.py                  # 반송 작업(상태/우선순위/경로 등)
-    ├── LinePassTime.py         # 라인 통과시간
-    ├── ohtLinePassTime.py      # OHT별 라인 통과시간
-    ├── ohtPos.py               # OHT 위치
-    └── OHTCommandTime.py       # 명령 수행 시간
+```text
+main_contextual.py              실행 및 TCP loop
+ClientAlgorithm_contextual.py   action, reward, replay, 학습 runtime
+contextual_*.py                 topology, observation, action, reward, W&B
+cocel_rl/algorithms/contextual_td7/
+                                encoder, actor, critic, SALE, LAP, checkpoint
+tests/                          contextual 회귀 테스트
 ```
 
-> 학습을 새로 실행하면 `checkpoints/<타임스탬프>/`(모델),
-> `reward_log.csv`(스텝별 보상 로그), `log/`(통신 로그)가 추가로 생성됩니다.
+## Action 계약
 
----
+기본값은 `region_b_rl`입니다.
 
-## 3. 통신 프로토콜 (명령코드 `v`)
-
-시뮬레이터가 매 스텝 보내는 `v` 값에 따라 Python이 처리합니다 (`main.py`).
-
-| `v` | 의미 | Python 처리 |
-|----|------------------------|--------------------------------------------------|
-| 0 | ActiveData (상태→행동) | 상태 수신 → **RL이 RailLine별 cost 산출** → 전송 |
-| 1 | 에피소드 종료 | 종료 신호 기록(루프 계속) |
-| 2 | 재시작(Reset) | 에피소드 상태 초기화 |
-| 3 | Snapshot | 스냅샷 데이터 수신·갱신 |
-| 4 | 단일 OHT 경로 요청 | 해당 OHT 경로 계산 후 응답 |
-| 5 | Reroute | 재라우팅 대상 OHT 경로 재계산 후 응답 |
-| 6 | Assign | 작업 할당 처리 후 응답 |
-
-> **스트림 동기화(desync) 회복**: 위 집합(`{0..6}`) 밖의 `v`가 오면 TCP 스트림 정렬이
-> 깨진 것으로 보고, 가비지를 파싱하지 않고 소켓을 닫은 뒤 재접속해 회복합니다.
-> 재접속해도 학습 상태(리플레이 버퍼/네트워크)는 유지됩니다(`client`는 루프 밖에서 1회 생성).
-
-바이너리 프로토콜(빅엔디언, 가변길이 블록)의 인코딩/디코딩은 모두 `PClient.py`에 있습니다.
-
----
-
-## 4. 강화학습 설계
-
-### 4-1. per-rail TD7 (`ClientAlgorithm.py`)
-
-| 항목 | 내용 |
-|------|------|
-| **상태 (obs, 18차원)** | 글로벌 10 (혼잡/가동률/작업 통계 등) + RailLine 8 |
-| **행동 (act)** | RailLine별 cost 스케일 1차원, 범위 `[-1, 1]` (중립=Dijkstra 기본 가중치) |
-| **알고리즘** | `TD7`(기본) 또는 `TD3` — `train_config()`에서 선택 |
-| **보상** | `reward_components` config로 항별 on/off 제어 (§4-3 참고) |
-| **워밍업/커리큘럼** | 초기 `warmup_steps` 동안 데이터 수집 후 RL 시작. 행동 스케일을 작게(≈Dijkstra) 출발해 점진 확대 |
-
-하이퍼파라미터는 모두 **`train_config()`** 한 곳에 모여 있습니다
-(학습률·버퍼·배치·`reward_weights`·`curriculum`·`reward_components`·알고리즘 설정 등).
-
-- **이어 학습(resume)**: 기본값은 `resume=False`. 이어가려면 `resume=True`, `resume_ckpt_dir` 지정.
-
-### 4-2. region-token TD7 (`ClientAlgorithm_region.py` + `cocel_rl/algorithms/token_td7/`)
-
-`ClientAlgorithm`을 상속한 확장 아키텍처. 레일 전체를 **인접 레일 기반 리전(region)** 으로 묶고,
-글로벌 컨텍스트와 리전 내 레일 토큰을 **교차 어텐션**으로 융합해 리전 단위 액션을 산출합니다.
-
-| 항목 | 내용 |
-|------|------|
-| **입력** | 글로벌 컨텍스트 10차원 + 레일 토큰 시퀀스 (레일 obs 18차원 × 레일 수) |
-| **어텐션** | `ContextConcatRailAttention` — 글로벌·레일 임베딩 concat → Q/K 프로젝션 → Multi-Head Attention |
-| **출력** | 리전별 1차원 액션 → 해당 리전 내 모든 레일에 동일 cost 적용 |
-| **리전 구성** | `region.target_size=50` (레일 수 기준), 인접 레일 클러스터링 |
-| **설정** | `config["token_td7"]` — `embed_dim`, `num_heads` |
-
-> **상속 관계**: `get_step_reward`, `get_global_reward`, `get_local_reward` 등 보상 로직은
-> `ClientAlgorithm.py`에서 그대로 상속 → 부모 코드 수정이 region에도 자동 반영됨.
-
-### 4-3. 보상 설계 (`reward_components` config)
-
-`train_config()`의 `reward_components`로 각 보상 항을 코드 수정 없이 on/off 할 수 있습니다.
-
-```python
-"reward_components": {
-    "use_global_reward": True,   # 글로벌 TAT 밀도 신호 (w_tat_dense * g)
-    "use_local_reward":  False,  # 레일별 로컬 보상 (혼잡/대기/용량 등)
-    "use_rail_tat":      True,   # rail-level TAT 페널티 (primary signal)
-    "global": {
-        "use_tat":     True,
-        "use_op":      False,    # 가동률 항
-        "use_backlog": True,     # 적체 페널티
-    },
-    "local": {
-        "use_oht_count":  True,
-        "use_predicted":  True,
-        "use_stop":       True,
-        "use_idle":       True,
-        "use_capacity":   True,
-    },
-}
+```text
+policy_action      = actor(state)
+exploratory_action = clip(policy_action + noise, -1, 1)
+applied_action     = curriculum_scale × exploratory_action
+b_rl               = 0.5 + 0.5 × applied_action
+cost               = base + w × c × b_rl
 ```
 
-| reward_version | 설명 | `use_global` | `use_local` | `use_rail_tat` |
-|:-:|---|:-:|:-:|:-:|
-| **–** (0704, 최고 성능) | global + local 전부 사용 | ✅ | ✅ | – |
-| **I** | rail_tat_penalty 단독 | ❌ | ❌ | ✅ |
-| **J** | rail_tat + dense global 보조 | ✅ | ❌ | ✅ |
+- warm-up: `applied_action=0`, `b_rl=0.5`
+- step 10,000부터 scale `0.05`
+- step 40,000까지 geometric 방식으로 scale `1.0` 도달
+- `c=0`인 rail은 action에 의해 cost가 변하지 않음
 
----
+기존 residual 방식은 ablation으로 유지합니다.
 
-## 5. 실행 방법
-
-### 5-1. 의존성 설치
-```bash
-pip install -r requirements.txt
-```
-> `torch`는 환경(CUDA 유무)에 맞는 빌드를 설치하세요. GPU가 없으면 자동으로 CPU로 동작합니다.
-
-### 5-2. 학습
-
-**per-rail TD7** (기본)
-```bash
-set PYTHONUTF8=1
-set WANDB_MODE=offline        # wandb 미사용/오프라인 (online 쓰려면 생략)
-python -u main.py
+```powershell
+--action-mode exp_residual --action-scale 0.05
 ```
 
-**region-token TD7** (`--region` 플래그)
-```bash
-set PYTHONUTF8=1
-set WANDB_MODE=offline
-python -u main.py --region
+## 학습 실행
+
+저장소 루트에서:
+
+```powershell
+conda activate aicc
+
+python .\PythonCode\main_contextual.py `
+  --mode training `
+  --action-enabled `
+  --reward-version E `
+  --action-mode region_b_rl `
+  --sale `
+  --lap `
+  --critic-loss-mode auto `
+  --seed 0 `
+  --exploration-noise-std 0.10 `
+  --exploration-noise-final-std 0.02 `
+  --exploration-noise-anneal-steps 100000 `
+  --exploration-noise-clip 0.20 `
+  --warmup-steps 10000 `
+  --terminate-on-warmup-complete `
+  --normalizer-freeze-steps 10000 `
+  --save-state-normalizer .\normalizers\contextual_state_e_seed0.npz `
+  --save-reward-normalizer `
+  --reward-diagnostic-dir .\diagnostics\reward_e_fixedscale1 `
+  --curriculum-end-step 20000 `
+  --curriculum-scale-start 1.0 `
+  --curriculum-scale-end 1.0 `
+  --curriculum-shape geometric `
+  --smooth-b-rl-weight 0.05 `
+  --minimum-replay-env-steps 100 `
+  --minimum-action-enabled-env-steps 100 `
+  --replay-capacity-env-steps 100000 `
+  --batch-size 1024 `
+  --updates-per-env-step 1 `
+  --learn-every-env-steps 1 `
+  --sim-end-time 45000 `
+  --tat-termination-policy episode2_tat180 `
+  --wandb `
+  --smoke-report .\contextual_reward_e_fixedscale1_seed0.json `
+  --checkpoint-root .\checkpoints\contextual_reward_e_fixedscale1_seed0
 ```
 
-`--region`을 붙이면 `main.py`가 `ClientAlgorithm_region`을 로드해
-리전 어텐션 아키텍처로 실행됩니다. 플래그 없이 실행하면 per-rail TD7이 기본입니다.
+### Reusing only the state normalizer
 
-실행 후 시뮬레이터(GUI)에서 모델 DB를 열고 Python TCP 연동을 켠 뒤 **Run**.
-학습이 진행되며 `checkpoints/<타임스탬프>/`에 모델이 주기적으로 저장됩니다.
+The collection run above atomically saves the local/global observation
+normalizer once both statistics reach `--normalizer-freeze-steps` and freeze.
+At the next terminal observation after the 10,000 warm-up transitions, the
+runtime sends `SendIsEnd(1)`, stores the final warm-up reward transition, and
+forces a latest checkpoint. The actor is not evaluated on that boundary tick;
+after the simulator reset, policy control starts in the next clean episode.
+For a later run with a fresh actor, critic, replay, and checkpoint, replace the
+state save option and the automatic reward save option with:
 
-### 5-3. 평가
-시뮬레이션 결과 DB(`COMMAND_LOG` 테이블 포함)에 대해 TAT/가동률/반송건수를 산출합니다.
-```bash
-python eval.py --save_dir <결과DB 폴더> --db_filename <파일명.db>
+```powershell
+--load-state-normalizer .\normalizers\contextual_state_e_seed0.npz
+--load-reward-normalizer
 ```
-- 평가 구간/기준값(baseline)은 `eval.py` 상단 상수에 정의되어 있습니다.
-  - 평가 윈도우: `09:00 ~ 19:00`
-  - baseline: TAT `2.90706`분, 가동률 `0.79292`, 반송건수 `175299` (Dijkstra 기준)
-- 개선율은 `(baseline − 신규) / baseline` 으로 출력됩니다.
 
----
+A successful load automatically changes the effective action warm-up from the
+configured `10000` to `0`; do not also pass `--warmup-steps 0`. Loading is
+also an exact bypass of the warm-up episode boundary, so it does not force an
+extra reset before first-episode policy control. Loading is
+fail-fast unless the observation version, local/global/relation feature names
+and order, dimensions, topology hash, mapping hash, epsilon, clip, and frozen
+state all match. This restores observation/state statistics only. It does not
+restore actor/critic weights, replay, checkpoints, or Reward E's separate
+reward normalizers; `--load-reward-normalizer` restores those separately.
+The replay-size and action-enabled-transition gates still
+apply before the first learner update. With the current `episode2_tat180`
+policy, a loaded state normalizer also changes the effective TAT-termination
+start to episode 1; a collection run without a loaded snapshot retains the
+episode-1 exemption and starts TAT termination from episode 2.
 
-## 6. 실험 로드맵 (TODO)
+`--save-reward-normalizer` with no path atomically saves both Reward E local
+and global normalizers in one file under `.\normalizers`. The generated name
+contains the reward version, exact reward-profile fingerprint, topology and
+mapping hashes, and seed. The console prints the resolved path. An explicit
+path is also accepted:
 
-### ✅ 완료
+```powershell
+--save-reward-normalizer .\normalizers\reward_e_seed0.npz
+```
 
-- [x] **TD7 per-rail — global + local reward 전부 사용** (`ClientAlgorithm_0704.py`)
-  - 현재 최고 성능. TAT 평균 **+1.0% 개선**, 최대 ep4 **+1.34%**
-  - global: TAT marginal + backlog penalty / local: oht_count, predicted, stop, idle, capacity
-- [x] **reward_components config 추가** — 보상 항 코드 수정 없이 on/off
-- [x] **region-token TD7 초기 학습 진행** (`ClientAlgorithm_region.py`)
-  - 리전 단위 어텐션 아키텍처 동작 확인, 학습 진행 중
+Use `--load-reward-normalizer` with no path to resolve the same automatic
+filename, or pass the explicit saved path. Loading rejects snapshots unless
+the snapshot format, reward/contract/TAT/normalization versions, every reward
+term and coefficient, enabled local/global normalizers, epsilon/clipping,
+topology, mapping, populated counts, and frozen state all match. State and
+reward normalizer loads are standalone from actor, critic, replay, and
+checkpoint state. For a true zero-warm-up fresh-agent run, load both state and
+reward snapshots.
 
----
+The Reward I predecessor uses the fixed-scale contextual reward directly, so
+its reward normalizers are inactive even though the generic snapshot CLI is
+available. Observation/state
+normalization is unchanged. `--reward-diagnostic-dir` is optional; when it is
+omitted, no Reward I JSONL records or free-flow occurrence diagnostics are
+created. The default diagnostic windows are
+`0:1000,10000:11000,20000:21000` and can be overridden with
+`--reward-diagnostic-windows`.
 
-### 🔲 진행 예정
+Its fixed reward for controlled rail `i` is
+`0.5 * global_raw + 0.5 * (local_raw / 3) - clip(100 * rail_tat_raw, -0.5, 0.5) - 0.25 * abs(delta_b_rl)`.
 
-#### 보상 ablation (per-rail TD7 기반)
+## Reward J Phase 1: free-flow neutral-2 rail reward
 
-- [ ] **reward_version J 검증** — rail_tat_penalty + w_tat_dense × g (actor gradient vanishing 방지)
-  - reward_version I(rail_tat only)에서 NaN explosion 재현됨 → dense signal 추가로 해결 여부 확인
-- [ ] **local reward 제거 효과 확인** — `use_local_reward=False` 단독 실험
-- [ ] **global reward 항별 제거** — `use_op=False` (가동률), `use_backlog=False` (적체) 효과 분리
-- [ ] **최소 보상 조합 탐색** — rail_tat + 가장 기여도 높은 항만 남기는 ablation 완성
+Reward J replaces only the rail term with
+`2.0 - route_time / route_free_flow_time`. A ratio below 2 is rewarded, 2 is
+neutral, and a ratio above 2 is penalized. Phase 1 uses `rail_tat_weight=1.0`
+and per-rail clipping to `[-1.0, 1.0]`.
+The global raw, local `/3`, idle-off, and `0.25 * abs(delta_b_rl)` terms from
+Reward I are unchanged.
 
-#### 아키텍처 실험
+No offline baseline calibration or reference file is required. The neutral
+ratio can be overridden with `--rail-free-flow-neutral-ratio`, but defaults to
+`2.0`. Existing Reward I checkpoints and replay are incompatible with Reward J.
 
-- [ ] **region-token TD7 충분한 학습 및 per-rail 대비 성능 비교**
-  - 리전 어텐션이 per-rail 대비 TAT 개선에 실제 기여하는지 확인
-- [ ] **region-token TD7 + reward_version J 조합**
+## Reward K Phase 2 provisional first run
 
-#### 기타
+The first balanced-scale run keeps `tat_reference=174.4236`, neutral ratio
+`2.0`, both global/local alpha values at `0.5`, and smooth weight at `0.25`.
+Its provisional coefficients are `tat_weight=18.4`,
+`backlog_weight=0.0005`, `local_predicted_oht_weight=0.10`,
+`local_reward_scale=2.0`, `rail_tat_weight=50.0`, and
+`rail_tat_clip=1.0`. These are first-run values, not validated calibration
+results. W&B and optional reward JSONL record representative global, local,
+active-rail scales, good/bad reward signs, clipping, and Q-mean deltas for the
+next calibration pass. Reward I/J checkpoints and replay are incompatible.
 
-- [ ] `use_state_normalizer=False` 효과 확인 (관측 정규화 제거)
-- [ ] 하이퍼파라미터 튜닝 (embed_dim, num_heads, buffer_capacity for region)
+## Reward Q: Reward N pressure ablation without idle reserve
 
----
+Reward Q preserves the reward function used by W&B run `9qokskqq`: the global
+TAT raw term is the one-sided, unbounded
+`-11 * max(0, TotalTat - 160) / 165`, with no `tat_raw_clip`. For
+`B_t = Queued_t + Waiting_t`, its global raw reward is
+`tat_raw + 4*(0.8-OP) - 0.0008*B_t`
+`- 0.24*clip(max(0, B_t-B_{t-300})/30, 0, 1)`. The idle-reserve term is
+disabled with `idle_reserve_weight=0.0`; global alpha remains `0.5`.
 
-## 7. 성능 평가 결과 (현재 최고 — per-rail TD7, global + local reward)
+The ablation uses `local_predicted_oht_weight=0.10`, `rail_tat_weight=40`,
+`rail_tat_clip=1`, local divisor `2`, and smooth weight `0.25`. It restores the
+actual `9qokskqq` termination configuration: 10,000-step episode grace,
+`TotalTat >= 200` for 300 consecutive steps, then one replayed terminal
+penalty of `-20`. Reward Q requires fresh critic, target critic, replay, and
+reward-version state.
 
-- **wandb run**: `ozl3xyft`
-- **설정**: per-rail TD7, `reward_alpha=0.7`, global reward (TAT marginal + backlog) + local reward 전부 사용
-- **평가 방법**: `eval.py` — 결과 DB(`COMMAND_LOG`)에서 TAT·가동률·반송건수 산출
-- **평가 파일**: `eval_summary_ep_0629_all.db.csv`
+## Reward R: backlog pressure rebalance
 
-**Baseline (Dijkstra)**: TAT **2.9071분 (174.4초)** / 반송건수 **175,299** / 가동률 **0.793**
+Reward R keeps Reward Q's actor, critic, SALE, replay, TAT/OP terms,
+termination contract, parameterDw episode reset, and all learner
+hyperparameters. It changes only `backlog_weight=0.0008 -> 0.008` and
+`backlog_growth_weight=0.24 -> 0.16`. Its global raw backlog terms are therefore
+`-0.008*B_t - 0.16*clip(max(0, B_t-B_{t-300})/30, 0, 1)` before the unchanged
+global alpha `0.5`. Reward Q checkpoints, replay, and reward-normalizer state
+are incompatible; start Reward R fresh.
 
-> ep1은 워밍업(반송건수 미달, 미완성 에피소드), ep2~21은 sub-episode(시뮬 재시작 전 단편)로 평가 제외.  
-> ep22부터 반송건수 175,299건의 풀에피소드.
+## Reward S: Reward-E structure with signed TotalTat
 
-| 에피소드 | TAT (분) | TAT (초) | TAT 개선율 | 가동률 | 반송건수 |
-|:--:|:--:|:--:|:--:|:--:|:--:|
-| ep22 | 2.9216 | 175.3 | -0.50% | 0.796 | 175,299 |
-| ep23 | 2.9421 | 176.5 | -1.21% | 0.795 | 175,285 |
-| ep24 | 2.8620 | 171.7 | +1.55% | 0.781 | 175,299 |
-| ep25 | 2.8740 | 172.4 | +1.14% | 0.783 | 175,299 |
-| ep26 | 2.8495 | 171.0 | +1.98% | 0.778 | 175,299 |
-| ep27 | 2.8625 | 171.8 | +1.53% | 0.781 | 175,299 |
-| ep28 | 2.8726 | 172.4 | +1.18% | 0.784 | 175,300 |
-| ep29 | 2.8589 | 171.5 | +1.66% | 0.781 | 175,299 |
-| ep30 | 2.8340 | 170.0 | +2.51% | 0.775 | 175,298 |
-| ep31 | 2.8444 | 170.7 | +2.16% | 0.777 | 175,300 |
-| ep32 | 2.8438 | 170.6 | +2.17% | 0.777 | 175,298 |
-| **ep33** | **2.8249** | **169.5** | **+2.83%** | 0.773 | 175,299 |
-| ep34 | 2.8283 | 169.7 | +2.71% | 0.773 | 175,297 |
-| ep35 | 2.8277 | 169.7 | +2.73% | 0.773 | 175,298 |
-| ep36 | 2.8274 | 169.6 | +2.74% | 0.773 | 175,299 |
+Reward S (`contextual_controlled_reward_v21_e_structure_signed_total_tat`)
+restores Reward E's training-wide normalize-before-update global/local reward
+structure. Its raw global reward is
+`9.2*(165-TotalTat)/165 - 0.01*(Waiting+Queued)`; this TAT signal is signed,
+unclipped, and independent of completion-count or previous-TAT state. OP,
+idle-reserve, backlog-growth, and marginal-TAT reward terms are disabled.
 
-**요약**
+The local raw reward is
+`-(0.3*OHT + 0.2*PredictedOHT + 0.3*Stop + 0.1*Idle + 0.1*Capacity)`.
+There is no fixed local divisor. The final per-rail reward is
+`0.5*Norm(global_raw) + 0.5*Norm(local_raw) + rail_reward - smooth_penalty`.
+Rail reward uses Reward E's fixed-TAT, actual-elapsed-time attribution with
+weight `1`, and b_rl smoothing uses weight `0.05`. Reward normalizers freeze
+after 30,000 reward steps and persist across episode reset; observation
+normalizers retain their separate lifecycle. Start with fresh checkpoint,
+replay, and reward-normalizer state.
 
-- **최고 성능: ep33, TAT 2.8249분 (169.5초), +2.83% 개선**
-- 수렴 구간(ep30~36): TAT **169.5 ~ 170.7초**, 개선율 **+2.16% ~ +2.83%** 안정
-- 반송건수 175,299건 유지 — 처리량 동일, 소요시간만 단축
-- 가동률 0.773~0.784 (baseline 0.793 대비 -1.1%p) — 혼잡 구간 우회 중 일부 구간 공차 증가에 따른 자연스러운 트레이드오프
+## Reward T: global-normalization ablation
 
----
+Reward T (`contextual_controlled_reward_v22_global_raw_local_running_norm`)
+removes the global running normalizer while retaining Reward S's local,
+rail-reward, and smoothing paths. The final global component is exactly
+`0.5*(2.3*(165-TotalTat)/165 - 0.0025*(Waiting+Queued))`. When
+`TotalTat <= 0`, the TAT subterm is zero and only the backlog subterm remains.
 
-## 8. 참고
+The local raw reward remains
+`-(0.3*OHT + 0.2*PredictedOHT + 0.3*Stop + 0.1*Idle + 0.1*Capacity)` and still
+uses normalize-before-update running statistics with the 30,000-step freeze.
+W&B records coefficient-applied rail-wise subterm magnitude and dispersion as
+`local/{oht,pred,stop,idle,capacity}_{abs_mean,std}`. Reward T requires a fresh
+checkpoint, replay, and reward-normalizer state.
 
-- **인코딩**: Windows(cp949) 콘솔에서의 한글/이모지 출력 오류를 막기 위해 `main.py`가
-  stdout/stderr를 UTF-8로 재설정합니다. 실행 시 `PYTHONUTF8=1` 사용을 권장합니다.
-- **도메인 enum**
-  - OHT 상태: `0`=IDLE, `1`=STAGE, `2`=MOVE_TO_LOAD, `3`=LOADING, `4`=MOVE_TO_UNLOAD, `5`=UNLOADING
-  - Job 상태: `1`=QUEUED, `2`=RESERVED, `3`=WAITING, `5`=TRANSFERRING, `7`=COMPLETED
+Reward T's W&B budget applies `global_alpha` before comparing terms. It logs
+`reward/contribution/{tat,backlog,local}_abs` and computes
+`reward/budget/{tat,backlog,local,rail,smooth}_share` from the five magnitudes
+that enter the final reward. Variance/covariance shares are intentionally not
+included in this schema.
+
+## Reward U: actual completion-CmdTat ablation
+
+Reward U (`contextual_controlled_reward_v23_completion_tat_global_raw_local_running_norm`)
+changes only Reward T's TAT signal. On each reward tick it consumes each newly
+completed command once and computes
+`completion_raw = mean((165-CmdTat)/165)`, or zero when no command completed.
+The global component is
+`0.5*(2.3*completion_raw - 0.0025*(Waiting+Queued))`. `TotalTat` remains an
+environment/termination diagnostic and is not used to calculate this reward.
+
+Completion is detected at the existing OHT `UNLOADING -> IDLE/new-cycle`
+boundary. Its value comes from `PClient.OHT_DIC[*].CmdCompleteTat[*].CmdTat`;
+`OHTTat` is never substituted. Episode-local command-ID deduplication is reset
+between episodes, while the local running normalizer retains Reward T's
+training-wide normalize-before-update and 30,000-step freeze contract. Global
+normalization remains off, and local, rail, smooth, learner, replay, action,
+dispatch, and termination behavior are unchanged.
+
+For W&B inspection, each episode automatically selects the first valid command
+found in `CmdCompleteTat` and keeps that command ID fixed until completion.
+`trace/command/{cmd_tat,oht_tat,oht_id,oht_state,available,completed}` follows
+the command even if it moves to another OHT. The completion tick retains the
+last valid TAT values with `completed=1`; later ticks omit the trace until the
+next episode selects a new command.
+
+## Selecting historical Reward E through U
+
+All named reward contracts and their complete parameter profiles are managed
+in `contextual_reward_version_cfg.py`. Add or revise a reward version there;
+`contextual_reward.py` contains the generic immutable config schema and reward
+calculation/runtime state only. Existing imports from `contextual_reward` are
+re-exported for compatibility.
+
+The current CLI experiment defaults to `E` and accepts these unique locked
+reward profiles:
+
+`E`, `F_RAMP`, `F_NO_RAMP`, `G`, `H`, `I`, `J`, `K`, `L`, `M`, `N`,
+`O`, `P`, `Q`, `R`, `S_REBALANCE`, `S_EHYBRID`, `T`, and `U`.
+
+```powershell
+python .\PythonCode\main_contextual.py --reward-version E
+python .\PythonCode\main_contextual.py --reward-version F_RAMP
+python .\PythonCode\main_contextual.py --reward-version S_REBALANCE
+python .\PythonCode\main_contextual.py --reward-version T
+python .\PythonCode\main_contextual.py --reward-version U
+```
+
+This selects a complete locked profile, not only a TAT formula. The profile
+also selects global/local coefficients, local raw terms, backlog, rail and
+smooth rewards, global/local reward-normalizer enablement, normalization
+ordering/freeze, clipping, TAT confidence, and TAT termination/terminal
+penalty defaults for historical reproduction. Named runtime termination
+policies `episode2_tat175` and `episode2_tat180` override only the environment
+`done` condition; they do not change Reward E's formula. Select the current
+TAT-180 experiment with
+`--tat-termination-policy episode2_tat180`. Reward
+E-G restore the historical marginal-TAT EMA path; I through
+`S_REBALANCE` use fixed reward scale; `S_EHYBRID` restores both running reward
+normalizers; T keeps only the local normalizer; U uses newly completed
+commands' actual `CmdTat`. Replay, checkpoints, standalone reward-normalizer
+files, W&B metadata, and checkpoint directories carry the unique profile key
+and reject cross-profile state.
+
+Historical aliases are accepted: `F` resolves to `F_RAMP`, while `S` resolves
+to the later `S_EHYBRID`. Use `F_NO_RAMP` and `S_REBALANCE` explicitly for the
+other same-letter contracts. Hyphenated spellings such as `F-NO-RAMP` are also
+canonicalized.
+
+The older individual reward CLI knobs remain parseable for compatibility, but
+a value that differs from the selected named profile is rejected. A changed
+coefficient, termination, or normalization rule must be introduced as a new
+unique reward profile rather than reusing an existing identity.
+
+## Previous applied action input
+
+The decision-time state is action-augmented without mixing controller memory
+into the physical observation normalizer. For transition `t`, the actor uses
+`pi(observation_t, applied_action_(t-1))` and the critic uses
+`Q(observation_t, applied_action_(t-1), candidate_action_t)`. The critic keeps
+the traditional current candidate-action input; the previous action is state
+memory needed to evaluate the existing action-delta smoothing reward.
+
+For stacked input, every selected observation frame carries the simulator-
+applied action immediately preceding that frame. Thus a stack with offsets
+`[0, I, 2I]` pairs observations `[s_t, s_(t-I), s_(t-2I)]` with previous
+actions `[a_(t-1), a_(t-I-1), a_(t-2I-1)]`. The next state at `t+1` is paired
+with `a_t`. Episode reset starts with a zero previous action. This observation,
+network, replay, stack, and checkpoint contract requires a fresh run.
+
+실행 후 simulator GUI에서 Python 연동을 활성화하고 Run을 시작합니다.
+
+## Command 6 dispatch mode
+
+기본 배차는 기존과 동일한 first-match입니다.
+
+```powershell
+python .\PythonCode\main_contextual.py --dispatch-mode first-match
+```
+
+command 0에서 실제 적용한 rail cost의 pickup 경로 누적합이 가장 작은
+후보 OHT를 선택하려면:
+
+```powershell
+python .\PythonCode\main_contextual.py --dispatch-mode cost
+```
+
+두 모드 모두 기존 eligibility 조건과 `RouteList[:16]` 후보 범위를
+그대로 사용합니다.
+
+## Checkpoint와 재개
+
+기본 저장 위치:
+
+```text
+checkpoints/<algorithm_variant>_<action_version>/
+├─ latest/checkpoint.pt
+├─ periodic/step_*.pt
+└─ crash/checkpoint.pt
+```
+
+재개:
+
+```powershell
+--resume-checkpoint .\checkpoints\<variant>\latest\checkpoint.pt
+```
+
+- action/reward/network/config 버전이 정확히 같아야 로드됨
+- replay buffer는 checkpoint에 저장되지 않음
+- 재시작 후 로드한 policy로 replay를 다시 채운 뒤 학습 재개
+- `--batch-size`는 resume 시 안전하게 덮어쓸 수 있음
+- `--resume-inference-until-replay-full`을 주면 새 replay가
+  `--replay-capacity-env-steps`에 도달할 때까지 actor+exploration 추론과
+  transition 수집만 하고, 다음 tick부터 learner update를 재개함
+- `--resume-deterministic-first-episode`을 주면 첫 resume 에피소드는
+  action noise와 learner update 없이 deterministic actor로 끝까지 수집함.
+  해당 replay를 유지하고 다음 에피소드부터 저장된 exploration schedule과
+  learner update를 재개하며, 첫 에피소드가 100 env steps보다 짧으면 다음
+  에피소드에서 일반 minimum replay gate를 채운 뒤 학습함
+- full-refill 도중 프로세스를 재시작하면 replay는 저장되지 않으므로 다시
+  0부터 채워야 함
+- action mode 변경 시 기존 checkpoint 사용 금지
+- crash checkpoint는 진단용이며 재개 불가
+
+## Logging
+
+`--wandb` 사용 시 project `oht-routing-contextual-td7`에 기록합니다.
+
+- `action/*`, `b_rl/*`: policy, exploration, applied action
+- `reward/*`: global/local/TAT/smooth reward
+- `replay/*`, `learner/*`, `critic/*`: buffer와 학습 상태
+- `global/*`, `job/*`, `oht/*`: simulator 상태
+- `runtime/*`: observation, inference, update, send 시간
+
+run 이름과 config는 `contextual_wandb.py`의 `EXP_META`에서 생성됩니다.
+
+## Contextual twin-critic diagnostics
+
+`critic/q_abs_diff_mean` and `critic/q_abs_diff_max` are the mean and maximum
+absolute differences between Q1 and Q2 outputs for the current replay batch.
+`critic/q1_loss` and `critic/q2_loss` are the separate losses whose sum is
+`learner/critic_loss`. `critic/q1_grad_norm` and
+`critic/q2_grad_norm` are the finite, pre-clip L2 gradient norms of each
+Q-exclusive head.
+
+`critic/parameter_l2_distance` and
+`critic/parameter_max_abs_diff` compare corresponding trainable parameters in
+the Q1- and Q2-exclusive heads. They deliberately exclude the shared SALE
+state-action projection and the separately optimized contextual encoder.
+
+Actor metrics are stateful to avoid logging-interval/policy-delay aliasing.
+`learner/actor_updated_this_step` is the only current-step 0/1 flag.
+`learner/actor_loss_last`, `learner/actor_grad_norm_last`, and
+`learner/actor_last_update_step` retain the most recent real actor update, while
+`learner/actor_updates_total` is cumulative.
+
+## 테스트
+
+```powershell
+$env:PYTHONPATH="$PWD;$PWD\PythonCode;$PWD\PythonCode\tests"
+python -m unittest discover -s .\PythonCode\tests -p "test_contextual*.py"
+```
+
+현재 contextual 회귀 테스트: **157개**.
+
+
+## Ablation study
+
+```powershell
+
+#1 
+python .\PythonCode\main_contextual.py `
+  --mode training `
+  --action-enabled `
+  --no-lap `
+  --replay-buffer-rail `
+  --batch-size 1024 `
+  --wandb
+
+#2 
+python .\PythonCode\main_contextual.py `
+  --mode training `
+  --action-enabled `
+  --no-sale `
+  --replay-buffer-rail `
+  --batch-size 1024 `
+  --wandb
+
+#3 
+python .\PythonCode\main_contextual.py `
+  --mode training `
+  --action-enabled `
+  --no-sale `
+  --no-lap `
+  --replay-buffer-rail `
+  --batch-size 1024 `
+  --wandb
+
+#4
+python main_contextual.py \
+  --mode training \
+  --action-enabled \
+  --replay-buffer-snapshot  \
+  --batch-size 4 \
+  --no-lap \
+  --wandb
+
+python .\PythonCode\main_contextual.py `
+  --mode training `
+  --action-enabled `
+  --no-lap `
+  --replay-buffer-rail `
+  --batch-size 1024 `
+  --dispatch-mode cost `
+  --wandb
+
+
+```

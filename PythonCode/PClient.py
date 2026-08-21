@@ -53,8 +53,17 @@ class PClient:
        secData ={}
 
        episode_index = 0
-       def __init__(self, socket):
+
+       @staticmethod
+       def _store_oht_command_tat(oht, cmd_id, command_time):
+           """Preserve every active-command TAT entry in the current packet."""
+           oht.CmdCompleteTat[int(cmd_id)] = command_time
+
+       def __init__(self, socket, sim_end_time=45000):
            self.client_socket = socket
+           self.requested_end_time = int(sim_end_time)
+           if self.requested_end_time <= 0:
+               raise ValueError("sim_end_time must be positive")
            try:
                self.client_socket.settimeout(self.RECV_TIMEOUT)  # 무한 hang 진단용; 타임아웃시 RecieveMessage가 로그 후 계속 대기
            except Exception:
@@ -65,7 +74,8 @@ class PClient:
            self.SendStartPythonStartTime(0);
            self.SendDijkstraUpdateTime(1);
            self.SendReroutingUpdateTime(7);
-           self.SendEndTime(45000);
+           # This raw fixed-width field must occur exactly once here.
+           self.SendEndTime(self.requested_end_time);
            self.RecieveSetPara();
            self.file_path = datetime.now().strftime('%Y%m%d%H%M%S')  + self.file_path;
            self.file_path_TCP = datetime.now().strftime('%Y%m%d%H%M%S')  + self.file_path_TCP;
@@ -79,7 +89,8 @@ class PClient:
            self.SendStartPythonStartTime(0);
            self.SendDijkstraUpdateTime(1);
            self.SendReroutingUpdateTime(7);
-           self.SendEndTime(45000);
+           # The reset handshake also owns exactly one end-time field.
+           self.SendEndTime(self.requested_end_time);
            self.RecieveSetPara();
            return 2;
            
@@ -156,7 +167,7 @@ class PClient:
                file.write("\n")
        def RecieveSimulationSnapshotData(self):
           self.RecieveRailLineData();
-          # self.RecieveJobData();  # 새 시뮬은 스냅샷에 Job 데이터 안 보냄 (PythonCode_origin 참조)
+          self.RecieveJobData();
           self.RecieveOHTData();
 
        def SendIsEnd(self, isEnd):
@@ -548,11 +559,9 @@ class PClient:
                            oct.OHTWorkTimeByCommand = 0.0
                        
                        
-                       if  cmdID in self.OHT_DIC[id].CmdCompleteTat:
-                           a=0;
-                       else :
-                           self.OHT_DIC[id].CmdCompleteTat = {};
-                       self.OHT_DIC[id].CmdCompleteTat[cmdID] = oct
+                       self._store_oht_command_tat(
+                           self.OHT_DIC[id], cmdID, oct
+                       )
                        commandCount+=1;
  
                    ohtIndividualTatRaw = self.GetBase10Value_3(recieveMessage, railLineIndex)
@@ -739,6 +748,7 @@ class PClient:
            commandIndex += 3
 
            commandCount = self.CompletedCommandCount + self.TransferCommandCount + self.WaitingCommandCount + self.QueuedCommandCount
+           # print(f"[JobData] total={commandCount} completed={self.CompletedCommandCount} transfer={self.TransferCommandCount} waiting={self.WaitingCommandCount} queued={self.QueuedCommandCount}", flush=True)
 
            completedCommandCount = self.CompletedCommandCount  ;
            waitingTranferCommandCount = completedCommandCount + self.TransferCommandCount + self.WaitingCommandCount;
@@ -801,7 +811,7 @@ class PClient:
                  for i in range(running_area_type_cnt):
                      running_area_type = recieveMessage[commandIndex]
                      commandIndex += 1
-                     self.JOB_DIC[id].RunningAreaTyes.append(carrier_type)
+                     self.JOB_DIC[id].RunningAreaTyes.append(running_area_type)
 
                  self.JOB_DIC[id].ToNode = toNode
                  self.JOB_DIC[id].FromNode = fromNode
@@ -884,7 +894,7 @@ class PClient:
                  for i in range(running_area_type_cnt):
                      running_area_type = recieveMessage[commandIndex]
                      commandIndex += 1
-                     self.JOB_DIC[id].RunningAreaTyes.append(carrier_type)
+                     self.JOB_DIC[id].RunningAreaTyes.append(running_area_type)
                  cC += 1
 
                else:
@@ -945,7 +955,7 @@ class PClient:
                  for i in range(running_area_type_cnt):
                      running_area_type = recieveMessage[commandIndex]
                      commandIndex += 1
-                     self.JOB_DIC[id].RunningAreaTyes.append(carrier_type)
+                     self.JOB_DIC[id].RunningAreaTyes.append(running_area_type)
                  cC += 1
 
                else:
@@ -1189,13 +1199,17 @@ class PClient:
            count = 0
 
            while count < command_cnt:
-               if idx + 14 < self.BUFFER_SIZE :
-                   command_id = self.GetBase10Value_3(recieveMessage, idx)
-                   idx += 3
-                   if command_id == 0:
-                       recieveMessage = self.RecieveMessage(self.BUFFER_SIZE)
-                       idx = 0
-                       continue;
+               if idx + 14 >= len(recieveMessage):
+                   recieveMessage = self.RecieveMessage(self.BUFFER_SIZE)
+                   idx = 0
+                   continue
+
+               command_id = self.GetBase10Value_3(recieveMessage, idx)
+               idx += 3
+               if command_id == 0:
+                   recieveMessage = self.RecieveMessage(self.BUFFER_SIZE)
+                   idx = 0
+                   continue;
              
                from_node = self.GetBase10Value_2(recieveMessage, idx)
                idx += 2
@@ -1242,24 +1256,33 @@ class PClient:
                count += 1
            return job_list
 
-       def SendAssignOht(self, oht_dic):
+       def SendAssignOht(self, assignments):
            buffer = bytearray(self.BUFFER_SIZE)
            idx = 0
-           self.SetByteHexa_2Legnth(len(oht_dic.keys()),buffer, idx)
+           self.SetByteHexa_2Legnth(len(assignments),buffer, idx)
            idx += 2
 
-           for job_id, oht_id in oht_dic.items():
-               if idx + 5  + len(self.JOB_DIC[job_id].RouteList) * 2 + 2 >= self.BUFFER_SIZE:
+           for job_id, assignment in assignments.items():
+               if isinstance(assignment, dict):
+                   oht_id = assignment["oht_id"]
+                   route = list(assignment["pickup_path"])
+               else:
+                   # Legacy main.py still returns {job_id: oht_id}.
+                   oht_id = assignment
+                   route = list(self.JOB_DIC[job_id].RouteList)
+
+               if idx + 5 + len(route) * 2 + 2 >= self.BUFFER_SIZE:
                    self.SendMessage(buffer)
+                   buffer = bytearray(self.BUFFER_SIZE)
                    idx = 0
 
                self.SetByteHexa_3Legnth(job_id, buffer, idx)
                idx += 3
                self.SetByteHexa_2Legnth(oht_id, buffer, idx)
                idx += 2
-               self.SetByteHexa_2Legnth(len(self.JOB_DIC[job_id].RouteList), buffer, idx)
+               self.SetByteHexa_2Legnth(len(route), buffer, idx)
                idx += 2
-               for line_id in self.JOB_DIC[job_id].RouteList:
+               for line_id in route:
                    self.SetByteHexa_2Legnth(line_id, buffer, idx)
                    idx += 2
 
@@ -1437,9 +1460,14 @@ class PClient:
                     raise RuntimeError("RecieveMessage 180s 무응답 — desync 의심, 재접속 (마지막 v=" + str(self.LAST_V) + ")")
                 continue;
             if not data:
-                print("client disconnected");
-                print("received:",data);
-                break;
+                # recv()가 b''를 반환하면 peer가 연결을 정상 종료한 것이다.
+                # 부분/빈 버퍼를 이후 파서에 넘기면 IndexError로 원인이 가려지므로,
+                # 즉시 예외를 올려 main의 재접속 경로를 타게 한다.
+                got = bufferSize - rebufferSize
+                raise ConnectionError(
+                    "Socket peer disconnected while receiving "
+                    + str(bufferSize) + "B message (received " + str(got) + "B)"
+                )
 
             rebufferSize = rebufferSize -len(data)
             returnData =returnData + data ;

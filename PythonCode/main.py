@@ -162,12 +162,16 @@ def main():
                         traceback.print_exc()
                         is_connect = False
                         s.close();
-                    except ConnectionResetError as cre:
-                        pclient.WriteAdminLog("ConnectionResetError: The connection was forcibly terminated by the remote host.");
-                        print("ConnectionResetError: The connection was forcibly terminated by the remote host.")
+                    except ConnectionError as ce:
+                        pclient.WriteAdminLog("ConnectionError: Socket peer disconnected; reconnecting.");
+                        print("ConnectionError: Socket peer disconnected; reconnecting.")
                         traceback.print_exc()
                         is_connect = False
                         s.close();
+                    except FloatingPointError:
+                        # Fail closed on NaN/Inf. The surrounding `with s`
+                        # closes the socket while the exception leaves main().
+                        raise
                     except Exception as ex:
                         pclient.WriteAdminLog("Exception: The connection to the Socket server has been terminated.");
                         print("Exception: The connection to the Socket server has been terminated.")
@@ -175,6 +179,8 @@ def main():
                         is_connect = False
                         s.close();
 
+        except FloatingPointError:
+            raise
         except Exception as ex:
             print(datetime.now().strftime('%Y.%m.%d - %H:%M:%S'))
             print("while Exception.")
