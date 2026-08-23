@@ -1326,6 +1326,7 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
                 minimum_action_enabled_env_steps=2,
                 checkpoint_root=directory,
                 resume_checkpoint_path=str(checkpoint),
+                wandb_enabled=False,
                 sale_enabled=False,
                 lap_enabled=False,
             ))

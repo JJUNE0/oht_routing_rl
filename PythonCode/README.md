@@ -1,4 +1,4 @@
-# Contextual TD7 v2 for OHT routing
+# Contextual TD7 v3 for OHT routing
 
 ## Checkpoint actor evaluation
 
@@ -47,11 +47,8 @@ python .\PythonCode\main.py
 python .\PythonCode\main.py `
   --mode training `
   --action-enabled `
-  --reward-version N `
-  --replay-buffer-rail `
-  --batch-size 1024 `
-  --warmup-steps 10000 `
-  --wandb `
+  --no-lap `
+  --save-state-normalizer .\PythonCode\normalizers\contextual_v3_seed0.npz `
   --checkpoint-root .\PythonCode\checkpoints\ctx_td7_reward_n
 ```
 
@@ -61,6 +58,14 @@ python .\PythonCode\main.py `
 
 공식 진입점은 `main.py` 하나입니다. 삭제된 region-token 경로는 더 이상
 별도 wrapper나 진입점을 제공하지 않습니다.
+
+Runtime 기본값의 단일 원본은
+`oht_routing/runtime/config.py`의 `ContextualRuntimeConfig`입니다. CLI는
+사용자가 명시한 옵션만 override하며 별도의 기본값을 두지 않습니다.
+현재 region-B curriculum 기본은 geometric `0.05 -> 1.0`, global step
+20,000입니다. 따라서 위 명령에 curriculum 옵션을 반복할 필요가 없으며,
+필요할 때만 `--curriculum-scale-start` 같은 CLI override를 사용합니다.
+`--no-lap`과 `--no-sale`도 최종 runtime config에 직접 반영됩니다.
 
 ## Reward N 계약
 
@@ -160,7 +165,7 @@ LAP 사용 계약으로 저장됐다면 호환성 검사에서 명시적으로 �
 
 ## Checkpoint와 resume
 
-통합 runtime/checkpoint 버전은 `v3.1.0`입니다. 같은 major의 이전
+통합 runtime/checkpoint 버전은 `v3.1.2`입니다. 같은 major의 이전
 버전 artifact만 현재 runtime보다 새 버전이 아닌 경우 호환될 수 있습니다.
 checkpoint 로드는
 통합 버전, topology/mapping hash, network config, action mode,
@@ -197,9 +202,11 @@ PyTorch가 memory-efficient attention backward의 비결정적 CUDA 경로를
 `wandb.init`은 runtime config와 `EXP_META`를 함께 기록하고
 `EXP_META["description"]`을 notes로 전달합니다.
 
-v2 변경과 실험 결과는 루트의 `EXPERIMENTS_v2.md`에 기록합니다.
-모든 변경은 `oht_routing/version.py`의 단일
+현재 v3 변경과 실험 결과는 루트의 `EXPERIMENTS_v3.md`에
+기록합니다. 모든 변경은 `oht_routing/version.py`의 단일
 `vMAJOR.MINOR.PATCH` 버전으로 분리하고 호환성 영향을 함께 기록합니다.
+MAJOR가 바뀌면 루트에 `EXPERIMENTS_v{new_major}.md`를 새로 만들고,
+이전 major의 기록 파일은 수정하지 않고 이력으로 보존합니다.
 W&B metric을 바꾸면
 `oht_routing/utils/export_wandb_run.py`도 같이 수정합니다.
 

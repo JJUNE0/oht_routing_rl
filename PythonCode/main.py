@@ -33,16 +33,11 @@ def _configure_console_encoding():
 def main():
     _configure_console_encoding()
     args = parse_args()
-    if args.sim_end_time <= 0:
-        raise ValueError("--sim-end-time must be positive")
-    if args.console_log_interval <= 0:
-        raise ValueError("--console-log-interval must be positive")
-
     config = runtime_config_from_args(args)
     seed_everything(config.seed)
     client = ClientAlgorithm(config)
-    print_runtime_summary(args, client)
-    serve_contextual(args, client)
+    print_runtime_summary(client)
+    serve_contextual(client)
 
 
 if __name__ == "__main__":

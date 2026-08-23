@@ -3,11 +3,12 @@
 
 # .gitignore 자체는 추적
 !/.gitignore
-!/EXPERIMENTS_v2.md
+!/EXPERIMENTS_v*.md
 
 # PythonCode 디렉토리만 추적
 !/PythonCode/
 !/contextual_topology_cache.npz
+!/PythonCode/normalizers
 
 # ── PythonCode 내 런타임 산출물 ─────────────────────────────────
 __pycache__/
@@ -23,3 +24,5 @@ PythonCode/*.db
 PythonCode/*.log
 PythonCode/*.csv
 PythonCode/oht_routing/topology/cache/topology_neighbor_audit.json
+PythonCode/simulator/log/
+PythonCode/simulator/log/*.txt

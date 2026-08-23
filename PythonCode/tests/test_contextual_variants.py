@@ -8,7 +8,7 @@ from oht_dispatching.config import DISPATCH_COST, DISPATCH_FIRST_MATCH
 from oht_routing.runtime.client import ContextualRuntimeConfig
 from oht_routing.runtime.config import (
     RESUME_LAUNCH_CONTROL_FIELDS,
-    restore_checkpoint_runtime_config,
+    runtime_config_from_args,
 )
 from oht_routing.runtime.config_validation import make_reward_config
 from oht_routing.mdp.reward.config import (
@@ -45,8 +45,17 @@ class ContextualVariantTests(unittest.TestCase):
 
     def test_cli_and_runtime_are_locked_to_reward_n(self):
         parsed = self.parse()
-        self.assertEqual(parsed.reward_version, REWARD_VERSION)
-        self.assertEqual(self.parse("--reward-version", "n").reward_version, "N")
+        self.assertNotIn("reward_version", vars(parsed))
+        self.assertEqual(
+            runtime_config_from_args(parsed).reward_version,
+            REWARD_VERSION,
+        )
+        self.assertEqual(
+            runtime_config_from_args(
+                self.parse("--reward-version", "n")
+            ).reward_version,
+            "N",
+        )
         with self.assertRaises(SystemExit):
             self.parse("--reward-version", "E")
         with self.assertRaisesRegex(ValueError, "only reward_version='N'"):
@@ -72,26 +81,83 @@ class ContextualVariantTests(unittest.TestCase):
             reward.rail_reward_mode, RAIL_REWARD_FREE_FLOW_NEUTRAL_2
         )
 
-    def test_cli_keeps_runtime_and_resume_controls(self):
+    def test_cli_omits_runtime_defaults_and_config_resolves_them(self):
         parsed = self.parse()
-        self.assertEqual(parsed.curriculum_scale_start, 1.0)
-        self.assertEqual(parsed.curriculum_scale_end, 1.0)
-        self.assertEqual(parsed.replay_capacity_env_steps, 100_000)
+        self.assertEqual(vars(parsed), {})
+        config = runtime_config_from_args(parsed)
+        self.assertEqual(config.curriculum_scale_start, 0.05)
+        self.assertEqual(config.curriculum_scale_end, 1.0)
+        self.assertEqual(config.curriculum_end_step, 20_000)
+        self.assertEqual(config.replay_capacity_env_steps, 100_000)
+        self.assertEqual(config.replay_sampling_mode, REPLAY_SAMPLING_RAIL)
+        self.assertEqual(config.batch_size, 1_024)
+        self.assertEqual(config.warmup_steps, 10_000)
+        self.assertTrue(config.terminate_on_warmup_complete)
+        self.assertIsNone(config.load_state_normalizer_path)
+        self.assertIsNone(config.save_state_normalizer_path)
+        self.assertTrue(config.sale_enabled)
+        self.assertTrue(config.lap_enabled)
+        self.assertFalse(config.wandb_enabled)
+        self.assertEqual(config.console_log_interval, 100)
+        self.assertEqual(config.sim_end_time, 45_000)
+
+    def test_explicit_cli_values_override_only_selected_config_fields(self):
+        config = runtime_config_from_args(self.parse(
+            "--curriculum-scale-start",
+            "0.2",
+            "--curriculum-scale-end",
+            "0.8",
+            "--curriculum-end-step",
+            "30000",
+            "--batch-size",
+            "2048",
+            "--no-terminate-on-warmup-complete",
+            "--device",
+            "cpu",
+            "--console-log-interval",
+            "200",
+            "--sim-end-time",
+            "55000",
+        ))
+        self.assertEqual(config.curriculum_scale_start, 0.2)
+        self.assertEqual(config.curriculum_scale_end, 0.8)
+        self.assertEqual(config.curriculum_end_step, 30_000)
+        self.assertEqual(config.batch_size, 2_048)
+        self.assertFalse(config.terminate_on_warmup_complete)
+        self.assertEqual(config.device, "cpu")
+        self.assertEqual(config.console_log_interval, 200)
+        self.assertEqual(config.sim_end_time, 55_000)
+        self.assertEqual(config.warmup_steps, 10_000)
+        self.assertEqual(config.replay_capacity_env_steps, 100_000)
+
+    def test_runtime_and_resume_launch_control_contract_is_declared(self):
         self.assertIn("replay_capacity_env_steps", RESUME_LAUNCH_CONTROL_FIELDS)
         self.assertIn("lap_enabled", RESUME_LAUNCH_CONTROL_FIELDS)
-        self.assertEqual(parsed.batch_size, 1_024)
-        self.assertEqual(parsed.warmup_steps, 10_000)
-        self.assertTrue(parsed.terminate_on_warmup_complete)
-        self.assertIsNone(parsed.load_state_normalizer)
-        self.assertIsNone(parsed.save_state_normalizer)
+        self.assertIn("console_log_interval", RESUME_LAUNCH_CONTROL_FIELDS)
+        self.assertIn("sim_end_time", RESUME_LAUNCH_CONTROL_FIELDS)
 
-        self.assertFalse(parsed.wandb)
-        self.assertTrue(self.parse("--mode", "training").wandb)
-        self.assertTrue(self.parse("--mode", "actor_inference").wandb)
-        self.assertFalse(
-            self.parse("--mode", "actor_inference", "--no-wandb").wandb
+    def test_mode_aware_wandb_default_and_explicit_cli_overrides(self):
+        self.assertFalse(ContextualRuntimeConfig().wandb_enabled)
+        self.assertTrue(
+            ContextualRuntimeConfig(mode="actor_inference").wandb_enabled
         )
-        self.assertTrue(self.parse("--wandb").wandb)
+        self.assertTrue(ContextualRuntimeConfig(
+            mode="training", action_enabled=True
+        ).wandb_enabled)
+        self.assertTrue(runtime_config_from_args(
+            self.parse("--mode", "actor_inference")
+        ).wandb_enabled)
+        self.assertTrue(runtime_config_from_args(self.parse(
+            "--mode", "training", "--action-enabled"
+        )).wandb_enabled)
+        self.assertFalse(runtime_config_from_args(self.parse(
+            "--mode", "actor_inference", "--no-wandb"
+        )).wandb_enabled)
+        self.assertTrue(
+            runtime_config_from_args(self.parse("--wandb")).wandb_enabled
+        )
+
+    def test_save_data_aliases_and_runtime_validation(self):
         self.assertTrue(
             self.parse(
                 "--mode", "actor_inference", "--save_data"
@@ -109,33 +175,25 @@ class ContextualVariantTests(unittest.TestCase):
                 save_data_enabled=True,
             )
 
-        no_boundary = self.parse("--no-terminate-on-warmup-complete")
-        self.assertFalse(no_boundary.terminate_on_warmup_complete)
-        full_refill = self.parse(
-            "--resume-checkpoint",
-            "checkpoint.pt",
-            "--resume-inference-until-replay-full",
-            "--batch-size",
-            "2048",
-        )
-        self.assertTrue(full_refill.resume_inference_until_replay_full)
-        self.assertEqual(full_refill.batch_size, 2_048)
-        deterministic = self.parse(
-            "--resume-checkpoint",
-            "checkpoint.pt",
-            "--resume-deterministic-first-episode",
-        )
-        self.assertTrue(deterministic.resume_deterministic_first_episode)
-
+    def test_path_cli_destinations_and_runtime_string_conversion(self):
         reuse = self.parse(
             "--load-state-normalizer",
             "normalizers/state_n.npz",
             "--save-state-normalizer",
             "normalizers/state_copy.npz",
         )
-        config = ContextualRuntimeConfig(
-            load_state_normalizer_path=str(reuse.load_state_normalizer),
-            save_state_normalizer_path=str(reuse.save_state_normalizer),
+        self.assertIn("load_state_normalizer_path", vars(reuse))
+        self.assertIn("save_state_normalizer_path", vars(reuse))
+        self.assertNotIn("load_state_normalizer", vars(reuse))
+        self.assertNotIn("save_state_normalizer", vars(reuse))
+        config = runtime_config_from_args(reuse)
+        self.assertEqual(
+            config.load_state_normalizer_path,
+            "normalizers\\state_n.npz",
+        )
+        self.assertEqual(
+            config.save_state_normalizer_path,
+            "normalizers\\state_copy.npz",
         )
         self.assertEqual(config.effective_warmup_steps, 0)
         self.assertTrue(config.state_normalizer_warmup_bypass)
@@ -147,26 +205,43 @@ class ContextualVariantTests(unittest.TestCase):
                 "lap_enabled": True,
                 "replay_capacity_env_steps": 10_000,
                 "warmup_steps": 321,
+                "console_log_interval": 7,
+                "sim_end_time": 9,
             },
             True,
         )
-        restored = restore_checkpoint_runtime_config(
-            {
-                "lap_enabled": False,
-                "replay_capacity_env_steps": 100_000,
-                "warmup_steps": 10_000,
-            },
+        config = runtime_config_from_args(self.parse(
+            "--resume-checkpoint",
             "checkpoint.pt",
-        )
-        self.assertFalse(restored["lap_enabled"])
-        self.assertEqual(restored["replay_capacity_env_steps"], 100_000)
-        self.assertEqual(restored["warmup_steps"], 321)
+            "--resume-inference-until-replay-full",
+            "--resume-deterministic-first-episode",
+            "--no-lap",
+            "--replay-capacity-env-steps",
+            "100000",
+            "--console-log-interval",
+            "200",
+            "--sim-end-time",
+            "55000",
+        ))
+        self.assertEqual(config.resume_checkpoint_path, "checkpoint.pt")
+        self.assertTrue(config.resume_inference_until_replay_full)
+        self.assertTrue(config.resume_deterministic_first_episode)
+        self.assertFalse(config.lap_enabled)
+        self.assertEqual(config.replay_capacity_env_steps, 100_000)
+        self.assertEqual(config.warmup_steps, 321)
+        self.assertEqual(config.console_log_interval, 200)
+        self.assertEqual(config.sim_end_time, 55_000)
+        self.assertTrue(config.state_normalizer_warmup_bypass)
+        read_config.assert_called_once_with("checkpoint.pt")
 
     def test_cli_diagnostics_are_opt_in(self):
         parsed = self.parse()
-        self.assertIsNone(parsed.reward_diagnostic_dir)
+        self.assertNotIn("reward_diagnostic_dir", vars(parsed))
+        self.assertNotIn("reward_diagnostic_windows", vars(parsed))
+        config = runtime_config_from_args(parsed)
+        self.assertIsNone(config.reward_diagnostic_dir)
         self.assertEqual(
-            parsed.reward_diagnostic_windows,
+            config.reward_diagnostic_windows,
             "0:1000,10000:11000,20000:21000",
         )
         opted_in = self.parse(
@@ -175,8 +250,9 @@ class ContextualVariantTests(unittest.TestCase):
             "--reward-diagnostic-windows",
             "5:10",
         )
-        self.assertEqual(opted_in.reward_diagnostic_dir, "diag")
-        self.assertEqual(opted_in.reward_diagnostic_windows, "5:10")
+        config = runtime_config_from_args(opted_in)
+        self.assertEqual(config.reward_diagnostic_dir, "diag")
+        self.assertEqual(config.reward_diagnostic_windows, "5:10")
 
     def test_cli_dispatch_mode_defaults_to_first_match_and_accepts_cost(self):
         cases = (
@@ -186,7 +262,8 @@ class ContextualVariantTests(unittest.TestCase):
         )
         for arguments, expected in cases:
             with self.subTest(arguments=arguments):
-                self.assertEqual(self.parse(*arguments).dispatch_mode, expected)
+                config = runtime_config_from_args(self.parse(*arguments))
+                self.assertEqual(config.dispatch_mode, expected)
         with self.assertRaises(SystemExit):
             self.parse("--dispatch-mode", "unknown")
         with self.assertRaises(ValueError):
@@ -202,8 +279,9 @@ class ContextualVariantTests(unittest.TestCase):
         for arguments, sale, lap in cases:
             with self.subTest(arguments=arguments):
                 parsed = self.parse(*arguments)
-                self.assertIs(parsed.sale, sale)
-                self.assertIs(parsed.lap, lap)
+                config = runtime_config_from_args(parsed)
+                self.assertIs(config.sale_enabled, sale)
+                self.assertIs(config.lap_enabled, lap)
         with self.assertRaises(SystemExit):
             self.parse("--sale", "false")
 
@@ -211,14 +289,25 @@ class ContextualVariantTests(unittest.TestCase):
         cases = (
             ((), REPLAY_SAMPLING_RAIL),
             (("--replay-buffer-rail",), REPLAY_SAMPLING_RAIL),
-            (("--replay-buffer-snapshot",), REPLAY_SAMPLING_SNAPSHOT),
-            (("--replay-buffer-random-rail",), REPLAY_SAMPLING_RANDOM_RAIL),
-            (("--random-rail-mode",), REPLAY_SAMPLING_RANDOM_RAIL),
+            (
+                ("--replay-buffer-snapshot", "--no-lap"),
+                REPLAY_SAMPLING_SNAPSHOT,
+            ),
+            (
+                ("--replay-buffer-random-rail", "--no-lap"),
+                REPLAY_SAMPLING_RANDOM_RAIL,
+            ),
+            (
+                ("--random-rail-mode", "--no-lap"),
+                REPLAY_SAMPLING_RANDOM_RAIL,
+            ),
         )
         for arguments, expected in cases:
             with self.subTest(arguments=arguments):
+                parsed = self.parse(*arguments)
                 self.assertEqual(
-                    self.parse(*arguments).replay_sampling_mode, expected
+                    runtime_config_from_args(parsed).replay_sampling_mode,
+                    expected,
                 )
         with self.assertRaises(SystemExit):
             self.parse(

@@ -131,6 +131,7 @@ class ContextualRuntimeTests(unittest.TestCase):
             "normalizer_freeze_steps": 10,
             "device": "cpu",
             "seed": 7,
+            "wandb_enabled": False,
         }
         values.update(overrides)
         runtime = ClientAlgorithm(ContextualRuntimeConfig(**values))

@@ -7,7 +7,7 @@ from oht_routing.runtime.config_validation import make_reward_config
 from oht_routing.version import CONTEXTUAL_VERSION
 
 
-def print_runtime_summary(args, client):
+def print_runtime_summary(client):
     """Print the resolved runtime contract once before accepting a simulator."""
     config = client.config
     network = client.encoder.config
@@ -69,6 +69,8 @@ def print_runtime_summary(args, client):
             ("device", client.device),
             ("seed", config.seed),
             ("dispatch mode", config.dispatch_mode),
+            ("sim end time", config.sim_end_time),
+            ("console log interval", config.console_log_interval),
         ),
     )
     print_section(

@@ -6,6 +6,8 @@ from unittest.mock import Mock, patch
 from simulator import client as PClient
 from simulator.oht import OHTState
 from main import handle_command
+from oht_routing.runtime.config import ContextualRuntimeConfig
+from oht_routing.runtime.server import _run_session
 
 
 class DummySocket:
@@ -58,15 +60,71 @@ class ContextualProtocolTests(unittest.TestCase):
 
     def test_command_two_does_not_append_duplicate_end_time_bytes(self):
         pclient = SimpleNamespace(SendEndTime=Mock())
-        client = SimpleNamespace(Reset=Mock())
-        handle_command(
-            2,
-            pclient,
-            client,
-            sim_end_time=12_345,
+        client = SimpleNamespace(
+            config=ContextualRuntimeConfig(sim_end_time=12_345),
+            Reset=Mock(),
         )
+        handle_command(2, pclient, client)
         pclient.SendEndTime.assert_not_called()
         client.Reset.assert_called_once_with(pclient)
+
+    @patch("oht_routing.runtime.protocol.send_active_data")
+    def test_command_zero_uses_config_console_interval(self, send_active_data):
+        pclient = SimpleNamespace(WriteAdminLog=Mock())
+        client = SimpleNamespace(
+            config=ContextualRuntimeConfig(console_log_interval=3),
+            total_steps=6,
+        )
+
+        handle_command(0, pclient, client)
+        pclient.WriteAdminLog.assert_called_once_with(
+            "Contextual SendAndReceiveRailLineCost."
+        )
+        send_active_data.assert_called_once_with(pclient, client)
+
+        client.total_steps = 7
+        handle_command(0, pclient, client)
+        self.assertEqual(pclient.WriteAdminLog.call_count, 1)
+        self.assertEqual(send_active_data.call_count, 2)
+
+    def test_runtime_config_validates_server_controls(self):
+        config = ContextualRuntimeConfig()
+        self.assertEqual(config.console_log_interval, 100)
+        self.assertEqual(config.sim_end_time, 45_000)
+        for name, invalid in (
+            ("console_log_interval", 0),
+            ("console_log_interval", 1.5),
+            ("sim_end_time", -1),
+            ("sim_end_time", True),
+        ):
+            with self.subTest(name=name, invalid=invalid):
+                with self.assertRaisesRegex(ValueError, "must be"):
+                    ContextualRuntimeConfig(**{name: invalid})
+
+    @patch("oht_routing.runtime.server.handle_command")
+    @patch("oht_routing.runtime.server.PClient.PClient")
+    def test_session_uses_runtime_config_server_controls(
+        self, pclient_type, dispatch_command
+    ):
+        connection = object()
+        pclient = pclient_type.return_value
+        pclient.RecieveSimulationStandardData.side_effect = [0, 99]
+        pclient.PeekPending.return_value = b""
+        client = SimpleNamespace(
+            config=ContextualRuntimeConfig(
+                console_log_interval=2,
+                sim_end_time=12_345,
+            ),
+            on_new_connection=Mock(),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "unexpected v=99"):
+            _run_session(connection, ("127.0.0.1", 1234), 9100, client)
+
+        pclient_type.assert_called_once_with(
+            connection, sim_end_time=12_345
+        )
+        dispatch_command.assert_called_once_with(0, pclient, client)
 
     def test_assign_command_reader_advances_to_the_next_fixed_buffer(self):
         client = object.__new__(PClient.PClient)

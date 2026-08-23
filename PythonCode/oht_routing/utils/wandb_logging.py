@@ -96,10 +96,11 @@ EXP_META = {
     "terminal_tat_penalty": -20.0,
     "note": "replay_pack",
     "description": (
-        "Contextual TD7 v3.1.0 restores a 100,000 environment-step replay "
-        "capacity using feature-aware physical-state packing, Q15 action "
-        "storage, and float16 LAP priorities. The v3 observation, network, "
-        "checkpoint, and Reward N contracts are unchanged."
+        "Contextual TD7 v3.1.2 preserves the v3.1.1 runtime contract and "
+        "routes experiment history by major version. ContextualRuntimeConfig "
+        "remains the only runtime-default source, and the packed 100,000-step "
+        "replay, observation, network, checkpoint, and Reward N contracts "
+        "are unchanged."
     ),
 }
 

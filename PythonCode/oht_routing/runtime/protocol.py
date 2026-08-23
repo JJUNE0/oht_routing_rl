@@ -20,7 +20,7 @@ def read_port(path="wpconfig.json"):
     return DEFAULT_PORT
 
 
-def send_active_data(pclient, client, log_interval=100):
+def send_active_data(pclient, client):
     pclient.RecieveSimulationActiveData()
     client.Algorithm(pclient)
     started = time.perf_counter()
@@ -41,7 +41,7 @@ def send_active_data(pclient, client, log_interval=100):
         if client.config.action_enabled and warmup_remaining == 0
         else "warmup"
     )
-    if step % int(log_interval) == 0:
+    if step % client.config.console_log_interval == 0:
         print(
             "[contextual-runtime] "
             f"step={step}, episode={client.episode_id}, "
@@ -52,17 +52,11 @@ def send_active_data(pclient, client, log_interval=100):
         )
 
 
-def handle_command(
-    command,
-    pclient,
-    client,
-    sim_end_time=45_000,
-    console_log_interval=100,
-):
+def handle_command(command, pclient, client):
     if command == 0:
-        if client.total_steps % int(console_log_interval) == 0:
+        if client.total_steps % client.config.console_log_interval == 0:
             pclient.WriteAdminLog("Contextual SendAndReceiveRailLineCost.")
-        send_active_data(pclient, client, log_interval=console_log_interval)
+        send_active_data(pclient, client)
     elif command == 1:
         pclient.WriteAdminLog("Contextual simulation end signal (v=1).")
         client.on_terminal()

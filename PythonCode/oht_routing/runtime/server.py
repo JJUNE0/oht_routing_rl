@@ -13,14 +13,15 @@ HOST = "127.0.0.1"
 EXPECTED_SIMULATION_STATES = {0, 1, 2, 3, 4, 5, 6}
 
 
-def _run_session(connection, address, port, args, client):
+def _run_session(connection, address, port, client):
     print(
         "[contextual-runtime] TCP accepted; "
         f"starting PClient initialization handshake: {address}"
     )
     # PClient owns the fixed-width initialization/reset handshake.
     # Passing the override avoids appending duplicate raw bytes.
-    pclient = PClient.PClient(connection, sim_end_time=args.sim_end_time)
+    config = client.config
+    pclient = PClient.PClient(connection, sim_end_time=config.sim_end_time)
     client.on_new_connection()
     print(datetime.now().strftime("%Y.%m.%d - %H:%M:%S"))
     message = (
@@ -34,7 +35,7 @@ def _run_session(connection, address, port, args, client):
     while True:
         command = pclient.RecieveSimulationStandardData()
         command_count += 1
-        if command != 0 or command_count % args.console_log_interval == 0:
+        if command != 0 or command_count % config.console_log_interval == 0:
             print(datetime.now().strftime("%Y.%m.%d - %H:%M:%S"))
             print(f"[contextual-runtime] command={command}, count={command_count}")
             pclient.WriteAdminLog("RecieveSimulationStandardData.")
@@ -45,23 +46,17 @@ def _run_session(connection, address, port, args, client):
                 f"[DESYNC] unexpected v={command}; "
                 f"pending={len(pending)}B: {preview}"
             )
-        handle_command(
-            command,
-            pclient,
-            client,
-            sim_end_time=args.sim_end_time,
-            console_log_interval=args.console_log_interval,
-        )
+        handle_command(command, pclient, client)
 
 
-def _accept_sessions(server, port, args, client):
+def _accept_sessions(server, port, client):
     while True:
         print(datetime.now().strftime("%Y.%m.%d - %H:%M:%S"))
         print(f"[contextual-runtime] waiting on {HOST}:{port}")
         connection, address = server.accept()
         with connection:
             try:
-                _run_session(connection, address, port, args, client)
+                _run_session(connection, address, port, client)
             except ContextualTrainingFailure:
                 raise
             except (ConnectionError, IndexError):
@@ -78,7 +73,7 @@ def _accept_sessions(server, port, args, client):
                 print("[contextual-runtime] session failed; waiting for reconnect")
 
 
-def serve_contextual(args, client):
+def serve_contextual(client):
     """Serve simulator sessions until interrupted or training fails."""
     port = read_port()
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -87,7 +82,7 @@ def serve_contextual(args, client):
     server.listen(1)
     capture_status = "stopped"
     try:
-        _accept_sessions(server, port, args, client)
+        _accept_sessions(server, port, client)
     except ContextualTrainingFailure as error:
         capture_status = "failed"
         client.wandb_logger.finish_failed(error, client.failure_env_step)

@@ -1,12 +1,11 @@
-"""Command-line interface for contextual TD7 v2."""
+"""Explicit command-line overrides for the contextual runtime config."""
 
 import argparse
 from pathlib import Path
 
-from oht_dispatching.config import DISPATCH_FIRST_MATCH, DISPATCH_MODES
-from oht_routing.mdp.action import ACTION_MODES, REGION_B_RL
+from oht_dispatching.config import DISPATCH_MODES
+from oht_routing.mdp.action import ACTION_MODES
 from oht_routing.mdp.reward.config import (
-    REWARD_VERSION,
     REWARD_VERSIONS,
     canonical_reward_version,
 )
@@ -19,30 +18,28 @@ from oht_routing.algorithms.rl.contextual_td7 import (
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Contextual baseline, inference, and Phase 7 training runtime"
+        description="Contextual baseline, inference, and Phase 7 training runtime",
+        argument_default=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--mode",
         choices=("baseline_only", "actor_inference", "training"),
-        default="baseline_only",
     )
     parser.add_argument(
         "--reward-version",
         type=canonical_reward_version,
         choices=REWARD_VERSIONS,
-        default=REWARD_VERSION,
         help=(
             "Compatibility flag for the single locked Reward N contract."
         ),
     )
     parser.add_argument("--action-enabled", action="store_true")
     parser.add_argument(
-        "--action-mode", choices=ACTION_MODES, default=REGION_B_RL
+        "--action-mode", choices=ACTION_MODES
     )
     parser.add_argument(
         "--dispatch-mode",
         choices=DISPATCH_MODES,
-        default=DISPATCH_FIRST_MATCH,
         help=(
             "OHT selection for command 6: preserve iteration-order "
             "first-match, or minimize cumulative live command-0 rail cost."
@@ -51,64 +48,56 @@ def parse_args():
     parser.add_argument(
         "--action-scale",
         type=float,
-        default=0.05,
         help="Fixed applied-action scale for exp_residual mode only.",
     )
     parser.add_argument(
         "--num-stacks",
         type=int,
-        default=1,
         help="Total observation frames including the current frame.",
     )
     parser.add_argument(
         "--stack-interval",
         type=int,
-        default=1,
         help="Environment-step spacing between stacked frames.",
     )
-    parser.add_argument("--curriculum-end-step", type=int, default=20_000)
-    parser.add_argument("--curriculum-scale-start", type=float, default=1.0)
-    parser.add_argument("--curriculum-scale-end", type=float, default=1.0)
+    parser.add_argument("--curriculum-end-step", type=int)
+    parser.add_argument("--curriculum-scale-start", type=float)
+    parser.add_argument("--curriculum-scale-end", type=float)
     parser.add_argument(
         "--curriculum-shape",
         choices=("geometric", "linear"),
-        default="geometric",
     )
     parser.add_argument(
         "--exploration-noise-std",
         type=float,
-        default=0.10,
         help="Exploration noise std at global environment step 0.",
     )
     parser.add_argument(
         "--exploration-noise-final-std",
         type=float,
-        default=0.02,
         help="Final exploration noise std after annealing.",
     )
     parser.add_argument(
         "--exploration-noise-anneal-steps",
         type=int,
-        default=100_000,
         help="Post-warmup env steps over which noise reaches its final std.",
     )
-    parser.add_argument("--exploration-noise-clip", type=float, default=0.20)
-    parser.add_argument("--warmup-steps", type=int, default=10_000)
+    parser.add_argument("--exploration-noise-clip", type=float)
+    parser.add_argument("--warmup-steps", type=int)
     parser.add_argument(
         "--terminate-on-warmup-complete",
         action=argparse.BooleanOptionalAction,
-        default=True,
         help=(
             "End the collection episode at the warm-up transition boundary "
             "so policy control starts from a clean next episode."
         ),
     )
-    parser.add_argument("--episode-burnin-steps", type=int, default=0)
-    parser.add_argument("--normalizer-freeze-steps", type=int, default=10_000)
+    parser.add_argument("--episode-burnin-steps", type=int)
+    parser.add_argument("--normalizer-freeze-steps", type=int)
     parser.add_argument(
         "--load-state-normalizer",
+        dest="load_state_normalizer_path",
         type=Path,
-        default=None,
         help=(
             "Load only a populated, frozen observation/state normalizer "
             "snapshot. Exact observation feature order, dimensions, topology, "
@@ -119,8 +108,8 @@ def parse_args():
     )
     parser.add_argument(
         "--save-state-normalizer",
+        dest="save_state_normalizer_path",
         type=Path,
-        default=None,
         help=(
             "Atomically save the observation/state normalizer once both local "
             "and global statistics are populated and frozen."
@@ -128,23 +117,20 @@ def parse_args():
     )
     parser.add_argument(
         "--reward-diagnostic-dir",
-        default=None,
         help="Opt-in directory for contextual reward step/cycle JSONL diagnostics.",
     )
     parser.add_argument(
         "--reward-diagnostic-windows",
-        default="0:1000,10000:11000,20000:21000",
         help="Start-inclusive:end-exclusive global-step windows.",
     )
-    parser.add_argument("--device", default=None)
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--device")
+    parser.add_argument("--seed", type=int)
     parser.add_argument(
         "--replay-capacity-env-steps",
         type=int,
-        default=100_000,
         help=(
             "Number of environment-step transitions retained by the packed "
-            "CPU replay (default: 100,000)."
+            "CPU replay. The default is defined in ContextualRuntimeConfig."
         ),
     )
     replay_sampling = parser.add_mutually_exclusive_group()
@@ -180,18 +166,17 @@ def parse_args():
             "replay pool. Requires --no-lap."
         ),
     )
-    parser.set_defaults(replay_sampling_mode=REPLAY_SAMPLING_RAIL)
-    parser.add_argument("--batch-size", type=int, default=1_024)
-    parser.add_argument("--minimum-replay-env-steps", type=int, default=100)
+    parser.add_argument("--batch-size", type=int)
+    parser.add_argument("--minimum-replay-env-steps", type=int)
     parser.add_argument(
-        "--minimum-action-enabled-env-steps", type=int, default=100
+        "--minimum-action-enabled-env-steps", type=int
     )
-    parser.add_argument("--updates-per-env-step", type=int, default=1)
-    parser.add_argument("--learn-every-env-steps", type=int, default=1)
+    parser.add_argument("--updates-per-env-step", type=int)
+    parser.add_argument("--learn-every-env-steps", type=int)
     parser.add_argument(
         "--wandb",
+        dest="wandb_enabled",
         action=argparse.BooleanOptionalAction,
-        default=None,
         help=(
             "Enable W&B logging. By default it is enabled for training and "
             "actor_inference, and disabled for baseline_only."
@@ -208,20 +193,26 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        "--sale", action=argparse.BooleanOptionalAction, default=True
+        "--sale",
+        dest="sale_enabled",
+        action=argparse.BooleanOptionalAction,
     )
     parser.add_argument(
-        "--lap", action=argparse.BooleanOptionalAction, default=True
+        "--lap",
+        dest="lap_enabled",
+        action=argparse.BooleanOptionalAction,
     )
     parser.add_argument(
-        "--critic-loss-mode", choices=("auto", "huber", "mse"), default="auto"
+        "--critic-loss-mode", choices=("auto", "huber", "mse")
     )
-    parser.add_argument("--wandb-log-interval", type=int, default=10)
-    parser.add_argument("--console-log-interval", type=int, default=100)
-    parser.add_argument("--early-stop-queued-threshold", type=float, default=500.0)
-    parser.add_argument("--max-stale-sim-time-ticks", type=int, default=5)
-    parser.add_argument("--checkpoint-root", default=None)
-    parser.add_argument("--resume-checkpoint", default=None)
+    parser.add_argument("--wandb-log-interval", type=int)
+    parser.add_argument("--console-log-interval", type=int)
+    parser.add_argument("--early-stop-queued-threshold", type=float)
+    parser.add_argument("--max-stale-sim-time-ticks", type=int)
+    parser.add_argument("--checkpoint-root")
+    parser.add_argument(
+        "--resume-checkpoint", dest="resume_checkpoint_path"
+    )
     parser.add_argument(
         "--resume-inference-until-replay-full",
         action="store_true",
@@ -245,7 +236,7 @@ def parse_args():
     )
     parser.add_argument(
         "--rail-tat-diagnostic",
-        default=None,
+        dest="rail_tat_diagnostic_path",
         help=(
             "Opt in to the legacy rail-TAT completion JSONL at this path."
         ),
@@ -253,7 +244,6 @@ def parse_args():
     parser.add_argument(
         "--rail-tat-diagnostic-max-step",
         type=int,
-        default=1_000,
         help=(
             "Write rail-TAT JSONL only while global_step is below this "
             "exclusive cutoff. Zero disables event logging."
@@ -262,10 +252,6 @@ def parse_args():
     parser.add_argument(
         "--sim-end-time",
         type=int,
-        default=45_000,
         help="Override PClient's simulator episode end time after every init/reset.",
     )
-    args = parser.parse_args()
-    if args.wandb is None:
-        args.wandb = args.mode in {"training", "actor_inference"}
-    return args
+    return parser.parse_args()

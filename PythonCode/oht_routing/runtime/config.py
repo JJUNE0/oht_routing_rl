@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import random
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 
 import numpy as np
 import torch
@@ -41,6 +41,8 @@ RESUME_LAUNCH_CONTROL_FIELDS = {
     "reward_diagnostic_dir",
     "reward_diagnostic_windows",
     "wandb_enabled",
+    "console_log_interval",
+    "sim_end_time",
     "save_data_enabled",
     "dispatch_mode",
     "batch_size",
@@ -48,13 +50,6 @@ RESUME_LAUNCH_CONTROL_FIELDS = {
     "lap_enabled",
     "resume_inference_until_replay_full",
     "resume_deterministic_first_episode",
-}
-_ARG_ALIASES = {
-    "load_state_normalizer_path": "load_state_normalizer",
-    "save_state_normalizer_path": "save_state_normalizer",
-    "wandb_enabled": "wandb",
-    "resume_checkpoint_path": "resume_checkpoint",
-    "rail_tat_diagnostic_path": "rail_tat_diagnostic",
 }
 _PATH_CONFIG_FIELDS = {
     "load_state_normalizer_path",
@@ -64,6 +59,8 @@ _PATH_CONFIG_FIELDS = {
 
 @dataclass(frozen=True)
 class ContextualRuntimeConfig:
+    """Canonical runtime defaults; CLI values are explicit overrides only."""
+
     mode: str = "baseline_only"
     action_enabled: bool = False
     reward_version: str = REWARD_VERSION
@@ -107,8 +104,13 @@ class ContextualRuntimeConfig:
     resume_deterministic_first_episode: bool = False
     rail_tat_diagnostic_path: str | None = None
     rail_tat_diagnostic_max_step: int = 1_000
-    wandb_enabled: bool = False
+    # None means the canonical mode-aware default: enabled for training and
+    # actor inference, disabled for baseline-only execution.  CLI flags are
+    # explicit overrides, never a second source of defaults.
+    wandb_enabled: bool | None = None
     wandb_log_interval: int = 10
+    console_log_interval: int = 100
+    sim_end_time: int = 45_000
     save_data_enabled: bool = False
     sale_enabled: bool = True
     lap_enabled: bool = True
@@ -152,6 +154,12 @@ class ContextualRuntimeConfig:
         )
 
     def __post_init__(self):
+        if self.wandb_enabled is None:
+            object.__setattr__(
+                self,
+                "wandb_enabled",
+                self.mode in {"training", "actor_inference"},
+            )
         validate_runtime_config(self)
 
 
@@ -211,28 +219,24 @@ def restore_checkpoint_runtime_config(config_kwargs, checkpoint_path):
 
 
 def runtime_config_from_args(args) -> ContextualRuntimeConfig:
-    """Build the validated runtime config from CLI and optional resume state."""
+    """Apply only explicit CLI overrides to the canonical config defaults."""
     fields = ContextualRuntimeConfig.__dataclass_fields__
-    config_kwargs = {
-        name: getattr(args, name)
-        for name in fields
-        if name != "device" and hasattr(args, name)
-    }
-    for config_name, argument_name in _ARG_ALIASES.items():
-        value = getattr(args, argument_name)
-        if config_name == "wandb_enabled" and value is None:
-            value = args.mode in {"training", "actor_inference"}
-        if config_name in _PATH_CONFIG_FIELDS and value is not None:
+    config_kwargs = {}
+    for name in fields:
+        if not hasattr(args, name):
+            continue
+        value = getattr(args, name)
+        if name in _PATH_CONFIG_FIELDS and value is not None:
             value = str(value)
-        config_kwargs[config_name] = value
+        config_kwargs[name] = value
 
-    if args.device:
-        config_kwargs["device"] = args.device
-    if args.resume_checkpoint:
+    config = ContextualRuntimeConfig(**config_kwargs)
+    if config.resume_checkpoint_path:
         config_kwargs = restore_checkpoint_runtime_config(
-            config_kwargs, args.resume_checkpoint
+            asdict(config), config.resume_checkpoint_path
         )
-    return ContextualRuntimeConfig(**config_kwargs)
+        config = ContextualRuntimeConfig(**config_kwargs)
+    return config
 
 
 __all__ = (
