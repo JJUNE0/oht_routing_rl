@@ -85,6 +85,8 @@ class CountingObservationBuilder:
 
     def build(
         self, pclient, *, next_10_route_oht_count,
+        recent_completed_tat_s=0.0,
+        recent_completed_tat_available=False,
         previous_applied_action=None,
     ):
         self.calls += 1
@@ -183,24 +185,25 @@ class ContextualRuntimeTests(unittest.TestCase):
         self.assertTrue(np.isfinite(costs).all())
         np.testing.assert_array_equal(costs, result.final_cost)
 
-    def test_runtime_wires_locked_reward_n_profile(self):
+    def test_runtime_wires_locked_reward_o_profile(self):
         runtime = self.runtime()
         runtime._ensure_initialized(make_runtime_pclient())
         reward = runtime.reward_builder.config
 
         self.assertEqual(reward.tat_reference, 165.0)
-        self.assertEqual(reward.tat_weight, 11.0)
-        self.assertEqual(reward.op_weight, 4.0)
-        self.assertTrue(reward.use_op)
-        self.assertEqual(reward.backlog_weight, 0.0004)
+        self.assertEqual(reward.tat_weight, 4.3)
+        self.assertEqual(reward.tat_window_seconds, 300.0)
+        self.assertEqual(reward.op_weight, 0.0)
+        self.assertFalse(reward.use_op)
+        self.assertEqual(reward.backlog_weight, 0.0007)
         self.assertTrue(reward.backlog_growth_enabled)
-        self.assertEqual(reward.backlog_growth_weight, 0.16)
-        self.assertEqual(reward.idle_reserve_weight, 0.20)
-        self.assertEqual(reward.local_oht_weight, 0.3)
-        self.assertEqual(reward.local_predicted_oht_weight, 0.075)
-        self.assertEqual(reward.local_stop_weight, 0.3)
+        self.assertEqual(reward.backlog_growth_weight, 0.17)
+        self.assertEqual(reward.idle_reserve_weight, 0.09)
+        self.assertEqual(reward.local_oht_weight, 0.0)
+        self.assertEqual(reward.local_predicted_oht_weight, 0.05)
+        self.assertEqual(reward.local_stop_weight, 0.12)
         self.assertEqual(reward.local_idle_weight, 0.0)
-        self.assertEqual(reward.local_capacity_weight, 0.1)
+        self.assertEqual(reward.local_capacity_weight, 0.0)
         self.assertEqual(reward.rail_tat_weight, 30.0)
         self.assertEqual(reward.rail_tat_clip, 1.0)
         self.assertEqual(reward.rail_free_flow_neutral_ratio, 2.0)
@@ -229,9 +232,9 @@ class ContextualRuntimeTests(unittest.TestCase):
             record = records[0]
             self.assertEqual(record["global_step"], 1)
             self.assertEqual(record["episode_step"], 0)
-            self.assertEqual(record["tat_weight"], 11.0)
-            self.assertEqual(record["backlog_weight"], 0.0004)
-            self.assertEqual(record["local_predicted_oht_weight"], 0.075)
+            self.assertEqual(record["tat_weight"], 4.3)
+            self.assertEqual(record["backlog_weight"], 0.0007)
+            self.assertEqual(record["local_predicted_oht_weight"], 0.05)
             self.assertEqual(record["local_reward_scale"], 2.0)
             self.assertEqual(record["rail_tat_weight"], 30.0)
             self.assertEqual(record["rail_tat_clip"], 1.0)

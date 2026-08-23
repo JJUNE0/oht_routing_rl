@@ -1,3 +1,4 @@
+import copy
 import unittest
 
 import numpy as np
@@ -42,6 +43,54 @@ class ContextualLAPTests(unittest.TestCase):
         second.push(make_snapshot(second.topology, 0))
         self.assertEqual(first.sample(100).sample_keys,
                          second.sample(100).sample_keys)
+
+    def test_vectorized_rail_draw_matches_former_grouped_rng_contract(self):
+        replay = self.replay(seed=27)
+        for step in range(2):
+            replay.push(make_snapshot(replay.topology, step))
+        keys = []
+        priorities = []
+        for slot in range(2):
+            generation = int(replay._transition_generation[slot])
+            for row, priority in ((1, 2.0), (7, 30.0), (31, 5.0)):
+                keys.append(ReplaySampleKey(slot, generation, row))
+                priorities.append(priority + slot)
+        replay.update_priorities(keys, priorities)
+
+        reference_rng = np.random.default_rng()
+        reference_rng.bit_generator.state = copy.deepcopy(
+            replay.rng.bit_generator.state
+        )
+        valid_slots = replay._valid_transition_slots()
+        step_sums = replay._priority_sum[valid_slots]
+        total_priority = float(step_sums.sum())
+        transition_slots = reference_rng.choice(
+            valid_slots,
+            size=64,
+            replace=True,
+            p=step_sums / total_priority,
+        )
+        expected_rows = np.empty(64, np.int64)
+        unique_slots, inverse = np.unique(
+            transition_slots, return_inverse=True
+        )
+        for group, slot in enumerate(unique_slots):
+            batch_rows = np.flatnonzero(inverse == group)
+            cdf = np.cumsum(replay._priority[slot], dtype=np.float64)
+            thresholds = reference_rng.random(batch_rows.size) * cdf[-1]
+            expected_rows[batch_rows] = np.searchsorted(
+                cdf, thresholds, side="right"
+            )
+
+        batch = replay.sample(64)
+        actual = [
+            (key.step_slot, key.controlled_row)
+            for key in batch.sample_keys
+        ]
+        expected = list(zip(
+            transition_slots.tolist(), expected_rows.tolist()
+        ))
+        self.assertEqual(actual, expected)
 
     def test_new_transition_uses_current_max_and_overwrite_resets(self):
         replay = self.replay()

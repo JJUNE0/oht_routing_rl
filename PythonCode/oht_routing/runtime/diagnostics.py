@@ -20,12 +20,16 @@ class ContextualRuntimeDiagnosticsMixin:
 
         backlog_p50 = float(np.median(self._phase2_backlogs))
         total_mean = float(batch.total.mean())
-        if batch.total_tat_level < self.reward_builder.config.tat_reference and (
-            batch.backlog <= backlog_p50
+        if (
+            batch.tat_signal_available
+            and batch.total_tat_level < self.reward_builder.config.tat_reference
+            and batch.backlog <= backlog_p50
         ):
             self._phase2_good_rewards.append(total_mean)
-        if batch.total_tat_level > self.reward_builder.config.tat_reference and (
-            batch.backlog >= backlog_p50
+        if (
+            batch.tat_signal_available
+            and batch.total_tat_level > self.reward_builder.config.tat_reference
+            and batch.backlog >= backlog_p50
         ):
             self._phase2_bad_rewards.append(total_mean)
 
@@ -147,7 +151,20 @@ class ContextualRuntimeDiagnosticsMixin:
             "episode_id": int(completed.episode_id),
             "episode_step": int(completed.env_step),
             "sim_time": float(getattr(pclient, "SimTime", 0.0)),
-            "total_tat": batch.total_tat_level,
+            "recent_completed_tat_300s_mean": batch.total_tat_level,
+            "recent_completed_tat_300s_p90": (
+                batch.recent_completed_tat_p90
+            ),
+            "recent_completed_tat_300s_count": int(
+                batch.recent_completed_tat_event_count
+            ),
+            "recent_completed_tat_300s_window_age": (
+                batch.recent_completed_tat_window_age_s
+            ),
+            "recent_completed_tat_events_added": int(
+                batch.recent_completed_tat_events_added
+            ),
+            "cumulative_total_tat": batch.cumulative_total_tat_level,
             "tat_reference": self.reward_builder.config.tat_reference,
             "tat_weight": self.reward_builder.config.tat_weight,
             "tat_signal_available": bool(batch.tat_signal_available),
@@ -204,6 +221,26 @@ class ContextualRuntimeDiagnosticsMixin:
             "reward_budget_shares": {
                 name: diagnostics.get(f"reward/budget/{name}_share", 0.0)
                 for name in ("tat", "backlog", "local", "rail", "smooth")
+            },
+            "reward_term_abs_mean": {
+                name: diagnostics.get(
+                    f"reward/term_scale/{name}_abs_mean", 0.0
+                )
+                for name in (
+                    "tat", "op", "backlog_level", "backlog_growth",
+                    "idle_reserve", "current_oht", "predicted_oht",
+                    "stop_time", "local_idle", "capacity",
+                    "rail_outcome", "smooth",
+                )
+            },
+            "reward_term_shares": {
+                name: diagnostics.get(f"reward/term_share/{name}", 0.0)
+                for name in (
+                    "tat", "op", "backlog_level", "backlog_growth",
+                    "idle_reserve", "current_oht", "predicted_oht",
+                    "stop_time", "local_idle", "capacity",
+                    "rail_outcome", "smooth",
+                )
             },
             "leading_indicator_snapshot": {
                 key: value
@@ -277,7 +314,9 @@ class ContextualRuntimeDiagnosticsMixin:
             "exploration_noise_std": diagnostics.get(
                 "action/exploration_noise_std", 0.0
             ),
-            "env_tat": diagnostics.get("env/tat", batch.total_tat_level),
+            "env_tat": diagnostics.get(
+                "env/tat", batch.cumulative_total_tat_level
+            ),
             "operation_rate": diagnostics.get("env/operation_rate", batch.op_rate),
             "completed_delta": batch.completed_delta,
             "transfer_count": diagnostics.get("env/transferring", 0.0),

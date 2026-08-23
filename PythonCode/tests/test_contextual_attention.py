@@ -231,7 +231,7 @@ class ContextualAttentionTests(unittest.TestCase):
         first_global_linear = self.encoder.global_encoder.network[0]
         self.assertEqual(first_center_linear.in_features, 24)
         self.assertEqual(first_neighbor_linear.in_features, 26)
-        self.assertEqual(first_global_linear.in_features, 17)
+        self.assertEqual(first_global_linear.in_features, 18)
         self.assertIsNot(first_neighbor_linear, first_global_linear)
 
 

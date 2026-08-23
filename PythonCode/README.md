@@ -1,4 +1,4 @@
-# Contextual TD7 v3 for OHT routing
+# Contextual TD7 v4 for OHT routing
 
 ## Checkpoint actor evaluation
 
@@ -9,7 +9,7 @@ learner updates, or checkpoint writes:
 python .\PythonCode\main.py `
   --mode actor_inference `
   --action-enabled `
-  --resume-checkpoint ".\checkpoints\ctx_td7_reward_n_detep1_b2048\periodic\step_400000.pt"
+  --resume-checkpoint ".\checkpoints\ctx_td7_reward_o\periodic\step_400000.pt"
 ```
 
 병목 분석용 원본 환경 snapshot도 함께 저장하려면 `--save_data`를 추가합니다.
@@ -21,7 +21,7 @@ python .\PythonCode\main.py `
   --mode actor_inference `
   --action-enabled `
   --save_data `
-  --resume-checkpoint ".\checkpoints\ctx_td7_reward_n_detep1_b2048\periodic\step_400000.pt"
+  --resume-checkpoint ".\checkpoints\ctx_td7_reward_o\periodic\step_400000.pt"
 ```
 
 The checkpoint is loaded after simulator topology initialization. Confirm the
@@ -29,7 +29,7 @@ The checkpoint is loaded after simulator topology initialization. Confirm the
 scale, and restored normalizers before using evaluation results.
 
 반도체 FAB OHT의 rail cost를 학습해 혼잡 구간을 우회시키는 contextual TD7
-구현입니다. `contextual-td7-v2` 브랜치는 Reward N만 실행하며, 이전 Reward
+구현입니다. v4 runtime은 Reward O만 실행하며, 이전 Reward
 E~U 구현과 실험 기록은 `contextual-region-brl-v1` 브랜치와 루트의
 `EXPERIMENTS.md`에 보존합니다.
 
@@ -43,17 +43,17 @@ conda activate aicc
 # baseline
 python .\PythonCode\main.py
 
-# Reward N 학습
+# Reward O 학습
 python .\PythonCode\main.py `
   --mode training `
   --action-enabled `
   --no-lap `
-  --save-state-normalizer .\PythonCode\normalizers\contextual_v3_seed0.npz `
-  --checkpoint-root .\PythonCode\checkpoints\ctx_td7_reward_n
+  --save-state-normalizer .\PythonCode\normalizers\contextual_v4_seed0.npz `
+  --checkpoint-root .\PythonCode\checkpoints\ctx_td7_reward_o
 ```
 
 `--reward-version`은 체크포인트/실행 계약을 명시하기 위한 호환 옵션이며
-`N`만 허용합니다. simulator GUI에서 Python 연동을 활성화한 뒤 Run을
+`O`만 허용합니다. simulator GUI에서 Python 연동을 활성화한 뒤 Run을
 시작해야 TCP 세션이 연결됩니다.
 
 공식 진입점은 `main.py` 하나입니다. 삭제된 region-token 경로는 더 이상
@@ -67,7 +67,7 @@ Runtime 기본값의 단일 원본은
 필요할 때만 `--curriculum-scale-start` 같은 CLI override를 사용합니다.
 `--no-lap`과 `--no-sale`도 최종 runtime config에 직접 반영됩니다.
 
-## Reward N 계약
+## Reward O 계약
 
 controlled rail `i`의 최종 reward는 다음과 같습니다.
 
@@ -81,12 +81,23 @@ r_i = 0.5 * global_raw
 global 항은 아래의 합입니다.
 
 ```text
-tat_raw            = -11 * max(0, TotalTat - 160) / 165
-op_raw             = 4 * (0.8 - operation_rate)
-backlog_raw        = -0.0004 * (waiting + queued)
-backlog_growth_raw = -0.16 * clip(max(0, B_t - B_(t-300)) / 30, 0, 1)
-idle_reserve_raw   = -0.20 * clip((200 - idle_oht_count) / 50, 0, 1)
+recent_tat_300     = mean(CmdTat of commands completed in [t-300, t])
+tat_raw            = -4.3 * max(0, recent_tat_300 - 160) / 165
+op_raw             = 0
+backlog_raw        = -0.0007 * (waiting + queued)
+backlog_growth_raw = -0.17 * clip(max(0, B_t - B_(t-300)) / 30, 0, 1)
+idle_reserve_raw   = -0.09 * clip((200 - idle_oht_count) / 50, 0, 1)
+
+predicted_oht_raw_i = -0.05 * predicted_oht_count_i
+stop_time_raw_i     = -0.12 * sum(StopTime of OHTs on rail i)
 ```
+
+The recent-TAT signal becomes available after 300 simulation seconds and at
+least one verified command completion. Until then its observation value and
+reward contribution are `0`, with an explicit observation availability bit.
+`TotalTat` remains the cumulative diagnostic and early-termination signal.
+The rail-local StopTime sum is deliberately unclipped, so worsening congestion
+continues to increase the penalty.
 
 rail 항은 완료된 cycle의
 `2 - route_time / route_free_flow_time`이며 rail별로 `[-1, 1]`에
@@ -98,8 +109,8 @@ TAT 종료 조건은 10,000 environment-step grace 이후
 `-20` terminal penalty를 한 번 broadcast합니다.
 
 계약의 단일 소스는
-`oht_routing/mdp/reward/config.py`의 `REWARD_N_CONTRACT`와
-`REWARD_N_PROFILE`입니다.
+`oht_routing/mdp/reward/config.py`의 `REWARD_O_CONTRACT`와
+`REWARD_O_PROFILE`입니다.
 
 ## 코드 구조
 
@@ -109,7 +120,7 @@ main.py
 oht_routing/
 ├─ algorithms/rl/contextual_td7/   TD7, SALE, LAP, replay, checkpoint
 ├─ mdp/                            action, observation, transition, termination
-│  └─ reward/                      Reward N 설정, 조합, rail-cycle 추적
+│  └─ reward/                      Reward O 설정, 조합, rail-cycle 추적
 ├─ runtime/                        client, CLI/config, protocol, TCP server
 └─ utils/                          W&B, reward 진단, topology/분석 도구
 oht_dispatching/                   job-to-OHT 후보 생성과 dispatch 선택
@@ -165,15 +176,14 @@ LAP 사용 계약으로 저장됐다면 호환성 검사에서 명시적으로 �
 
 ## Checkpoint와 resume
 
-통합 runtime/checkpoint 버전은 `v3.1.2`입니다. 같은 major의 이전
+통합 runtime/checkpoint 버전은 `v4.0.0`입니다. 같은 major의 이전
 버전 artifact만 현재 runtime보다 새 버전이 아닌 경우 호환될 수 있습니다.
 checkpoint 로드는
 통합 버전, topology/mapping hash, network config, action mode,
-SALE/LAP 사용 여부, Reward N만 호환성으로 검사합니다. replay payload는
+SALE/LAP 사용 여부, Reward O만 호환성으로 검사합니다. replay payload는
 저장하지 않으므로 training resume 후에는 replay를 다시 채워야 합니다.
-v3는 observation과 network 입력 계약이 바뀐 breaking version입니다.
-기존 v2 artifact와 `step_400000.pt`, v2 normalizer 및 10-neighbor topology
-cache는 예외 승격 없이 거부됩니다.
+v4는 recent-TAT availability feature로 observation 입력 계약이 바뀐
+breaking version입니다. 기존 v2/v3 checkpoint와 normalizer는 거부됩니다.
 
 ```powershell
 python .\PythonCode\main.py `
@@ -202,7 +212,7 @@ PyTorch가 memory-efficient attention backward의 비결정적 CUDA 경로를
 `wandb.init`은 runtime config와 `EXP_META`를 함께 기록하고
 `EXP_META["description"]`을 notes로 전달합니다.
 
-현재 v3 변경과 실험 결과는 루트의 `EXPERIMENTS_v3.md`에
+현재 v4 변경과 실험 결과는 루트의 `EXPERIMENTS_v4.md`에
 기록합니다. 모든 변경은 `oht_routing/version.py`의 단일
 `vMAJOR.MINOR.PATCH` 버전으로 분리하고 호환성 영향을 함께 기록합니다.
 MAJOR가 바뀌면 루트에 `EXPERIMENTS_v{new_major}.md`를 새로 만들고,
@@ -218,5 +228,5 @@ $env:PYTHONPATH="$PWD;$PWD\PythonCode;$PWD\PythonCode\tests"
   -m unittest discover -s .\PythonCode\tests -p 'test_contextual*.py'
 ```
 
-Reward N 식의 고정값 검증은
+Reward O 식의 고정값 검증은
 `tests/test_contextual_reward_n_contract.py`에 있습니다.

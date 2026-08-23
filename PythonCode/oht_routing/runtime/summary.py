@@ -139,17 +139,21 @@ def print_runtime_summary(client):
         ),
     )
     print_section(
-        "Reward N",
+        "Reward O",
         (
             ("version", config.reward_version),
             ("rail reward mode", reward.rail_reward_mode),
             ("free-flow neutral ratio", reward.rail_free_flow_neutral_ratio),
+            ("TAT signal", reward.contract.tat_signal_description),
+            ("TAT window seconds", reward.tat_window_seconds),
             ("TAT weight", reward.tat_weight),
             ("operation-rate weight", reward.op_weight),
             ("backlog weight", reward.backlog_weight),
             ("backlog-growth weight", reward.backlog_growth_weight),
             ("idle-reserve weight", reward.idle_reserve_weight),
             ("predicted-OHT weight", reward.local_predicted_oht_weight),
+            ("StopTime aggregation", "sum (unclipped)"),
+            ("StopTime weight", reward.local_stop_weight),
             ("local reward scale", reward.local_reward_scale),
             ("rail TAT weight", reward.rail_tat_weight),
             ("rail TAT clip", reward.rail_tat_clip),

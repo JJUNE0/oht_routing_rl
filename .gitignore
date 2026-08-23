@@ -26,3 +26,4 @@ PythonCode/*.csv
 PythonCode/oht_routing/topology/cache/topology_neighbor_audit.json
 PythonCode/simulator/log/
 PythonCode/simulator/log/*.txt
+PythonCode/tests/

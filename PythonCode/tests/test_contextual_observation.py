@@ -202,9 +202,9 @@ class ContextualObservationTests(unittest.TestCase):
         )
         return builder, pclient, batch
 
-    def test_v3_feature_contract_names_and_dimensions(self):
+    def test_v4_feature_contract_names_and_dimensions(self):
         self.assertEqual(LOCAL_PHYSICAL_DIM, 16)
-        self.assertEqual(GLOBAL_DIM, 17)
+        self.assertEqual(GLOBAL_DIM, 18)
         self.assertEqual(RELATION_DIM, 2)
         self.assertEqual(
             LOCAL_PHYSICAL_FEATURE_NAMES,
@@ -230,7 +230,8 @@ class ContextualObservationTests(unittest.TestCase):
         self.assertEqual(
             GLOBAL_FEATURE_NAMES,
             (
-                "total_tat_s",
+                "recent_completed_tat_300s_mean_s",
+                "recent_completed_tat_300s_available",
                 "operation_rate",
                 "queued_ratio",
                 "waiting_ratio",
@@ -245,7 +246,7 @@ class ContextualObservationTests(unittest.TestCase):
                 "stopped_oht_ratio",
                 "mean_stop_time_s",
                 "backlog_delta_60s",
-                "tat_delta_60s",
+                "recent_completed_tat_delta_60s",
                 "completion_rate_60s",
             ),
         )
@@ -323,11 +324,14 @@ class ContextualObservationTests(unittest.TestCase):
 
     def test_each_global_feature_has_the_declared_meaning(self):
         _, global_raw = self.builder().build_raw(
-            self.pclient(), next_10_route_oht_count=self.route_ahead
+            self.pclient(), next_10_route_oht_count=self.route_ahead,
+            recent_completed_tat_s=120.0,
+            recent_completed_tat_available=True,
         )
         expected = np.asarray(
             (
                 120.0,
+                1.0,
                 0.75,
                 3.0 / 6.0,
                 2.0 / 6.0,
@@ -349,13 +353,30 @@ class ContextualObservationTests(unittest.TestCase):
         )
         np.testing.assert_allclose(global_raw, expected)
 
+    def test_unavailable_recent_tat_is_explicitly_masked(self):
+        builder = self.builder()
+        _, global_raw = builder.build_raw(
+            self.pclient(),
+            next_10_route_oht_count=self.route_ahead,
+            recent_completed_tat_s=220.0,
+            recent_completed_tat_available=False,
+        )
+        np.testing.assert_array_equal(global_raw[:2], (0.0, 0.0))
+        self.assertEqual(
+            builder.diagnostics()[
+                "observation/recent_completed_tat_300s_mean"
+            ],
+            0.0,
+        )
+
     def test_strict_sixty_second_trend_same_time_replace_and_reset(self):
         builder = self.builder()
         self.assertEqual(
             builder._trend_features(
                 sim_time_s=0.0,
                 backlog=10.0,
-                total_tat_s=100.0,
+                recent_completed_tat_s=100.0,
+                recent_completed_tat_available=True,
                 completed_count=99.0,
             ),
             (0.0, 0.0, 0.0),
@@ -364,7 +385,8 @@ class ContextualObservationTests(unittest.TestCase):
             trend = builder._trend_features(
                 sim_time_s=float(second),
                 backlog=10.0 + second,
-                total_tat_s=100.0 + 2.0 * second,
+                recent_completed_tat_s=100.0 + 2.0 * second,
+                recent_completed_tat_available=True,
                 completed_count=1.0,
             )
             self.assertEqual(trend, (0.0, 0.0, 0.0))
@@ -372,7 +394,8 @@ class ContextualObservationTests(unittest.TestCase):
         trend = builder._trend_features(
             sim_time_s=60.0,
             backlog=70.0,
-            total_tat_s=220.0,
+            recent_completed_tat_s=220.0,
+            recent_completed_tat_available=True,
             completed_count=1.0,
         )
         np.testing.assert_allclose(trend, (60.0, 120.0, 1.0))
@@ -380,7 +403,8 @@ class ContextualObservationTests(unittest.TestCase):
         replaced = builder._trend_features(
             sim_time_s=60.0,
             backlog=75.0,
-            total_tat_s=230.0,
+            recent_completed_tat_s=230.0,
+            recent_completed_tat_available=True,
             completed_count=7.0,
         )
         np.testing.assert_allclose(replaced, (65.0, 130.0, 66.0 / 60.0))
@@ -390,7 +414,8 @@ class ContextualObservationTests(unittest.TestCase):
             builder._trend_features(
                 sim_time_s=61.0,
                 backlog=90.0,
-                total_tat_s=300.0,
+                recent_completed_tat_s=300.0,
+                recent_completed_tat_available=True,
                 completed_count=5.0,
             ),
             (0.0, 0.0, 0.0),
@@ -402,14 +427,16 @@ class ContextualObservationTests(unittest.TestCase):
             builder._trend_features(
                 sim_time_s=float(second),
                 backlog=float(second),
-                total_tat_s=float(second),
+                recent_completed_tat_s=float(second),
+                recent_completed_tat_available=True,
                 completed_count=1.0,
             )
         self.assertEqual(
             builder._trend_features(
                 sim_time_s=1.0,
                 backlog=5.0,
-                total_tat_s=7.0,
+                recent_completed_tat_s=7.0,
+                recent_completed_tat_available=True,
                 completed_count=3.0,
             ),
             (0.0, 0.0, 0.0),
@@ -508,6 +535,48 @@ class ContextualObservationTests(unittest.TestCase):
             np.testing.assert_array_equal(
                 getattr(normal, name), getattr(reversed_result, name)
             )
+
+    def test_static_rail_cache_is_reused_while_dynamic_features_refresh(self):
+        builder = self.builder()
+        pclient = self.pclient()
+        first, _ = builder.build_raw(
+            pclient, next_10_route_oht_count=self.route_ahead
+        )
+        cached_template = builder._static_physical_template
+        cached_distances = builder.physical_distance_mm
+
+        pclient.RAILLINE_DIC[10].PredictedOHTCount = 17.0
+        pclient.RAILLINE_DIC[10].ReservationPortCount = 9.0
+        pclient.OHT_DIC[100].State = 5
+        pclient.OHT_DIC[100].StopTime = 4.0
+        second, _ = builder.build_raw(
+            pclient, next_10_route_oht_count={10: 23.0}
+        )
+
+        self.assertIs(builder._static_physical_template, cached_template)
+        self.assertIs(builder.physical_distance_mm, cached_distances)
+        np.testing.assert_array_equal(first[:, :4], second[:, :4])
+        self.assertEqual(second[10, 5], 17.0)
+        self.assertEqual(second[10, 6], 23.0)
+        self.assertEqual(second[10, 7], 9.0)
+        self.assertEqual(second[10, 8 + 5], 1.0)
+        self.assertEqual(second[10, 8:14].sum(), 2.0)
+        self.assertEqual(second[10, 14], 6.0)
+
+    def test_replacing_runtime_rail_dictionary_rebuilds_static_cache(self):
+        builder = self.builder()
+        first_client = self.pclient()
+        first, _ = builder.build_raw(
+            first_client, next_10_route_oht_count=self.route_ahead
+        )
+        first_template = builder._static_physical_template
+        replacement = self.pclient(reverse=True)
+        second, _ = builder.build_raw(
+            replacement, next_10_route_oht_count=self.route_ahead
+        )
+
+        self.assertIsNot(builder._static_physical_template, first_template)
+        np.testing.assert_array_equal(first, second)
 
     def test_local_normalizer_updates_each_physical_rail_exactly_once(self):
         builder, _, _ = self.build()

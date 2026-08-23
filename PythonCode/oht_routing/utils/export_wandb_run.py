@@ -16,8 +16,16 @@ from oht_routing.utils.wandb_logging import (
     WANDB_METRIC_KEYS,
 )
 
-REWARD_N_EXPORT_COLUMNS = {
+REWARD_O_EXPORT_COLUMNS = {
+    "env/recent_completed_tat_300s_mean",
+    "env/recent_completed_tat_300s_p90",
+    "env/recent_completed_tat_300s_count",
+    "env/recent_completed_tat_300s_available",
+    "observation/recent_completed_tat_300s_mean",
+    "observation/recent_completed_tat_300s_available",
     "reward/global/tat_component_raw",
+    "reward/global/recent_completed_tat_300s_mean",
+    "reward/global/cumulative_total_tat",
     "reward/global/backlog_component_raw",
     "reward/global/raw",
     "reward/global/component",
@@ -52,6 +60,20 @@ REWARD_N_EXPORT_COLUMNS = {
     "reward/smooth_penalty_mean",
     "reward/total_mean",
     "reward/total_std",
+} | {
+    f"reward/term_scale/{name}_abs_mean"
+    for name in (
+        "tat", "op", "backlog_level", "backlog_growth", "idle_reserve",
+        "current_oht", "predicted_oht", "stop_time", "local_idle",
+        "capacity", "rail_outcome", "smooth",
+    )
+} | {
+    f"reward/term_share/{name}"
+    for name in (
+        "tat", "op", "backlog_level", "backlog_growth", "idle_reserve",
+        "current_oht", "predicted_oht", "stop_time", "local_idle",
+        "capacity", "rail_outcome", "smooth",
+    )
 }
 WARMUP_BOUNDARY_EXPORT_COLUMNS = {
     "termination/by_warmup",
@@ -91,8 +113,8 @@ if len(WANDB_METRIC_KEYS) != len(set(WANDB_METRIC_KEYS)):
     raise RuntimeError("compact W&B export schema contains duplicate keys")
 if any(key.startswith(REMOVED_WANDB_PREFIXES) for key in WANDB_METRIC_KEYS):
     raise RuntimeError("removed metric group leaked into W&B export schema")
-if not REWARD_N_EXPORT_COLUMNS <= set(WANDB_METRIC_KEYS):
-    raise RuntimeError("Reward N diagnostics are missing from W&B export schema")
+if not REWARD_O_EXPORT_COLUMNS <= set(WANDB_METRIC_KEYS):
+    raise RuntimeError("Reward O diagnostics are missing from W&B export schema")
 if not WARMUP_BOUNDARY_EXPORT_COLUMNS <= set(WANDB_METRIC_KEYS):
     raise RuntimeError("warm-up boundary diagnostics are missing from W&B export schema")
 if not RUNTIME_SAFETY_EXPORT_COLUMNS <= set(WANDB_METRIC_KEYS):

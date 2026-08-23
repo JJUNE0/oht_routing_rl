@@ -88,6 +88,8 @@ class TrainingObservationBuilder:
 
     def build(
         self, pclient, *, next_10_route_oht_count,
+        recent_completed_tat_s=0.0,
+        recent_completed_tat_available=False,
         previous_applied_action=None,
     ):
         step = self.calls
@@ -1494,7 +1496,7 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
         self.assertEqual(runtime.last_diagnostics["env/termination_reason"], 1.0)
         self.assertIsNone(runtime.transition_aligner.pending)
 
-    def test_reward_n_tat_patience_adds_terminal_penalty_once(self):
+    def test_reward_o_tat_patience_adds_terminal_penalty_once(self):
         runtime, pclient = training_runtime(
             replay_capacity_env_steps=512,
             minimum_replay_env_steps=512,
@@ -1644,6 +1646,42 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
             "leadlag/composite_vs_future_tat_500",
             "leadlag/sample_count_500",
         }
+        expected.update({
+            "env/recent_completed_tat_300s_mean",
+            "env/recent_completed_tat_300s_p90",
+            "env/recent_completed_tat_300s_count",
+            "env/recent_completed_tat_300s_available",
+            "env/recent_completed_tat_300s_window_age",
+            "env/recent_completed_tat_events_added",
+            "env/recent_completed_tat_duplicate_events",
+            "env/recent_completed_tat_missing_state5",
+            "env/recent_completed_tat_ambiguous_entries",
+            "observation/recent_completed_tat_300s_mean",
+            "observation/recent_completed_tat_300s_available",
+            "reward/global/recent_completed_tat_300s_mean",
+            "reward/global/recent_completed_tat_300s_p90",
+            "reward/global/recent_completed_tat_300s_count",
+            "reward/global/recent_completed_tat_300s_window_age",
+            "reward/global/recent_completed_tat_events_added",
+            "reward/global/cumulative_total_tat",
+            "reward/global/tat_penalty_start",
+            "reward/global/tat_excess",
+            "reward/global/tat_signal_available",
+            "reward/term_scale/abs_sum",
+            "reward/term_scale/share_sum_error",
+            "reward/term_scale/reconstruction_error",
+        })
+        term_names = {
+            "tat", "op", "backlog_level", "backlog_growth",
+            "idle_reserve", "current_oht", "predicted_oht", "stop_time",
+            "local_idle", "capacity", "rail_outcome", "smooth",
+        }
+        expected.update({
+            f"reward/term_scale/{name}_abs_mean" for name in term_names
+        })
+        expected.update({
+            f"reward/term_share/{name}" for name in term_names
+        })
         self.assertEqual(set(WANDB_METRIC_KEYS), expected)
         self.assertEqual(len(WANDB_METRIC_KEYS), len(expected))
         removed_prefixes = (
@@ -1697,16 +1735,16 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
         self.assertEqual(captured["config"]["EXP_META"], meta)
         self.assertEqual(captured["notes"], meta["description"])
         self.assertEqual(meta["version"], CONTEXTUAL_VERSION)
-        self.assertEqual(meta["reward_version"], "N")
+        self.assertEqual(meta["reward_version"], "O")
         self.assertEqual(
             meta["tat_signal"],
-            "one_sided_total_tat_level",
+            "one_sided_recent_completed_tat_300s_mean",
         )
         self.assertNotIn("marginal_tat_enabled", meta)
         self.assertNotIn("command_trace_selection", meta)
         self.assertNotIn("reward_normalizer_freeze_steps", meta)
-        self.assertEqual(meta["op_weight"], 4.0)
-        self.assertTrue(meta["use_op"])
+        self.assertEqual(meta["op_weight"], 0.0)
+        self.assertFalse(meta["use_op"])
         self.assertEqual(meta["dispatch_mode"], "first-match")
         self.assertIn("dispatch_first_match", meta["note"])
         self.assertEqual(meta["num_stacks"], 1)
@@ -1727,7 +1765,7 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
             warmup_steps=10_000,
             seed=0,
         ))
-        self.assertEqual(experiment_meta["reward_version"], "N")
+        self.assertEqual(experiment_meta["reward_version"], "O")
         self.assertEqual(experiment_meta["action_scale"], 1.0)
         self.assertFalse(experiment_meta["curriculum_enabled"])
         self.assertEqual(

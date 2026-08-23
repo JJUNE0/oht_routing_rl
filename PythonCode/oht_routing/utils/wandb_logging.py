@@ -16,7 +16,7 @@ from oht_routing.mdp.reward.config import (
 )
 from oht_routing.version import CONTEXTUAL_VERSION
 
-_EXP_REWARD_VERSION = "N"
+_EXP_REWARD_VERSION = "O"
 _EXP_REWARD_CONTRACT = reward_contract(_EXP_REWARD_VERSION)
 
 EXP_META = {
@@ -24,10 +24,10 @@ EXP_META = {
     "cost_structure": "b_rl",
     "action_range": "b_rl_0.0-1.0_resume_curriculum_0.05-1",
     "topology": "directed_15in_15out_controlled_centers_v3",
-    "observation": "physical16_embedding8_global17_v3",
+    "observation": "physical16_embedding8_global18_recent_tat300_v4",
     "local_physical_dim": 16,
     "rail_embedding_dim": 8,
-    "global_dim": 17,
+    "global_dim": 18,
     "neighbor_count_per_direction": 15,
     "previous_action_input": (
         "actor_and_critic_previous_applied_action_separate_from_encoder"
@@ -37,32 +37,45 @@ EXP_META = {
     "stack_interval": 1,
     "reward_version": _EXP_REWARD_VERSION,
     "tat_signal": _EXP_REWARD_CONTRACT.tat_signal_description,
-    "calibration_status": "reward_n_only",
+    "calibration_status": "active_rail_calibrated",
     "reward_global_alpha": 0.5,
     "reward_local_alpha": 0.5,
     "tat_reference": 165.0,
-    "tat_weight": 11.0,
+    "tat_penalty_start": 160.0,
+    "tat_window_seconds": 300.0,
+    "tat_weight": 4.3,
     "op_reference": 0.80,
-    "op_weight": 4.0,
-    "use_op": True,
-    "backlog_weight": 0.0004,
+    "op_weight": 0.0,
+    "use_op": False,
+    "backlog_weight": 0.0007,
     "backlog_growth_enabled": True,
     "backlog_growth_horizon": 300,
     "backlog_growth_scale": 30.0,
-    "backlog_growth_weight": 0.16,
+    "backlog_growth_weight": 0.17,
     "idle_reserve_target": 200.0,
     "idle_reserve_scale": 50.0,
-    "idle_reserve_weight": 0.20,
-    "local_oht_weight": 0.3,
-    "local_predicted_oht_weight": 0.075,
-    "local_stop_weight": 0.3,
+    "idle_reserve_weight": 0.09,
+    "local_oht_weight": 0.0,
+    "local_predicted_oht_weight": 0.05,
+    "local_stop_weight": 0.12,
+    "local_stop_aggregation": "sum_unclipped",
     "local_idle_weight": 0.0,
-    "local_capacity_weight": 0.1,
+    "local_capacity_weight": 0.0,
     "local_reward_scale": 2.0,
     "rail_reward_mode": "free_flow_neutral_2",
     "rail_free_flow_neutral_ratio": 2.0,
     "rail_tat_weight": 30.0,
     "rail_tat_clip": 1.0,
+    "reward_target_shares": {
+        "tat": 0.2842,
+        "backlog_level": 0.0842,
+        "backlog_growth": 0.0526,
+        "idle_reserve": 0.0316,
+        "predicted_oht": 0.1263,
+        "stop_time": 0.1895,
+        "rail_outcome": 0.20,
+        "smooth": 0.0316,
+    },
     "action_scale": 0.05,
     "curriculum_scale_start": 0.05,
     "curriculum_scale_end": 1.0,
@@ -94,13 +107,14 @@ EXP_META = {
     "early_stop_tat_threshold": 200.0,
     "tat_above_threshold_patience": 300,
     "terminal_tat_penalty": -20.0,
-    "note": "replay_pack",
+    "note": "activescale",
     "description": (
-        "Contextual TD7 v3.1.2 preserves the v3.1.1 runtime contract and "
-        "routes experiment history by major version. ContextualRuntimeConfig "
-        "remains the only runtime-default source, and the packed 100,000-step "
-        "replay, observation, network, checkpoint, and Reward N contracts "
-        "are unchanged."
+        "This major release replaces cumulative episode TotalTat in the "
+        "observation and Reward O with the mean TAT of commands completed "
+        "during the latest 300 simulation seconds. Reward scales are "
+        "calibrated from the v2.2 2,000-step capture using active rail-step "
+        "distributions; rail StopTime is summed across resident OHTs without "
+        "clipping."
     ),
 }
 
@@ -431,6 +445,15 @@ WANDB_METRIC_KEYS = (
     "episode/step",
     "env/sim_time",
     "env/tat",
+    "env/recent_completed_tat_300s_mean",
+    "env/recent_completed_tat_300s_p90",
+    "env/recent_completed_tat_300s_count",
+    "env/recent_completed_tat_300s_available",
+    "env/recent_completed_tat_300s_window_age",
+    "env/recent_completed_tat_events_added",
+    "env/recent_completed_tat_duplicate_events",
+    "env/recent_completed_tat_missing_state5",
+    "env/recent_completed_tat_ambiguous_entries",
     "env/operation_rate",
     "env/queued",
     "env/waiting",
@@ -465,11 +488,22 @@ WANDB_METRIC_KEYS = (
     "observation/predicted_route10_union_nonzero_pearson",
     "observation/predicted_route10_union_nonzero_pearson_available",
     "observation/predicted_route10_union_nonzero_ratio",
-    # Locked Reward N components and contribution budget.
+    "observation/recent_completed_tat_300s_mean",
+    "observation/recent_completed_tat_300s_available",
+    # Locked Reward O components and contribution budget.
     "reward/total_mean",
     "reward/total_std",
     "reward/terminal_penalty",
     "reward/global/tat_component_raw",
+    "reward/global/recent_completed_tat_300s_mean",
+    "reward/global/recent_completed_tat_300s_p90",
+    "reward/global/recent_completed_tat_300s_count",
+    "reward/global/recent_completed_tat_300s_window_age",
+    "reward/global/recent_completed_tat_events_added",
+    "reward/global/cumulative_total_tat",
+    "reward/global/tat_penalty_start",
+    "reward/global/tat_excess",
+    "reward/global/tat_signal_available",
     "reward/global/backlog_component_raw",
     "reward/global/raw",
     "reward/global/component",
@@ -502,6 +536,25 @@ WANDB_METRIC_KEYS = (
     "reward/budget/rail_share",
     "reward/budget/smooth_share",
     "reward/budget/share_sum_error",
+    "reward/term_scale/abs_sum",
+    "reward/term_scale/share_sum_error",
+    "reward/term_scale/reconstruction_error",
+    *(
+        f"reward/term_scale/{name}_abs_mean"
+        for name in (
+            "tat", "op", "backlog_level", "backlog_growth",
+            "idle_reserve", "current_oht", "predicted_oht", "stop_time",
+            "local_idle", "capacity", "rail_outcome", "smooth",
+        )
+    ),
+    *(
+        f"reward/term_share/{name}"
+        for name in (
+            "tat", "op", "backlog_level", "backlog_growth",
+            "idle_reserve", "current_oht", "predicted_oht", "stop_time",
+            "local_idle", "capacity", "rail_outcome", "smooth",
+        )
+    ),
     "reward/rail/route_ratio_mean",
     "reward/rail/route_ratio_p95",
     "reward/rail/positive_cycle_ratio",
@@ -684,6 +737,7 @@ def runtime_exp_meta(config) -> dict:
         reward_config.rail_free_flow_neutral_ratio
     )
     meta["tat_reference"] = float(reward_config.tat_reference)
+    meta["tat_window_seconds"] = float(reward_config.tat_window_seconds)
     meta["tat_weight"] = float(reward_config.tat_weight)
     meta["op_reference"] = float(reward_config.op_reference)
     meta["op_weight"] = float(reward_config.op_weight)

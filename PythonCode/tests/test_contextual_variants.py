@@ -29,10 +29,10 @@ from test_contextual_sale import sale_replay
 
 
 EXPECTED = {
-    (True, True): "contextual_td7_sale_lap_v3_prevact",
-    (False, True): "contextual_td7_no_sale_lap_v3_prevact",
-    (True, False): "contextual_td7_sale_uniform_v3_prevact",
-    (False, False): "contextual_twin_delayed_uniform_v3_prevact",
+    (True, True): "contextual_td7_sale_lap_v4_recenttat",
+    (False, True): "contextual_td7_no_sale_lap_v4_recenttat",
+    (True, False): "contextual_td7_sale_uniform_v4_recenttat",
+    (False, False): "contextual_twin_delayed_uniform_v4_recenttat",
 }
 
 
@@ -43,7 +43,7 @@ class ContextualVariantTests(unittest.TestCase):
         ):
             return parse_args()
 
-    def test_cli_and_runtime_are_locked_to_reward_n(self):
+    def test_cli_and_runtime_are_locked_to_reward_o(self):
         parsed = self.parse()
         self.assertNotIn("reward_version", vars(parsed))
         self.assertEqual(
@@ -52,28 +52,30 @@ class ContextualVariantTests(unittest.TestCase):
         )
         self.assertEqual(
             runtime_config_from_args(
-                self.parse("--reward-version", "n")
+                self.parse("--reward-version", "o")
             ).reward_version,
-            "N",
+            "O",
         )
         with self.assertRaises(SystemExit):
             self.parse("--reward-version", "E")
-        with self.assertRaisesRegex(ValueError, "only reward_version='N'"):
+        with self.assertRaisesRegex(ValueError, "only reward_version='O'"):
             ContextualRuntimeConfig(reward_version="U")
 
         config = ContextualRuntimeConfig()
-        self.assertEqual(config.reward_version, "N")
+        self.assertEqual(config.reward_version, "O")
         self.assertEqual(config.early_stop_tat_threshold, 200.0)
         self.assertEqual(config.tat_termination_grace_steps, 10_000)
         self.assertEqual(config.tat_above_threshold_patience, 300)
         self.assertEqual(config.terminal_tat_penalty, -20.0)
         reward = make_reward_config(config)
-        self.assertEqual(reward.tat_weight, 11.0)
-        self.assertEqual(reward.op_weight, 4.0)
-        self.assertEqual(reward.backlog_weight, 0.0004)
-        self.assertEqual(reward.backlog_growth_weight, 0.16)
-        self.assertEqual(reward.idle_reserve_weight, 0.20)
-        self.assertEqual(reward.local_predicted_oht_weight, 0.075)
+        self.assertEqual(reward.tat_weight, 4.3)
+        self.assertEqual(reward.op_weight, 0.0)
+        self.assertFalse(reward.use_op)
+        self.assertEqual(reward.tat_window_seconds, 300.0)
+        self.assertEqual(reward.backlog_weight, 0.0007)
+        self.assertEqual(reward.backlog_growth_weight, 0.17)
+        self.assertEqual(reward.idle_reserve_weight, 0.09)
+        self.assertEqual(reward.local_predicted_oht_weight, 0.05)
         self.assertEqual(reward.local_reward_scale, 2.0)
         self.assertEqual(reward.rail_tat_weight, 30.0)
         self.assertEqual(reward.rail_tat_clip, 1.0)

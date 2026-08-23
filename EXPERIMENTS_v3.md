@@ -4,6 +4,31 @@
 기록한다. v2.x 이력은 `EXPERIMENTS_v2.md`, 이전 Reward E~U 이력은
 `EXPERIMENTS.md`에 보존한다. 실험 작성 규칙은 루트 `AGENTS.md`를 따른다.
 
+## 2026-08-23 - v3.1.3 learner throughput refactor
+
+- LAP의 동일 environment-step 내 rail draw를 step별 Python loop 대신
+  2차원 cumulative priority와 chunked vector search로 바꿨다. 기존
+  step-group 순서의 RNG 소비와 `searchsorted(..., side="right")` 경계 의미를
+  그대로 보존하므로 같은 seed에서 뽑히는 transition key가 같다.
+- observation builder는 runtime rail dictionary별로 topology 순서 rail 참조,
+  rail distance, 정적 local feature 4개를 캐시한다. 매 tick에는 dynamic
+  feature 12개만 갱신하며 OHT local/global 집계도 한 번의 배치 순회로 합쳤다.
+  rail dictionary가 교체되면 ID와 distance 계약을 재검증하고 캐시를 다시 만든다.
+- learner stage timing은 구간마다 호출하던 `torch.cuda.synchronize()` 대신
+  CUDA Event를 사용한다. parameter-distance 7개와 일반 scalar 진단값은 각각
+  묶어서 host로 전송해 진단에 의한 GPU pipeline stall을 줄였다.
+- observation/action/reward N/replay sampling distribution/checkpoint 계약과
+  W&B metric key 및 진단 주기는 v3.1.2와 같다. 따라서 v3 checkpoint와
+  normalizer artifact는 기존 major 호환 규칙으로 로드할 수 있다.
+- 4,999-rail CPU fixture에서 observation raw build median은 정적 cache 강제
+  rebuild `54.258 ms`, warm cache `28.535 ms`였다(60회, `25.723 ms` 절감).
+  1,024개 sample이 모두 다른 step인 LAP rail-select microbenchmark median은
+  grouped loop `35.364 ms`, vectorized binary search `34.749 ms`였다(15회).
+- LAP RNG 동등성, observation cache 재사용/교체, learner/SALE/replay 결합을
+  포함한 전체 unittest 290개가 통과했다(환경 의존 CUDA test 1개 skip).
+  현재 검증 환경은 CPU-only이므로 CUDA learner latency는 다음 simulator/W&B
+  run에서 별도로 비교한다.
+
 ## 2026-08-23 - v3.1.2 major-scoped experiment logs
 
 - `EXPERIMENTS_v2.md`에 잘못 섞여 있던 v3.0.0, v3.1.0, v3.1.1

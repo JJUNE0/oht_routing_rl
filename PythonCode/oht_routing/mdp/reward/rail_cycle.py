@@ -1,4 +1,4 @@
-"""Reward N rail-cycle tracking and free-flow credit assignment."""
+"""Reward O rail-cycle tracking and free-flow credit assignment."""
 
 import json
 from dataclasses import dataclass, field
@@ -138,7 +138,7 @@ class CycleRewardOutcome:
 
 
 class ContextualRailRewardMixin:
-    """OHT cycle state machine used by the locked Reward N rail term."""
+    """OHT cycle state machine used by the locked Reward O rail term."""
 
     def _rail_reward_raw(
         self,

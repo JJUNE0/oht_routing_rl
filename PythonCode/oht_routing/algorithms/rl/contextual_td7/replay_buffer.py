@@ -1011,15 +1011,43 @@ class ContextualStepReplayBuffer:
             unique_slots, inverse = np.unique(
                 transition_slots, return_inverse=True
             )
-            for group, slot in enumerate(unique_slots):
-                batch_rows = np.flatnonzero(inverse == group)
-                cdf = np.cumsum(
-                    self._priority[slot], dtype=np.float64
+            # Build every selected step CDF in one NumPy kernel.  The former
+            # implementation scanned ``inverse`` and launched a separate
+            # cumsum/search for almost every batch row because duplicate
+            # environment slots are rare at the production replay size.
+            cdfs = np.cumsum(
+                self._priority[unique_slots], axis=1, dtype=np.float64
+            )
+
+            # Preserve the exact RNG assignment of the former grouped loop:
+            # groups follow sorted ``unique_slots`` and rows within a group
+            # retain their original batch order.  One vector draw consumes
+            # the same generator sequence as the former consecutive draws.
+            grouped_positions = np.argsort(inverse, kind="stable")
+            grouped_random = self.rng.random(int(batch_size))
+            row_random = np.empty(int(batch_size), dtype=np.float64)
+            row_random[grouped_positions] = grouped_random
+            thresholds = row_random * cdfs[inverse, -1]
+
+            # NumPy has no row-wise searchsorted, so perform all row searches
+            # together with a logarithmic batched binary search.  The
+            # ``<=`` branch is exactly searchsorted(..., side="right").
+            lower = np.zeros(int(batch_size), dtype=np.int64)
+            upper = np.full(
+                int(batch_size), self.controlled_count, dtype=np.int64
+            )
+            while np.any(lower < upper):
+                active = lower < upper
+                middle = (lower + upper) // 2
+                # A completed row may equal controlled_count while another
+                # row still searches. Clamp only the unused probe for it.
+                probe = np.minimum(middle, self.controlled_count - 1)
+                move_right = active & (
+                    cdfs[inverse, probe] <= thresholds
                 )
-                thresholds = self.rng.random(batch_rows.size) * cdf[-1]
-                controlled_rows[batch_rows] = np.searchsorted(
-                    cdf, thresholds, side="right"
-                )
+                lower = np.where(move_right, middle + 1, lower)
+                upper = np.where(active & ~move_right, middle, upper)
+            controlled_rows[:] = lower
             sample_probabilities = (
                 self._priority[transition_slots, controlled_rows].astype(
                     np.float64

@@ -26,6 +26,10 @@ from oht_routing.mdp.reward.config import (
     canonical_reward_version,
     reward_contract,
 )
+from oht_routing.mdp.recent_tat import (
+    RecentCompletedTatSnapshot,
+    RecentCompletedTatTracker,
+)
 
 
 class ContextualRewardError(RuntimeError):
@@ -42,23 +46,24 @@ class ContextualRewardConfig:
     action_mode: str = REGION_B_RL
     smooth_b_rl_weight: float = 0.25
     smooth_exp_residual_weight: float = 0.5
-    tat_weight: float = 11.0
-    op_weight: float = 4.0
-    backlog_weight: float = 0.0004
+    tat_weight: float = 4.3
+    tat_window_seconds: float = 300.0
+    op_weight: float = 0.0
+    backlog_weight: float = 0.0007
     backlog_growth_enabled: bool = True
     backlog_growth_horizon: int = 300
     backlog_growth_scale: float = 30.0
-    backlog_growth_weight: float = 0.16
+    backlog_growth_weight: float = 0.17
     idle_reserve_target: float = 200.0
     idle_reserve_scale: float = 50.0
-    idle_reserve_weight: float = 0.20
-    local_oht_weight: float = 0.3
-    local_predicted_oht_weight: float = 0.075
-    local_stop_weight: float = 0.3
+    idle_reserve_weight: float = 0.09
+    local_oht_weight: float = 0.0
+    local_predicted_oht_weight: float = 0.05
+    local_stop_weight: float = 0.12
     local_idle_weight: float = 0.0
-    local_capacity_weight: float = 0.1
+    local_capacity_weight: float = 0.0
     use_tat: bool = True
-    use_op: bool = True
+    use_op: bool = False
     use_backlog: bool = True
     tat_reference: float = 165.0
     op_reference: float = 0.80
@@ -72,7 +77,7 @@ class ContextualRewardConfig:
         *,
         action_mode: str = REGION_B_RL,
     ) -> "ContextualRewardConfig":
-        """Build the single immutable Reward N profile."""
+        """Build the single immutable Reward O profile."""
         canonical_reward_version(reward_version)
         return cls(action_mode=action_mode)
 
@@ -82,7 +87,7 @@ class ContextualRewardConfig:
 
     @property
     def rail_reward_mode(self) -> str:
-        """Constant diagnostic label; Reward N has no rail-mode selector."""
+        """Constant diagnostic label; Reward O has no rail-mode selector."""
         return RAIL_REWARD_FREE_FLOW_NEUTRAL_2
 
     def __post_init__(self):
@@ -91,7 +96,7 @@ class ContextualRewardConfig:
         numeric = (
             self.global_alpha, self.local_alpha, self.rail_tat_weight,
             self.smooth_b_rl_weight, self.smooth_exp_residual_weight,
-            self.tat_weight, self.op_weight,
+            self.tat_weight, self.tat_window_seconds, self.op_weight,
             self.backlog_weight, self.tat_reference, self.op_reference,
             self.backlog_growth_scale, self.backlog_growth_weight,
             self.idle_reserve_target, self.idle_reserve_scale,
@@ -106,6 +111,8 @@ class ContextualRewardConfig:
             raise ValueError("tat_reference must be positive")
         if self.tat_weight < 0:
             raise ValueError("tat_weight must be non-negative")
+        if self.tat_window_seconds <= 0:
+            raise ValueError("tat_window_seconds must be positive")
         if self.local_reward_scale <= 0:
             raise ValueError("local_reward_scale must be positive")
         if self.backlog_weight < 0:
@@ -173,6 +180,11 @@ class ControlledRewardBatch:
     smooth_penalty: np.ndarray
     controlled_rail_ids: np.ndarray
     total_tat_level: float
+    cumulative_total_tat_level: float
+    recent_completed_tat_p90: float
+    recent_completed_tat_event_count: float
+    recent_completed_tat_window_age_s: float
+    recent_completed_tat_events_added: float
     tat_signal_available: float
     tat_error: float
     tat_raw: float
@@ -262,6 +274,9 @@ class ContextualRewardBuilder(ContextualRailRewardMixin):
                 "completion_diagnostic_max_global_step must be non-negative"
             )
         self.reward_steps = 0
+        self._recent_tat_tracker = RecentCompletedTatTracker(
+            window_seconds=self.config.tat_window_seconds
+        )
         self._oht_cycle_trackers: dict[int, OHTCycleTracker] = {}
         self._rail_pass_trackers: dict[int, RailPassTemporalTracker] = {}
         self._reset_temporal()
@@ -287,6 +302,7 @@ class ContextualRewardBuilder(ContextualRailRewardMixin):
         self._last_rail_tat_uncontrolled_assignment_count = 0
         self._oht_cycle_trackers.clear()
         self._rail_pass_trackers.clear()
+        self._recent_tat_tracker.reset_episode()
 
     def reset_episode(self) -> None:
         """Clear only episode-temporal state; training statistics persist."""
@@ -312,23 +328,37 @@ class ContextualRewardBuilder(ContextualRailRewardMixin):
         queued = float(getattr(pclient, "QueuedCommandCount", 0) or 0)
         return waiting, queued
 
+    @property
+    def recent_completed_tat(self) -> RecentCompletedTatSnapshot:
+        return self._recent_tat_tracker.snapshot
+
+    def update_recent_completed_tat(
+        self, pclient
+    ) -> RecentCompletedTatSnapshot:
+        """Advance the shared recent-completion signal once per SimTime tick."""
+        return self._recent_tat_tracker.update(pclient)
+
     def _global_raw(self, pclient) -> float:
-        """Compute the locked Reward N global term from total TAT."""
+        """Compute the Reward O global term from recent completed-job TAT."""
         cfg = self.config
-        cur_tat = float(getattr(pclient, "TotalTat"))
+        recent_tat = self.update_recent_completed_tat(pclient)
+        cumulative_tat = float(getattr(pclient, "TotalTat"))
+        cur_tat = (
+            float(recent_tat.mean_s) if recent_tat.available else 0.0
+        )
         cur_op = float(getattr(pclient, "TotalOhtOperationRate"))
         completed_delta = float(
             getattr(pclient, "CompletedCommandCount", 0) or 0
         )
         waiting, queued = self._job_backlog(pclient)
         if not np.isfinite((
-            cur_tat, cur_op, completed_delta, waiting, queued
+            cumulative_tat, cur_tat, cur_op, completed_delta, waiting, queued
         )).all():
             raise ContextualRewardError(
                 "global reward input contains NaN or Inf"
             )
         self._total_completed_jobs += completed_delta
-        tat_signal_available = cur_tat > 0.0
+        tat_signal_available = bool(recent_tat.available)
         tat_excess = (
             max(0.0, cur_tat - TAT_PENALTY_START)
             if tat_signal_available else 0.0
@@ -391,6 +421,20 @@ class ContextualRewardBuilder(ContextualRailRewardMixin):
             "tat_signal_available": float(tat_signal_available),
             "tat_raw": tat_raw,
             "total_tat": cur_tat,
+            "cumulative_total_tat": cumulative_tat,
+            "recent_completed_tat_p90": recent_tat.p90_s,
+            "recent_completed_tat_event_count": recent_tat.event_count,
+            "recent_completed_tat_window_age_s": recent_tat.window_age_s,
+            "recent_completed_tat_events_added": recent_tat.events_added,
+            "recent_completed_tat_duplicate_event_count": (
+                recent_tat.duplicate_event_count
+            ),
+            "recent_completed_tat_missing_state5_tat_count": (
+                recent_tat.missing_state5_tat_count
+            ),
+            "recent_completed_tat_ambiguous_entry_count": (
+                recent_tat.ambiguous_entry_count
+            ),
             "completed_episode": self._total_completed_jobs,
             "completed_delta": completed_delta,
             "op_rate": cur_op,
@@ -432,10 +476,9 @@ class ContextualRewardBuilder(ContextualRailRewardMixin):
                 ohts[oht_id] for oht_id in getattr(rail, "OhtList")
                 if oht_id in ohts
             ]
-            avg_stop = (
-                float(np.mean([float(getattr(oht, "StopTime")) for oht in rail_ohts]))
-                if rail_ohts else 0.0
-            )
+            stop_time_sum = float(sum(
+                float(getattr(oht, "StopTime")) for oht in rail_ohts
+            ))
             oht_count = len(getattr(rail, "OhtList"))
             capacity = oht_count / max(1, int(getattr(rail, "PortCount")) + 1)
             result[row] = 0.0
@@ -444,7 +487,12 @@ class ContextualRewardBuilder(ContextualRailRewardMixin):
                 -self.config.local_predicted_oht_weight
                 * float(getattr(rail, "PredictedOHTCount"))
             )
-            local_values["stop"][row] = -self.config.local_stop_weight * avg_stop
+            # Reward O deliberately keeps this rail-local congestion signal
+            # additive and unclipped. Multiple stopped OHTs and worsening
+            # dwell must remain distinguishable to the policy.
+            local_values["stop"][row] = (
+                -self.config.local_stop_weight * stop_time_sum
+            )
             idle_observation[row] = float(getattr(rail, "IdleOHTCount"))
             local_values["idle"][row] = (
                 -self.config.local_idle_weight * idle_observation[row]
@@ -540,6 +588,21 @@ class ContextualRewardBuilder(ContextualRailRewardMixin):
             global_normalized=float(global_normalized),
             global_component=float(global_component),
             total_tat_level=float(self._last_global_terms["total_tat"]),
+            cumulative_total_tat_level=float(
+                self._last_global_terms["cumulative_total_tat"]
+            ),
+            recent_completed_tat_p90=float(
+                self._last_global_terms["recent_completed_tat_p90"]
+            ),
+            recent_completed_tat_event_count=float(
+                self._last_global_terms["recent_completed_tat_event_count"]
+            ),
+            recent_completed_tat_window_age_s=float(
+                self._last_global_terms["recent_completed_tat_window_age_s"]
+            ),
+            recent_completed_tat_events_added=float(
+                self._last_global_terms["recent_completed_tat_events_added"]
+            ),
             tat_signal_available=float(
                 self._last_global_terms["tat_signal_available"]
             ),
@@ -645,6 +708,53 @@ class ContextualRewardBuilder(ContextualRailRewardMixin):
         backlog_contribution = (
             self.config.global_alpha * batch.backlog_raw
         )
+        term_abs = {
+            "tat": abs(self.config.global_alpha * batch.tat_raw),
+            "op": abs(self.config.global_alpha * batch.op_raw),
+            "backlog_level": abs(
+                self.config.global_alpha * batch.backlog_raw
+            ),
+            "backlog_growth": abs(
+                self.config.global_alpha * batch.backlog_growth_raw
+            ),
+            "idle_reserve": abs(
+                self.config.global_alpha * batch.idle_reserve_raw
+            ),
+            "current_oht": float(np.mean(np.abs(
+                self.config.local_alpha
+                * batch.local_oht_raw
+                / self.config.local_reward_scale
+            ))),
+            "predicted_oht": float(np.mean(np.abs(
+                self.config.local_alpha
+                * batch.local_predicted_raw
+                / self.config.local_reward_scale
+            ))),
+            "stop_time": float(np.mean(np.abs(
+                self.config.local_alpha
+                * batch.local_stop_raw
+                / self.config.local_reward_scale
+            ))),
+            "local_idle": float(np.mean(np.abs(
+                self.config.local_alpha
+                * batch.local_idle_raw
+                / self.config.local_reward_scale
+            ))),
+            "capacity": float(np.mean(np.abs(
+                self.config.local_alpha
+                * batch.local_capacity_raw
+                / self.config.local_reward_scale
+            ))),
+            "rail_outcome": float(np.mean(np.abs(
+                batch.rail_reward_postclip
+            ))),
+            "smooth": float(np.mean(np.abs(batch.smooth_penalty))),
+        }
+        term_abs_sum = float(sum(term_abs.values()))
+        term_shares = {
+            name: value / term_abs_sum if term_abs_sum > 0.0 else 0.0
+            for name, value in term_abs.items()
+        }
         budget_abs = {
             "tat_raw": abs(batch.tat_raw),
             "backlog_raw": abs(batch.backlog_raw),
@@ -667,7 +777,29 @@ class ContextualRewardBuilder(ContextualRailRewardMixin):
         result = {
             "reward/global_raw": batch.global_raw,
             "reward/global/total_tat": batch.total_tat_level,
+            "reward/global/recent_completed_tat_300s_mean": (
+                batch.total_tat_level
+            ),
+            "reward/global/recent_completed_tat_300s_p90": (
+                batch.recent_completed_tat_p90
+            ),
+            "reward/global/recent_completed_tat_300s_count": (
+                batch.recent_completed_tat_event_count
+            ),
+            "reward/global/recent_completed_tat_300s_window_age": (
+                batch.recent_completed_tat_window_age_s
+            ),
+            "reward/global/recent_completed_tat_events_added": (
+                batch.recent_completed_tat_events_added
+            ),
+            "reward/global/cumulative_total_tat": (
+                batch.cumulative_total_tat_level
+            ),
             "reward/global/tat_reference": self.config.tat_reference,
+            "reward/global/tat_penalty_start": TAT_PENALTY_START,
+            "reward/global/tat_excess": max(
+                0.0, batch.total_tat_level - TAT_PENALTY_START
+            ) if batch.tat_signal_available else 0.0,
             "reward/global/tat_error": batch.tat_error,
             "reward/global/tat_weight": self.config.tat_weight,
             "reward/global/tat_signal_available": (
@@ -907,7 +1039,22 @@ class ContextualRewardBuilder(ContextualRailRewardMixin):
             "reward/budget/share_sum_error": abs(
                 1.0 - sum(budget_shares.values())
             ) if budget_total > 0.0 else 0.0,
+            "reward/term_scale/abs_sum": term_abs_sum,
+            "reward/term_scale/share_sum_error": abs(
+                1.0 - sum(term_shares.values())
+            ) if term_abs_sum > 0.0 else 0.0,
+            "reward/term_scale/reconstruction_error": abs(float(
+                batch.total.mean()
+                - batch.terminal_penalty
+                - batch.global_component
+                - float(batch.local_component.mean())
+                - float(batch.rail_reward_postclip.mean())
+                + float(batch.smooth_penalty.mean())
+            )),
         }
+        for name, value in term_abs.items():
+            result[f"reward/term_scale/{name}_abs_mean"] = value
+            result[f"reward/term_share/{name}"] = term_shares[name]
         for name, values in (
             ("oht", batch.local_oht_raw),
             ("predicted", batch.local_predicted_raw),
@@ -920,7 +1067,7 @@ class ContextualRewardBuilder(ContextualRailRewardMixin):
             result[f"reward/local/{name}_raw_abs_mean"] = float(
                 np.abs(values).mean()
             )
-            # Compact Reward N metrics use coefficient-applied subterms,
+            # Compact Reward O metrics use coefficient-applied subterms,
             # not the unweighted input features.
             compact_name = "pred" if name == "predicted" else name
             result[f"local/{compact_name}_abs_mean"] = float(

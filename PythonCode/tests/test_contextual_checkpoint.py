@@ -31,19 +31,19 @@ class CheckpointObservationBuilder(FakeObservationBuilder):
     def __init__(self, topology):
         super().__init__(topology)
         self.local_normalizer = RunningFeatureNormalizer(16)
-        self.global_normalizer = RunningFeatureNormalizer(17)
+        self.global_normalizer = RunningFeatureNormalizer(18)
         self.local_normalizer.update(
             np.ones((4999, 16)), name="checkpoint_local"
         )
         self.global_normalizer.update(
-            np.ones((1, 17)), name="checkpoint_global"
+            np.ones((1, 18)), name="checkpoint_global"
         )
         self.local_normalizer.freeze()
         self.global_normalizer.freeze()
 
 
 def components(
-    seed=17, *, sale=False, lap=False, reward_version="N", batch_size=16
+    seed=17, *, sale=False, lap=False, reward_version="O", batch_size=16
 ):
     topology = make_topology()
     builder = CheckpointObservationBuilder(topology)
@@ -116,7 +116,7 @@ class ContextualCheckpointTests(unittest.TestCase):
         learner, obs, reward = components()
         with tempfile.TemporaryDirectory() as directory:
             path = save_contextual_checkpoint(
-                Path(directory) / "reward_n.pt",
+                Path(directory) / "reward_o.pt",
                 learner,
                 observation_builder=obs,
                 reward_builder=reward,
@@ -164,7 +164,7 @@ class ContextualCheckpointTests(unittest.TestCase):
                 learner,
                 observation_builder=obs,
                 reward_builder=reward,
-                runtime_config={"reward_version": "N"},
+                runtime_config={"reward_version": "O"},
             )
             payload = torch.load(path, weights_only=False)
             payload.pop("version")
@@ -207,7 +207,7 @@ class ContextualCheckpointTests(unittest.TestCase):
                 learner,
                 observation_builder=obs,
                 reward_builder=reward,
-                runtime_config={"reward_version": "N"},
+                runtime_config={"reward_version": "O"},
             )
             payload = torch.load(path, weights_only=False)
             payload["version"] = "v2.0.0"

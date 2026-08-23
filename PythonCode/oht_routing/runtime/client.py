@@ -1192,6 +1192,13 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
         sim_time, stale_sim_time_ticks, protocol_stalled = (
             self._sim_time_progress(pclient)
         )
+        recent_tat = self.reward_builder.update_recent_completed_tat(pclient)
+        # Expose the shared snapshot to capture/debug consumers without
+        # recomputing lifecycle events in a second tracker.
+        pclient.RecentCompletedTat300s = float(recent_tat.mean_s)
+        pclient.RecentCompletedTat300sP90 = float(recent_tat.p90_s)
+        pclient.RecentCompletedTat300sCount = int(recent_tat.event_count)
+        pclient.RecentCompletedTat300sAvailable = bool(recent_tat.available)
         queued = float(getattr(pclient, "QueuedCommandCount", 0) or 0)
         total_tat = float(getattr(pclient, "TotalTat", 0.0) or 0.0)
         done_by_queue = queued > self.config.early_stop_queued_threshold
@@ -1238,6 +1245,8 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
         observation = self.observation_builder.build(
             pclient,
             next_10_route_oht_count=self.parameterC,
+            recent_completed_tat_s=recent_tat.mean_s,
+            recent_completed_tat_available=recent_tat.available,
             previous_applied_action=(
                 np.zeros(
                     (len(self.topology.controlled_rail_ids), 1),
@@ -1677,6 +1686,29 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
             "env/step": float(self.total_steps),
             "env/episode": float(self.episode_id),
             "env/tat": float(getattr(pclient, "TotalTat", 0.0)),
+            "env/recent_completed_tat_300s_mean": float(recent_tat.mean_s),
+            "env/recent_completed_tat_300s_p90": float(recent_tat.p90_s),
+            "env/recent_completed_tat_300s_count": float(
+                recent_tat.event_count
+            ),
+            "env/recent_completed_tat_300s_available": float(
+                recent_tat.available
+            ),
+            "env/recent_completed_tat_300s_window_age": float(
+                recent_tat.window_age_s
+            ),
+            "env/recent_completed_tat_events_added": float(
+                recent_tat.events_added
+            ),
+            "env/recent_completed_tat_duplicate_events": float(
+                recent_tat.duplicate_event_count
+            ),
+            "env/recent_completed_tat_missing_state5": float(
+                recent_tat.missing_state5_tat_count
+            ),
+            "env/recent_completed_tat_ambiguous_entries": float(
+                recent_tat.ambiguous_entry_count
+            ),
             "env/operation_rate": float(
                 getattr(pclient, "TotalOhtOperationRate", 0.0)
             ),
@@ -1703,6 +1735,10 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
             "protocol/stale_sim_time_ticks": float(stale_sim_time_ticks),
             "curriculum/action_scale": current_action_scale,
             "global/tat": float(getattr(pclient, "TotalTat", 0.0)),
+            "global/recent_completed_tat_300s": float(recent_tat.mean_s),
+            "global/recent_completed_tat_300s_available": float(
+                recent_tat.available
+            ),
             "global/op_rate": float(
                 getattr(pclient, "TotalOhtOperationRate", 0.0)
             ),

@@ -30,7 +30,7 @@ def parse_args():
         type=canonical_reward_version,
         choices=REWARD_VERSIONS,
         help=(
-            "Compatibility flag for the single locked Reward N contract."
+            "Compatibility flag for the single locked Reward O contract."
         ),
     )
     parser.add_argument("--action-enabled", action="store_true")

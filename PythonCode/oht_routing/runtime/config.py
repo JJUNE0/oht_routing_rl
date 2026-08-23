@@ -187,7 +187,7 @@ def seed_everything(seed):
 
 
 def restore_checkpoint_runtime_config(config_kwargs, checkpoint_path):
-    """Apply saved Reward N settings while preserving launch controls."""
+    """Apply saved Reward O settings while preserving launch controls."""
     saved, _ = read_contextual_runtime_config(checkpoint_path)
     valid_fields = set(ContextualRuntimeConfig.__dataclass_fields__)
     restored = []

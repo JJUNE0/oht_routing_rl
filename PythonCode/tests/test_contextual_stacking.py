@@ -105,7 +105,7 @@ class ContextualStackingTests(unittest.TestCase):
         self.assertEqual(batch.center_rail_index.shape, (128, 3))
         self.assertEqual(batch.incoming_rail_indices.shape, (128, 3, 15))
         self.assertEqual(batch.outgoing_rail_indices.shape, (128, 3, 15))
-        self.assertEqual(batch.global_state.shape, (128, 3, 17))
+        self.assertEqual(batch.global_state.shape, (128, 3, 18))
         self.assertEqual(batch.center_rail_index.dtype, torch.long)
         self.assertEqual(batch.incoming_rail_indices.dtype, torch.long)
         self.assertEqual(batch.outgoing_rail_indices.dtype, torch.long)

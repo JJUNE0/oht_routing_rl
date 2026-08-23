@@ -18,7 +18,7 @@ SMALL_NETWORK = ContextualNetworkConfig(
     local_physical_dim=16,
     rail_embedding_dim=8,
     num_rails=4_999,
-    global_dim=17,
+    global_dim=18,
     neighbor_count=15,
     d_model=16, num_heads=4, global_emb_dim=8,
     context_dim=32, hidden_dim=64,

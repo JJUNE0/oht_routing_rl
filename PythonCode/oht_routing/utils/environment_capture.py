@@ -549,6 +549,18 @@ class ActorEnvironmentCapture:
             "sim_time_s": sim_time,
             "environment": {
                 "total_tat_s": _number(getattr(pclient, "TotalTat", None)),
+                "recent_completed_tat_300s_mean_s": _number(
+                    getattr(pclient, "RecentCompletedTat300s", None)
+                ),
+                "recent_completed_tat_300s_p90_s": _number(
+                    getattr(pclient, "RecentCompletedTat300sP90", None)
+                ),
+                "recent_completed_tat_300s_count": _integer(
+                    getattr(pclient, "RecentCompletedTat300sCount", 0)
+                ),
+                "recent_completed_tat_300s_available": bool(
+                    getattr(pclient, "RecentCompletedTat300sAvailable", False)
+                ),
                 "operation_rate": _number(
                     getattr(pclient, "TotalOhtOperationRate", None)
                 ),

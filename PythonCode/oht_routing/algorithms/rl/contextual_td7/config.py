@@ -7,10 +7,10 @@ from .stacking import validate_stack_config
 
 def contextual_algorithm_variant(sale_enabled: bool, lap_enabled: bool) -> str:
     return {
-        (True, True): "contextual_td7_sale_lap_v3_prevact",
-        (False, True): "contextual_td7_no_sale_lap_v3_prevact",
-        (True, False): "contextual_td7_sale_uniform_v3_prevact",
-        (False, False): "contextual_twin_delayed_uniform_v3_prevact",
+        (True, True): "contextual_td7_sale_lap_v4_recenttat",
+        (False, True): "contextual_td7_no_sale_lap_v4_recenttat",
+        (True, False): "contextual_td7_sale_uniform_v4_recenttat",
+        (False, False): "contextual_twin_delayed_uniform_v4_recenttat",
     }[(bool(sale_enabled), bool(lap_enabled))]
 
 
@@ -20,7 +20,7 @@ class ContextualNetworkConfig:
     rail_embedding_dim: int = 8
     num_rails: int = 4_999
     relation_dim: int = 2
-    global_dim: int = 17
+    global_dim: int = 18
     neighbor_count: int = 15
     d_model: int = 64
     num_heads: int = 4

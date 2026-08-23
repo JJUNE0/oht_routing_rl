@@ -13,22 +13,22 @@ from oht_routing.mdp.termination import (
     tat_termination_profile,
 )
 from test_contextual_observation import CONTROLLED_COUNT, make_topology
-from test_contextual_reward import reward_client
+from test_contextual_reward import prime_recent_tat, reward_client
 
 
-class RewardNContractTests(unittest.TestCase):
-    """Characterization tests for the v2 Reward N executable baseline."""
+class RewardOContractTests(unittest.TestCase):
+    """Characterization tests for the v4 Reward O executable baseline."""
 
     def setUp(self):
         self.config = ContextualRewardConfig.for_version(
-            "N", action_mode=REGION_B_RL
+            "O", action_mode=REGION_B_RL
         )
         self.topology = make_topology()
 
-    def test_locked_profile_matches_latest_reward_n_run(self):
+    def test_locked_profile_matches_reward_o_run(self):
         config = self.config
         expected = {
-            "reward_version": "N",
+            "reward_version": "O",
             "global_alpha": 0.5,
             "local_alpha": 0.5,
             "rail_tat_weight": 30.0,
@@ -37,22 +37,23 @@ class RewardNContractTests(unittest.TestCase):
             "smooth_b_rl_weight": 0.25,
             "smooth_exp_residual_weight": 0.5,
             "tat_reference": 165.0,
-            "tat_weight": 11.0,
-            "op_weight": 4.0,
-            "use_op": True,
-            "backlog_weight": 0.0004,
+            "tat_weight": 4.3,
+            "tat_window_seconds": 300.0,
+            "op_weight": 0.0,
+            "use_op": False,
+            "backlog_weight": 0.0007,
             "backlog_growth_enabled": True,
             "backlog_growth_horizon": 300,
             "backlog_growth_scale": 30.0,
-            "backlog_growth_weight": 0.16,
+            "backlog_growth_weight": 0.17,
             "idle_reserve_target": 200.0,
             "idle_reserve_scale": 50.0,
-            "idle_reserve_weight": 0.20,
-            "local_oht_weight": 0.3,
-            "local_predicted_oht_weight": 0.075,
-            "local_stop_weight": 0.3,
+            "idle_reserve_weight": 0.09,
+            "local_oht_weight": 0.0,
+            "local_predicted_oht_weight": 0.05,
+            "local_stop_weight": 0.12,
             "local_idle_weight": 0.0,
-            "local_capacity_weight": 0.1,
+            "local_capacity_weight": 0.0,
             "local_reward_scale": 2.0,
             "rail_tat_clip": 1.0,
         }
@@ -73,8 +74,8 @@ class RewardNContractTests(unittest.TestCase):
                     self.topology, self.config
                 )
                 client = reward_client()
-                client.TotalTat = total_tat
                 client.TotalOhtOperationRate = 0.8
+                prime_recent_tat(builder, client, total_tat)
                 batch = builder.build(
                     client,
                     applied_action=action,
@@ -82,8 +83,8 @@ class RewardNContractTests(unittest.TestCase):
                     env_step=0,
                     episode_id=0,
                 )
-                tat_raw = -11.0 * excess / 165.0
-                expected_global_raw = tat_raw - 0.0004 * 5.0 - 0.20
+                tat_raw = -4.3 * excess / 165.0
+                expected_global_raw = tat_raw - 0.0007 * 5.0 - 0.09
                 self.assertAlmostEqual(batch.tat_raw, tat_raw)
                 self.assertAlmostEqual(batch.global_raw, expected_global_raw)
                 self.assertAlmostEqual(
@@ -91,8 +92,9 @@ class RewardNContractTests(unittest.TestCase):
                 )
 
     def test_reward_and_termination_identity(self):
-        contract = reward_contract("N")
-        self.assertEqual(contract.version, "N")
+        contract = reward_contract("O")
+        self.assertEqual(contract.version, "O")
+        self.assertEqual(contract.tat_window_seconds, 300.0)
         self.assertEqual(
             tat_termination_profile(
                 TAT_TERMINATION_REWARD_PROFILE, contract

@@ -130,7 +130,7 @@ class ContextualReplayTests(unittest.TestCase):
         )
         batch = replay.sample(16)
         self.assertEqual(LOCAL_PHYSICAL_DIM, 16)
-        self.assertEqual(GLOBAL_DIM, 17)
+        self.assertEqual(GLOBAL_DIM, 18)
         self.assertEqual(self.topology.incoming_neighbor_ids.shape[1], 15)
         self.assertEqual(self.topology.outgoing_neighbor_ids.shape[1], 15)
         expected_shapes = {
@@ -142,7 +142,7 @@ class ContextualReplayTests(unittest.TestCase):
             "outgoing_rail_indices": (16, 15),
             "incoming_relation": (16, 15, 2),
             "outgoing_relation": (16, 15, 2),
-            "global_state": (16, 17),
+            "global_state": (16, 18),
             "previous_applied_action": (16, 1),
             "policy_action": (16, 1),
             "applied_action": (16, 1),
@@ -488,8 +488,8 @@ class ContextualReplayTests(unittest.TestCase):
         self.assertEqual(replay._policy_action.dtype, np.int16)
         self.assertEqual(replay._applied_action.dtype, np.int16)
 
-    def test_replay_is_locked_to_reward_n(self):
-        with self.assertRaisesRegex(ValueError, "only reward_version='N'"):
+    def test_replay_is_locked_to_reward_o(self):
+        with self.assertRaisesRegex(ValueError, "only reward_version='O'"):
             ContextualStepReplayBuffer(
                 self.topology,
                 self.builder,

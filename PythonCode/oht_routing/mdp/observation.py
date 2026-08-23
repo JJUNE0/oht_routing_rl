@@ -41,7 +41,8 @@ LOCAL_PHYSICAL_FEATURE_NAMES = (
     "stopped_oht_count",
 )
 GLOBAL_FEATURE_NAMES = (
-    "total_tat_s",
+    "recent_completed_tat_300s_mean_s",
+    "recent_completed_tat_300s_available",
     "operation_rate",
     "queued_ratio",
     "waiting_ratio",
@@ -56,7 +57,7 @@ GLOBAL_FEATURE_NAMES = (
     "stopped_oht_ratio",
     "mean_stop_time_s",
     "backlog_delta_60s",
-    "tat_delta_60s",
+    "recent_completed_tat_delta_60s",
     "completion_rate_60s",
 )
 RELATION_FEATURE_NAMES = (
@@ -288,9 +289,15 @@ class ContextualObservationBuilder:
             RELATION_DIM, epsilon=self.config.epsilon, clip=self.config.clip
         )
         self.env_steps = 0
-        self._trend_history: deque[tuple[float, float, float, float]] = deque()
+        self._trend_history: deque[
+            tuple[float, float, float, float, bool]
+        ] = deque()
         self.last_diagnostics: dict[str, float] = {}
         self._physical_distance_mm: np.ndarray | None = None
+        self._cached_runtime_rail_lines = None
+        self._cached_runtime_rail_count = 0
+        self._ordered_runtime_rails: tuple[object, ...] = ()
+        self._static_physical_template: np.ndarray | None = None
 
         self._rail_id_to_physical_row = {
             int(rail_id): row
@@ -416,7 +423,8 @@ class ContextualObservationBuilder:
         *,
         sim_time_s: float,
         backlog: float,
-        total_tat_s: float,
+        recent_completed_tat_s: float,
+        recent_completed_tat_available: bool,
         completed_count: float,
     ) -> tuple[float, float, float]:
         now = float(sim_time_s)
@@ -431,10 +439,13 @@ class ContextualObservationBuilder:
         entry = (
             now,
             self._finite_nonnegative(backlog, name="trend backlog"),
-            self._finite_nonnegative(total_tat_s, name="trend total TAT"),
+            self._finite_nonnegative(
+                recent_completed_tat_s, name="trend recent completed TAT"
+            ),
             self._finite_nonnegative(
                 completed_count, name="trend completed count"
             ),
+            bool(recent_completed_tat_available),
         )
         self._trend_history.append(entry)
         cutoff = now - TREND_WINDOW_SECONDS
@@ -448,13 +459,16 @@ class ContextualObservationBuilder:
             self._trend_history.popleft()
         if self._trend_history[0][0] > cutoff:
             return 0.0, 0.0, 0.0
-        _, anchor_backlog, anchor_tat, _ = self._trend_history[0]
+        _, anchor_backlog, anchor_tat, _, anchor_tat_available = (
+            self._trend_history[0]
+        )
         completion_rate = sum(
             item[3] for item in self._trend_history if item[0] > cutoff
         ) / TREND_WINDOW_SECONDS
         return (
             float(entry[1] - anchor_backlog),
-            float(entry[2] - anchor_tat),
+            float(entry[2] - anchor_tat)
+            if entry[4] and anchor_tat_available else 0.0,
             float(completion_rate),
         )
 
@@ -471,19 +485,15 @@ class ContextualObservationBuilder:
             )
         return self._physical_distance_mm
 
-    def build_raw(
-        self,
-        pclient,
-        *,
-        next_10_route_oht_count: Mapping[int, float],
-    ) -> tuple[np.ndarray, np.ndarray]:
-        rail_lines = getattr(pclient, "RAILLINE_DIC", {})
-        runtime_ohts = getattr(pclient, "OHT_DIC", {})
-        ohts = {int(oht_id): oht for oht_id, oht in runtime_ohts.items()}
-        if len(ohts) != len(runtime_ohts):
-            raise ObservationContractError(
-                "OHT_DIC contains duplicate IDs after integer canonicalization"
-            )
+    def _ensure_static_rail_cache(self, rail_lines) -> None:
+        """Cache topology-ordered rail references and invariant raw features."""
+        if (
+            rail_lines is self._cached_runtime_rail_lines
+            and len(rail_lines) == self._cached_runtime_rail_count
+            and self._static_physical_template is not None
+        ):
+            return
+
         actual_ids = {int(rail_id) for rail_id in rail_lines}
         expected_ids = set(self._rail_id_to_physical_row)
         if actual_ids != expected_ids:
@@ -493,38 +503,84 @@ class ContextualObservationBuilder:
                 f"unexpected={sorted(actual_ids - expected_ids)[:20]}"
             )
 
-        physical_local = np.empty(
-            (len(self.topology.all_rail_ids), LOCAL_PHYSICAL_DIM),
-            dtype=np.float64,
+        physical_count = len(self.topology.all_rail_ids)
+        static_template = np.zeros(
+            (physical_count, LOCAL_PHYSICAL_DIM), dtype=np.float64
         )
-        physical_distance_mm = np.empty(
-            len(self.topology.all_rail_ids), dtype=np.float64
-        )
-        global_state_counts = np.zeros(6, dtype=np.float64)
-        global_stop_time_sum = 0.0
-        global_stopped_oht_count = 0.0
-        for oht_id, oht in ohts.items():
-            state = int(getattr(oht, "State", -1))
-            if state not in VALID_OHT_STATES:
-                raise ObservationContractError(
-                    f"OHT {oht_id} has unsupported state {state}"
-                )
-            stop_time = self._finite_nonnegative(
-                getattr(oht, "StopTime", 0.0),
-                name=f"OHT {oht_id} StopTime",
-            )
-            global_state_counts[state] += 1.0
-            global_stop_time_sum += stop_time
-            global_stopped_oht_count += float(stop_time > 0.0)
-
-        oht_placement: dict[int, int] = {}
+        physical_distance_mm = np.empty(physical_count, dtype=np.float64)
+        ordered_rails = []
         for physical_row, rail_id_value in enumerate(self.topology.all_rail_ids):
             rail_id = int(rail_id_value)
             rail = rail_lines[rail_id]
+            ordered_rails.append(rail)
+            distance_mm = self._finite_nonnegative(
+                getattr(rail, "Distance", 0.0),
+                name=f"rail {rail_id} Distance",
+            )
+            if distance_mm <= 0.0:
+                raise ObservationContractError(
+                    f"rail {rail_id} Distance must be positive"
+                )
+            physical_distance_mm[physical_row] = distance_mm
+            static_template[physical_row, :4] = (
+                self._finite_nonnegative(
+                    getattr(rail, "DistancePerVelocity"),
+                    name=f"rail {rail_id} DistancePerVelocity",
+                ),
+                self._finite_nonnegative(
+                    getattr(rail, "PortCount"),
+                    name=f"rail {rail_id} PortCount",
+                ),
+                float(len(getattr(rail, "LevelJoiningLineIDList"))),
+                float(len(getattr(rail, "DivergingLineIDList"))),
+            )
+
+        if self._physical_distance_mm is None:
+            physical_distance_mm = np.ascontiguousarray(physical_distance_mm)
+            physical_distance_mm.setflags(write=False)
+            self._physical_distance_mm = physical_distance_mm
+        elif not np.array_equal(
+            self._physical_distance_mm, physical_distance_mm
+        ):
+            raise ObservationContractError(
+                "runtime physical rail Distance changed after initialization"
+            )
+
+        static_template = np.ascontiguousarray(static_template)
+        static_template.setflags(write=False)
+        self._static_physical_template = static_template
+        self._ordered_runtime_rails = tuple(ordered_rails)
+        self._cached_runtime_rail_lines = rail_lines
+        self._cached_runtime_rail_count = len(rail_lines)
+
+    def build_raw(
+        self,
+        pclient,
+        *,
+        next_10_route_oht_count: Mapping[int, float],
+        recent_completed_tat_s: float = 0.0,
+        recent_completed_tat_available: bool = False,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        rail_lines = getattr(pclient, "RAILLINE_DIC", {})
+        runtime_ohts = getattr(pclient, "OHT_DIC", {})
+        ohts = {int(oht_id): oht for oht_id, oht in runtime_ohts.items()}
+        if len(ohts) != len(runtime_ohts):
+            raise ObservationContractError(
+                "OHT_DIC contains duplicate IDs after integer canonicalization"
+            )
+        self._ensure_static_rail_cache(rail_lines)
+        assert self._static_physical_template is not None
+        physical_local = self._static_physical_template.copy()
+        global_state_counts = np.zeros(6, dtype=np.float64)
+        global_stop_time_sum = 0.0
+        global_stopped_oht_count = 0.0
+
+        oht_placement: dict[int, int] = {}
+        for physical_row, (rail_id_value, rail) in enumerate(
+            zip(self.topology.all_rail_ids, self._ordered_runtime_rails)
+        ):
+            rail_id = int(rail_id_value)
             rail_oht_ids = tuple(int(value) for value in getattr(rail, "OhtList"))
-            state_counts = np.zeros(6, dtype=np.float64)
-            stop_time_sum = 0.0
-            stopped_oht_count = 0.0
             for oht_id in rail_oht_ids:
                 if oht_id not in ohts:
                     raise ObservationContractError(
@@ -547,27 +603,14 @@ class ContextualObservationBuilder:
                     getattr(oht, "StopTime", 0.0),
                     name=f"OHT {oht_id} StopTime",
                 )
-                state_counts[state] += 1.0
-                stop_time_sum += stop_time
-                stopped_oht_count += float(stop_time > 0.0)
-            distance_mm = self._finite_nonnegative(
-                getattr(rail, "Distance", 0.0),
-                name=f"rail {rail_id} Distance",
-            )
-            if distance_mm <= 0.0:
-                raise ObservationContractError(
-                    f"rail {rail_id} Distance must be positive"
-                )
-            physical_distance_mm[physical_row] = distance_mm
+                physical_local[physical_row, 8 + state] += 1.0
+                physical_local[physical_row, 14] += stop_time
+                physical_local[physical_row, 15] += float(stop_time > 0.0)
+                global_state_counts[state] += 1.0
+                global_stop_time_sum += stop_time
+                global_stopped_oht_count += float(stop_time > 0.0)
+            distance_mm = self._physical_distance_mm[physical_row]
             density_per_meter = len(rail_oht_ids) / (distance_mm / 1_000.0)
-            free_flow_time_s = self._finite_nonnegative(
-                getattr(rail, "DistancePerVelocity"),
-                name=f"rail {rail_id} DistancePerVelocity",
-            )
-            port_count = self._finite_nonnegative(
-                getattr(rail, "PortCount"),
-                name=f"rail {rail_id} PortCount",
-            )
             predicted_oht_count = self._finite_nonnegative(
                 getattr(rail, "PredictedOHTCount"),
                 name=f"rail {rail_id} PredictedOHTCount",
@@ -580,34 +623,16 @@ class ContextualObservationBuilder:
                 getattr(rail, "ReservationPortCount"),
                 name=f"rail {rail_id} ReservationPortCount",
             )
-            physical_local[physical_row] = (
-                free_flow_time_s,
-                port_count,
-                float(len(getattr(rail, "LevelJoiningLineIDList"))),
-                float(len(getattr(rail, "DivergingLineIDList"))),
+            physical_local[physical_row, 4:8] = (
                 float(density_per_meter),
                 predicted_oht_count,
                 route_oht_count,
                 reservation_port_count,
-                *state_counts.tolist(),
-                float(stop_time_sum),
-                float(stopped_oht_count),
             )
 
-        if self._physical_distance_mm is None:
-            physical_distance_mm = np.ascontiguousarray(physical_distance_mm)
-            physical_distance_mm.setflags(write=False)
-            self._physical_distance_mm = physical_distance_mm
-        elif not np.array_equal(
-            self._physical_distance_mm, physical_distance_mm
-        ):
-            raise ObservationContractError(
-                "runtime physical rail Distance changed after initialization"
-            )
-
-        placed_oht_ids = set(oht_placement)
-        expected_oht_ids = set(ohts)
-        if placed_oht_ids != expected_oht_ids:
+        if len(oht_placement) != len(ohts):
+            placed_oht_ids = set(oht_placement)
+            expected_oht_ids = set(ohts)
             raise ObservationContractError(
                 "rail OhtList placement does not exactly cover OHT_DIC: "
                 f"missing={sorted(expected_oht_ids - placed_oht_ids)[:20]}, "
@@ -616,8 +641,8 @@ class ContextualObservationBuilder:
 
         total_oht_count = len(ohts)
         denominator = float(max(1, total_oht_count))
-        total_tat_s = self._finite_nonnegative(
-            getattr(pclient, "TotalTat"), name="total TAT"
+        recent_completed_tat_s = self._finite_nonnegative(
+            recent_completed_tat_s, name="recent completed TAT"
         )
         operation_rate = self._finite_nonnegative(
             getattr(pclient, "TotalOhtOperationRate"),
@@ -640,12 +665,18 @@ class ContextualObservationBuilder:
         backlog_delta, tat_delta, completion_rate = self._trend_features(
             sim_time_s=float(getattr(pclient, "SimTime", 0.0)),
             backlog=queued + waiting,
-            total_tat_s=total_tat_s,
+            recent_completed_tat_s=recent_completed_tat_s,
+            recent_completed_tat_available=recent_completed_tat_available,
             completed_count=completed,
+        )
+        recent_completed_tat_feature = (
+            recent_completed_tat_s
+            if recent_completed_tat_available else 0.0
         )
         global_raw = np.asarray(
             (
-                total_tat_s,
+                recent_completed_tat_feature,
+                float(recent_completed_tat_available),
                 operation_rate,
                 queued / denominator,
                 waiting / denominator,
@@ -666,6 +697,12 @@ class ContextualObservationBuilder:
         predicted_union = predicted[union_nonzero]
         route_ahead_union = route_ahead[union_nonzero]
         self.last_diagnostics = {
+            "observation/recent_completed_tat_300s_mean": (
+                recent_completed_tat_feature
+            ),
+            "observation/recent_completed_tat_300s_available": float(
+                recent_completed_tat_available
+            ),
             "observation/predicted_route10_pearson": self._safe_pearson(
                 predicted, route_ahead
             ),
@@ -703,10 +740,16 @@ class ContextualObservationBuilder:
         *,
         next_10_route_oht_count: Mapping[int, float],
         previous_applied_action=None,
+        recent_completed_tat_s: float = 0.0,
+        recent_completed_tat_available: bool = False,
     ) -> ContextualObservationBatch:
         physical_raw, global_raw = self.build_raw(
             pclient,
             next_10_route_oht_count=next_10_route_oht_count,
+            recent_completed_tat_s=recent_completed_tat_s,
+            recent_completed_tat_available=(
+                recent_completed_tat_available
+            ),
         )
 
         # Contractual order: normalize the whole physical snapshot using the
