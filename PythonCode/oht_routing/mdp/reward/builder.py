@@ -77,7 +77,7 @@ class ContextualRewardConfig:
         *,
         action_mode: str = REGION_B_RL,
     ) -> "ContextualRewardConfig":
-        """Build the single immutable Reward O profile."""
+        """Build the single immutable Reward P profile."""
         canonical_reward_version(reward_version)
         return cls(action_mode=action_mode)
 
@@ -87,7 +87,7 @@ class ContextualRewardConfig:
 
     @property
     def rail_reward_mode(self) -> str:
-        """Constant diagnostic label; Reward O has no rail-mode selector."""
+        """Constant diagnostic label; Reward P has no rail-mode selector."""
         return RAIL_REWARD_FREE_FLOW_NEUTRAL_2
 
     def __post_init__(self):
@@ -181,6 +181,7 @@ class ControlledRewardBatch:
     controlled_rail_ids: np.ndarray
     total_tat_level: float
     cumulative_total_tat_level: float
+    recent_completed_tat_mean: float
     recent_completed_tat_p90: float
     recent_completed_tat_event_count: float
     recent_completed_tat_window_age_s: float
@@ -339,13 +340,15 @@ class ContextualRewardBuilder(ContextualRailRewardMixin):
         return self._recent_tat_tracker.update(pclient)
 
     def _global_raw(self, pclient) -> float:
-        """Compute the Reward O global term from recent completed-job TAT."""
+        """Compute Reward P from the cumulative simulator TotalTat level."""
         cfg = self.config
+        # Retained strictly for recent-300 diagnostic continuity. Reward P
+        # never consumes any value from this snapshot.
         recent_tat = self.update_recent_completed_tat(pclient)
+        # simulator.client decodes the two-byte wire value with ``/ 10``;
+        # pclient.TotalTat is therefore already expressed in seconds here.
         cumulative_tat = float(getattr(pclient, "TotalTat"))
-        cur_tat = (
-            float(recent_tat.mean_s) if recent_tat.available else 0.0
-        )
+        cur_tat = cumulative_tat if cumulative_tat > 0.0 else 0.0
         cur_op = float(getattr(pclient, "TotalOhtOperationRate"))
         completed_delta = float(
             getattr(pclient, "CompletedCommandCount", 0) or 0
@@ -357,8 +360,15 @@ class ContextualRewardBuilder(ContextualRailRewardMixin):
             raise ContextualRewardError(
                 "global reward input contains NaN or Inf"
             )
+        if cumulative_tat < 0.0:
+            raise ContextualRewardError(
+                "cumulative TotalTat must be non-negative"
+            )
         self._total_completed_jobs += completed_delta
-        tat_signal_available = bool(recent_tat.available)
+        # A zero wire value means that no cumulative TAT sample is available
+        # yet. Reward P applies no positive credit below the 160 s target and
+        # an unbounded linear penalty above it.
+        tat_signal_available = cumulative_tat > 0.0
         tat_excess = (
             max(0.0, cur_tat - TAT_PENALTY_START)
             if tat_signal_available else 0.0
@@ -422,6 +432,7 @@ class ContextualRewardBuilder(ContextualRailRewardMixin):
             "tat_raw": tat_raw,
             "total_tat": cur_tat,
             "cumulative_total_tat": cumulative_tat,
+            "recent_completed_tat_mean": recent_tat.mean_s,
             "recent_completed_tat_p90": recent_tat.p90_s,
             "recent_completed_tat_event_count": recent_tat.event_count,
             "recent_completed_tat_window_age_s": recent_tat.window_age_s,
@@ -487,7 +498,7 @@ class ContextualRewardBuilder(ContextualRailRewardMixin):
                 -self.config.local_predicted_oht_weight
                 * float(getattr(rail, "PredictedOHTCount"))
             )
-            # Reward O deliberately keeps this rail-local congestion signal
+            # Reward P inherits this rail-local congestion signal from O
             # additive and unclipped. Multiple stopped OHTs and worsening
             # dwell must remain distinguishable to the policy.
             local_values["stop"][row] = (
@@ -590,6 +601,9 @@ class ContextualRewardBuilder(ContextualRailRewardMixin):
             total_tat_level=float(self._last_global_terms["total_tat"]),
             cumulative_total_tat_level=float(
                 self._last_global_terms["cumulative_total_tat"]
+            ),
+            recent_completed_tat_mean=float(
+                self._last_global_terms["recent_completed_tat_mean"]
             ),
             recent_completed_tat_p90=float(
                 self._last_global_terms["recent_completed_tat_p90"]
@@ -778,7 +792,7 @@ class ContextualRewardBuilder(ContextualRailRewardMixin):
             "reward/global_raw": batch.global_raw,
             "reward/global/total_tat": batch.total_tat_level,
             "reward/global/recent_completed_tat_300s_mean": (
-                batch.total_tat_level
+                batch.recent_completed_tat_mean
             ),
             "reward/global/recent_completed_tat_300s_p90": (
                 batch.recent_completed_tat_p90
@@ -1067,7 +1081,7 @@ class ContextualRewardBuilder(ContextualRailRewardMixin):
             result[f"reward/local/{name}_raw_abs_mean"] = float(
                 np.abs(values).mean()
             )
-            # Compact Reward O metrics use coefficient-applied subterms,
+            # Compact Reward P metrics use coefficient-applied subterms,
             # not the unweighted input features.
             compact_name = "pred" if name == "predicted" else name
             result[f"local/{compact_name}_abs_mean"] = float(

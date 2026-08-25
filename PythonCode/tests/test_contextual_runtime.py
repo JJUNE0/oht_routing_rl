@@ -21,6 +21,7 @@ from oht_routing.runtime.client import (
 from oht_dispatching.config import DISPATCH_COST
 from oht_routing.mdp.action import EXP_RESIDUAL
 from oht_routing.mdp.observation import (
+    CRITIC_EXTRA_DIM,
     GLOBAL_DIM,
     LOCAL_PHYSICAL_DIM,
     ContextualObservationBatch,
@@ -75,12 +76,16 @@ class CountingObservationBuilder:
                 (CONTROLLED_COUNT, neighbor_count, 2), dtype=np.float32
             ),
             global_state=np.zeros(GLOBAL_DIM, dtype=np.float32),
+            critic_total_tat=np.zeros(CRITIC_EXTRA_DIM, dtype=np.float32),
             previous_applied_action=np.zeros(
                 (CONTROLLED_COUNT, 1), dtype=np.float32
             ),
             controlled_rail_ids=topology.controlled_rail_ids.copy(),
             topology_hash=topology.topology_hash,
             mapping_hash=topology.mapping_hash,
+            critic_total_tat_raw=np.zeros(
+                CRITIC_EXTRA_DIM, dtype=np.float32
+            ),
         )
 
     def build(
@@ -185,11 +190,17 @@ class ContextualRuntimeTests(unittest.TestCase):
         self.assertTrue(np.isfinite(costs).all())
         np.testing.assert_array_equal(costs, result.final_cost)
 
-    def test_runtime_wires_locked_reward_o_profile(self):
+    def test_runtime_wires_locked_reward_p_profile(self):
         runtime = self.runtime()
         runtime._ensure_initialized(make_runtime_pclient())
         reward = runtime.reward_builder.config
 
+        self.assertEqual(reward.reward_version, "P")
+        self.assertEqual(
+            reward.contract.tat_signal_description,
+            "one_sided_cumulative_total_tat_penalty",
+        )
+        self.assertEqual(reward.contract.tat_window_seconds, 0.0)
         self.assertEqual(reward.tat_reference, 165.0)
         self.assertEqual(reward.tat_weight, 4.3)
         self.assertEqual(reward.tat_window_seconds, 300.0)
@@ -211,6 +222,29 @@ class ContextualRuntimeTests(unittest.TestCase):
         self.assertIsNone(runtime.reward_diagnostic_writer)
         self.assertIsNone(runtime.rail_tat_diagnostic_path)
 
+    def test_reward_p_runtime_total_tat_dead_zone_and_penalty(self):
+        for total_tat, expected_tat_raw in (
+            (1.0, 0.0),
+            (159.0, 0.0),
+            (160.0, 0.0),
+            (175.0, -4.3 * 15.0 / 165.0),
+        ):
+            with self.subTest(total_tat=total_tat):
+                runtime = self.runtime()
+                pclient = make_runtime_pclient()
+                pclient.TotalTat = total_tat
+                runtime.Algorithm(pclient)
+                runtime.Algorithm(pclient)
+
+                reward = runtime.transition_aligner.last_completed.reward
+                self.assertEqual(reward.total_tat_level, total_tat)
+                self.assertTrue(reward.tat_signal_available)
+                self.assertAlmostEqual(reward.tat_raw, expected_tat_raw)
+                if total_tat > 160.0:
+                    self.assertLess(reward.tat_raw, 0.0)
+                else:
+                    self.assertEqual(reward.tat_raw, 0.0)
+
     def test_runtime_writes_bounded_reward_step_jsonl_only_when_opted_in(self):
         with tempfile.TemporaryDirectory() as directory:
             runtime = self.runtime(
@@ -218,6 +252,7 @@ class ContextualRuntimeTests(unittest.TestCase):
                 reward_diagnostic_windows="0:10",
             )
             pclient = make_runtime_pclient()
+            pclient.TotalTat = 175.0
             pclient.SimTime = 1.0
             runtime.Algorithm(pclient)
             pclient.SimTime = 2.0
@@ -232,6 +267,16 @@ class ContextualRuntimeTests(unittest.TestCase):
             record = records[0]
             self.assertEqual(record["global_step"], 1)
             self.assertEqual(record["episode_step"], 0)
+            self.assertEqual(record["reward_version"], "P")
+            self.assertEqual(record["cumulative_total_tat"], 175.0)
+            self.assertEqual(record["recent_completed_tat_300s_mean"], 0.0)
+            self.assertAlmostEqual(record["tat_raw"], -4.3 * 15.0 / 165.0)
+            completed_reward = runtime.transition_aligner.last_completed.reward
+            self.assertEqual(completed_reward.total_tat_level, 175.0)
+            self.assertEqual(
+                completed_reward.cumulative_total_tat_level, 175.0
+            )
+            self.assertEqual(completed_reward.recent_completed_tat_mean, 0.0)
             self.assertEqual(record["tat_weight"], 4.3)
             self.assertEqual(record["backlog_weight"], 0.0007)
             self.assertEqual(record["local_predicted_oht_weight"], 0.05)
@@ -324,6 +369,27 @@ class ContextualRuntimeTests(unittest.TestCase):
         self.assertFalse(captured["return_attention"])
         self.assertTrue(captured["attention_absent"])
         self.assertFalse(hasattr(runtime, "critic"))
+
+    def test_actor_action_is_invariant_to_critic_only_total_tat(self):
+        runtime = self.runtime(mode="actor_inference", action_enabled=True)
+        actor_observation = runtime.observation_builder.batch
+        low_tat = replace(
+            actor_observation,
+            critic_total_tat=np.asarray([-3.0], dtype=np.float32),
+            critic_total_tat_raw=np.asarray([100.0], dtype=np.float32),
+        )
+        high_tat = replace(
+            actor_observation,
+            critic_total_tat=np.asarray([7.0], dtype=np.float32),
+            critic_total_tat_raw=np.asarray([900.0], dtype=np.float32),
+        )
+
+        self.assertFalse(np.array_equal(
+            low_tat.critic_total_tat, high_tat.critic_total_tat
+        ))
+        low_action, _ = runtime._actor_inference(low_tat)
+        high_action, _ = runtime._actor_inference(high_tat)
+        np.testing.assert_array_equal(low_action, high_action)
 
     def test_sale_runtime_expands_global_state_for_every_controlled_rail(self):
         runtime = self.runtime(mode="actor_inference", action_enabled=True)

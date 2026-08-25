@@ -23,6 +23,7 @@ from oht_routing.algorithms.rl.contextual_td7.replay_buffer import (
     ACTION_FIXED_POINT_SCALE,
 )
 from oht_routing.mdp.observation import (
+    CRITIC_EXTRA_DIM,
     GLOBAL_DIM,
     LOCAL_PHYSICAL_DIM,
     ContextualObservationBatch,
@@ -57,6 +58,7 @@ class TrainingObservationBuilder:
         self.save_calls = []
         self.local_normalizer = RunningFeatureNormalizer(LOCAL_PHYSICAL_DIM)
         self.global_normalizer = RunningFeatureNormalizer(GLOBAL_DIM)
+        self.critic_normalizer = RunningFeatureNormalizer(CRITIC_EXTRA_DIM)
         self.neighbor_count = topology.incoming_neighbor_ids.shape[1]
         physical_rows = np.arange(
             len(topology.all_rail_ids), dtype=np.int64
@@ -95,14 +97,19 @@ class TrainingObservationBuilder:
         step = self.calls
         physical = make_physical_local_state(self.topology, step)
         global_raw = np.full(GLOBAL_DIM, step, np.float32)
+        critic_total_tat_raw = np.asarray(
+            [float(getattr(pclient, "TotalTat", 0.0))], dtype=np.float32
+        )
         if not self.local_normalizer.frozen:
             self.local_normalizer.update(physical)
             self.global_normalizer.update(global_raw)
+            self.critic_normalizer.update(critic_total_tat_raw)
         self.calls += 1
         self.env_steps += 1
         if self.calls >= self.freeze_steps:
             self.local_normalizer.freeze()
             self.global_normalizer.freeze()
+            self.critic_normalizer.freeze()
         zeros = np.zeros(
             (CONTROLLED_COUNT, LOCAL_PHYSICAL_DIM), np.float32
         )
@@ -130,6 +137,9 @@ class TrainingObservationBuilder:
             incoming_relation=self._incoming_relation,
             outgoing_relation=self._outgoing_relation,
             global_state=np.zeros(GLOBAL_DIM, np.float32),
+            critic_total_tat=self.critic_normalizer.normalize(
+                critic_total_tat_raw, name="training_critic_total_tat"
+            ).reshape(CRITIC_EXTRA_DIM),
             previous_applied_action=np.ascontiguousarray(
                 np.zeros((CONTROLLED_COUNT, 1), np.float32)
                 if previous_applied_action is None
@@ -140,6 +150,7 @@ class TrainingObservationBuilder:
             mapping_hash=self.topology.mapping_hash,
             physical_local_raw=physical,
             global_raw=global_raw,
+            critic_total_tat_raw=critic_total_tat_raw,
         )
 
     def load_normalizers(self, path, *, require_frozen=False):
@@ -151,8 +162,13 @@ class TrainingObservationBuilder:
             self.global_normalizer.update(
                 np.zeros((1, GLOBAL_DIM), np.float32)
             )
+        if self.critic_normalizer.count == 0:
+            self.critic_normalizer.update(
+                np.zeros((1, CRITIC_EXTRA_DIM), np.float32)
+            )
         self.local_normalizer.freeze()
         self.global_normalizer.freeze()
+        self.critic_normalizer.freeze()
         self.env_steps = 10_000
 
     def save_normalizers(self, path, *, require_frozen=False):
@@ -833,6 +849,17 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
             runtime.observation_builder.load_calls,
             [("state_normalizer.npz", True)],
         )
+        self.assertGreater(
+            runtime.observation_builder.critic_normalizer.count, 0
+        )
+        self.assertTrue(runtime.observation_builder.critic_normalizer.frozen)
+        self.assertTrue(runtime._state_normalizers_ready_for_bypass())
+
+        runtime.observation_builder.critic_normalizer.frozen = False
+        self.assertFalse(runtime._normalizers_frozen())
+        self.assertFalse(runtime._state_normalizers_ready_for_bypass())
+        runtime.observation_builder.critic_normalizer.freeze()
+        self.assertTrue(runtime._state_normalizers_ready_for_bypass())
 
         runtime.Algorithm(pclient)
         self.assertEqual(pclient.sent_is_end, [0])
@@ -861,6 +888,7 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
         runtime.Algorithm(pclient)
         self.assertEqual(len(runtime.observation_builder.save_calls), 1)
         self.assertTrue(runtime.state_normalizer_saved)
+        self.assertTrue(runtime.observation_builder.critic_normalizer.frozen)
 
     def test_region_curriculum_is_exact_legacy_geometric_schedule(self):
         runtime, _ = training_runtime(
@@ -1496,7 +1524,7 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
         self.assertEqual(runtime.last_diagnostics["env/termination_reason"], 1.0)
         self.assertIsNone(runtime.transition_aligner.pending)
 
-    def test_reward_o_tat_patience_adds_terminal_penalty_once(self):
+    def test_reward_p_tat_patience_adds_terminal_penalty_once(self):
         runtime, pclient = training_runtime(
             replay_capacity_env_steps=512,
             minimum_replay_env_steps=512,
@@ -1577,6 +1605,7 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
             "observation/predicted_route10_union_nonzero_ratio",
             "reward/total_mean", "reward/total_std",
             "reward/terminal_penalty",
+            "reward/global/tat_raw",
             "reward/global/tat_component_raw",
             "reward/global/backlog_component_raw",
             "reward/global/raw", "reward/global/component",
@@ -1663,6 +1692,7 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
             "reward/global/recent_completed_tat_300s_count",
             "reward/global/recent_completed_tat_300s_window_age",
             "reward/global/recent_completed_tat_events_added",
+            "reward/global/total_tat",
             "reward/global/cumulative_total_tat",
             "reward/global/tat_penalty_start",
             "reward/global/tat_excess",
@@ -1735,10 +1765,32 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
         self.assertEqual(captured["config"]["EXP_META"], meta)
         self.assertEqual(captured["notes"], meta["description"])
         self.assertEqual(meta["version"], CONTEXTUAL_VERSION)
-        self.assertEqual(meta["reward_version"], "O")
+        self.assertEqual(meta["reward_version"], "P")
         self.assertEqual(
             meta["tat_signal"],
-            "one_sided_recent_completed_tat_300s_mean",
+            "one_sided_cumulative_total_tat_penalty",
+        )
+        self.assertEqual(meta["tat_window_seconds"], 0.0)
+        self.assertEqual(meta["recent_tat_diagnostic_window_seconds"], 300.0)
+        self.assertEqual(meta["reward_tat_input"], "pclient.TotalTat")
+        self.assertFalse(meta["reward_recent_300_tat_used"])
+        self.assertEqual(meta["tat_penalty_threshold"], 160.0)
+        self.assertTrue(meta["tat_one_sided"])
+        self.assertEqual(
+            meta["tat_formula"],
+            "-4.3*max(TotalTat-160,0)/165_for_TotalTat_gt_0",
+        )
+        self.assertEqual(
+            meta["reward_tat_zero_policy"],
+            "unavailable_zero_contribution",
+        )
+        self.assertEqual(
+            meta["reward_tat_at_or_below_threshold_policy"],
+            "zero_contribution",
+        )
+        self.assertEqual(
+            meta["reward_tat_negative_policy"],
+            "invalid_fail_fast",
         )
         self.assertNotIn("marginal_tat_enabled", meta)
         self.assertNotIn("command_trace_selection", meta)
@@ -1749,7 +1801,38 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
         self.assertIn("dispatch_first_match", meta["note"])
         self.assertEqual(meta["num_stacks"], 1)
         self.assertEqual(meta["stack_interval"], 1)
-        self.assertNotIn("observation_version", meta)
+        self.assertEqual(meta["observation_version"], "v5")
+        self.assertEqual(meta["local_physical_dim"], 14)
+        self.assertEqual(meta["actor_global_dim"], 5)
+        self.assertEqual(meta["critic_extra_dim"], 1)
+        self.assertEqual(meta["relation_dim"], 2)
+        self.assertEqual(
+            {
+                key: meta[key]
+                for key in (
+                    "obs/version",
+                    "obs/local_dim",
+                    "obs/incoming_neighbors",
+                    "obs/outgoing_neighbors",
+                    "obs/relation_dim",
+                    "obs/actor_global_dim",
+                    "obs/critic_extra_dim",
+                    "obs/actor_has_total_tat",
+                    "obs/critic_has_total_tat",
+                )
+            },
+            {
+                "obs/version": "v5",
+                "obs/local_dim": 14,
+                "obs/incoming_neighbors": 15,
+                "obs/outgoing_neighbors": 15,
+                "obs/relation_dim": 2,
+                "obs/actor_global_dim": 5,
+                "obs/critic_extra_dim": 1,
+                "obs/actor_has_total_tat": 0,
+                "obs/critic_has_total_tat": 1,
+            },
+        )
         self.assertNotIn("sale_version", meta)
         self.assertNotIn("lap_version", meta)
         self.assertEqual(
@@ -1765,7 +1848,7 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
             warmup_steps=10_000,
             seed=0,
         ))
-        self.assertEqual(experiment_meta["reward_version"], "O")
+        self.assertEqual(experiment_meta["reward_version"], "P")
         self.assertEqual(experiment_meta["action_scale"], 1.0)
         self.assertFalse(experiment_meta["curriculum_enabled"])
         self.assertEqual(

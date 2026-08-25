@@ -6,10 +6,15 @@ from pathlib import Path
 import numpy as np
 
 from oht_routing.mdp.observation import (
+    ACTOR_GLOBAL_DIM,
+    ACTOR_GLOBAL_FEATURE_NAMES,
+    CRITIC_EXTRA_DIM,
+    CRITIC_FEATURE_NAMES,
     GLOBAL_DIM,
     GLOBAL_FEATURE_NAMES,
     LOCAL_PHYSICAL_DIM,
     LOCAL_PHYSICAL_FEATURE_NAMES,
+    OBSERVATION_VERSION,
     RELATION_DIM,
     RELATION_FEATURE_NAMES,
     ContextualObservationBuilder,
@@ -202,9 +207,11 @@ class ContextualObservationTests(unittest.TestCase):
         )
         return builder, pclient, batch
 
-    def test_v4_feature_contract_names_and_dimensions(self):
-        self.assertEqual(LOCAL_PHYSICAL_DIM, 16)
-        self.assertEqual(GLOBAL_DIM, 18)
+    def test_v5_feature_contract_names_order_and_dimensions(self):
+        self.assertEqual(LOCAL_PHYSICAL_DIM, 14)
+        self.assertEqual(ACTOR_GLOBAL_DIM, 5)
+        self.assertEqual(GLOBAL_DIM, ACTOR_GLOBAL_DIM)
+        self.assertEqual(CRITIC_EXTRA_DIM, 1)
         self.assertEqual(RELATION_DIM, 2)
         self.assertEqual(
             LOCAL_PHYSICAL_FEATURE_NAMES,
@@ -213,9 +220,7 @@ class ContextualObservationTests(unittest.TestCase):
                 "port_count",
                 "incoming_degree",
                 "outgoing_degree",
-                "oht_density",
                 "predicted_oht_count",
-                "next_10_route_oht_count",
                 "reservation_port_count",
                 "idle_count",
                 "stage_count",
@@ -228,28 +233,17 @@ class ContextualObservationTests(unittest.TestCase):
             ),
         )
         self.assertEqual(
-            GLOBAL_FEATURE_NAMES,
+            ACTOR_GLOBAL_FEATURE_NAMES,
             (
-                "recent_completed_tat_300s_mean_s",
-                "recent_completed_tat_300s_available",
                 "operation_rate",
                 "queued_ratio",
                 "waiting_ratio",
                 "transferring_ratio",
                 "mean_reassign",
-                "idle_oht_ratio",
-                "stage_oht_ratio",
-                "move_to_load_ratio",
-                "loading_ratio",
-                "move_to_unload_ratio",
-                "unloading_ratio",
-                "stopped_oht_ratio",
-                "mean_stop_time_s",
-                "backlog_delta_60s",
-                "recent_completed_tat_delta_60s",
-                "completion_rate_60s",
             ),
         )
+        self.assertEqual(GLOBAL_FEATURE_NAMES, ACTOR_GLOBAL_FEATURE_NAMES)
+        self.assertEqual(CRITIC_FEATURE_NAMES, ("total_tat_s",))
         self.assertEqual(
             RELATION_FEATURE_NAMES,
             ("directed_hop", "cumulative_free_flow_time_s"),
@@ -275,7 +269,11 @@ class ContextualObservationTests(unittest.TestCase):
             "incoming_relation": (CONTROLLED_COUNT, NEIGHBOR_COUNT, 2),
             "outgoing_relation": (CONTROLLED_COUNT, NEIGHBOR_COUNT, 2),
             "global_state": (GLOBAL_DIM,),
+            "critic_total_tat": (CRITIC_EXTRA_DIM,),
             "previous_applied_action": (CONTROLLED_COUNT, 1),
+            "physical_local_raw": (PHYSICAL_COUNT, LOCAL_PHYSICAL_DIM),
+            "global_raw": (GLOBAL_DIM,),
+            "critic_total_tat_raw": (CRITIC_EXTRA_DIM,),
         }
         for name, shape in expected.items():
             array = getattr(batch, name)
@@ -301,8 +299,6 @@ class ContextualObservationTests(unittest.TestCase):
                 3.0,
                 2.0,
                 1.0,
-                2.0 / 3.0,
-                1.0,
                 1.0,
                 1.0,
                 1.0,
@@ -318,7 +314,7 @@ class ContextualObservationTests(unittest.TestCase):
         )
         np.testing.assert_allclose(physical[rail_id], expected)
         self.assertEqual(
-            physical[rail_id, 8:14].sum(),
+            physical[rail_id, 6:12].sum(),
             len(pclient.RAILLINE_DIC[rail_id].OhtList),
         )
 
@@ -330,44 +326,72 @@ class ContextualObservationTests(unittest.TestCase):
         )
         expected = np.asarray(
             (
-                120.0,
-                1.0,
                 0.75,
                 3.0 / 6.0,
                 2.0 / 6.0,
                 1.0 / 6.0,
                 2.0,
-                1.0 / 6.0,
-                1.0 / 6.0,
-                1.0 / 6.0,
-                1.0 / 6.0,
-                1.0 / 6.0,
-                1.0 / 6.0,
-                3.0 / 6.0,
-                9.0 / 6.0,
-                0.0,
-                0.0,
-                0.0,
             ),
             dtype=np.float64,
         )
         np.testing.assert_allclose(global_raw, expected)
 
-    def test_unavailable_recent_tat_is_explicitly_masked(self):
-        builder = self.builder()
-        _, global_raw = builder.build_raw(
+    def test_unavailable_recent_tat_is_diagnostic_only_not_actor_input(self):
+        available_builder = self.builder()
+        _, available_global_raw = available_builder.build_raw(
+            self.pclient(),
+            next_10_route_oht_count=self.route_ahead,
+            recent_completed_tat_s=220.0,
+            recent_completed_tat_available=True,
+        )
+        unavailable_builder = self.builder()
+        _, unavailable_global_raw = unavailable_builder.build_raw(
             self.pclient(),
             next_10_route_oht_count=self.route_ahead,
             recent_completed_tat_s=220.0,
             recent_completed_tat_available=False,
         )
-        np.testing.assert_array_equal(global_raw[:2], (0.0, 0.0))
+        np.testing.assert_array_equal(
+            unavailable_global_raw, available_global_raw
+        )
         self.assertEqual(
-            builder.diagnostics()[
+            unavailable_builder.diagnostics()[
                 "observation/recent_completed_tat_300s_mean"
             ],
             0.0,
         )
+
+    def test_total_tat_is_raw_and_normalized_critic_only_scalar(self):
+        builder = self.builder(
+            normalizer_config=ObservationNormalizerConfig(clip=None)
+        )
+        pclient = self.pclient()
+        pclient.TotalTat = 120.0
+        first = builder.build(
+            pclient, next_10_route_oht_count=self.route_ahead
+        )
+        np.testing.assert_array_equal(
+            first.critic_total_tat_raw, np.asarray([120.0], np.float32)
+        )
+        np.testing.assert_array_equal(
+            first.critic_total_tat, np.asarray([120.0], np.float32)
+        )
+
+        pclient.TotalTat = 240.0
+        expected_normalized = builder.critic_normalizer.normalize(
+            np.asarray([240.0], np.float64), name="expected_total_tat"
+        )[0]
+        second = builder.build(
+            pclient, next_10_route_oht_count=self.route_ahead
+        )
+        np.testing.assert_array_equal(
+            second.critic_total_tat_raw, np.asarray([240.0], np.float32)
+        )
+        np.testing.assert_array_equal(
+            second.critic_total_tat, expected_normalized
+        )
+        self.assertIs(second.actor_global_state, second.global_state)
+        self.assertIs(second.actor_global_raw, second.global_raw)
 
     def test_strict_sixty_second_trend_same_time_replace_and_reset(self):
         builder = self.builder()
@@ -531,6 +555,8 @@ class ContextualObservationTests(unittest.TestCase):
             "incoming_rail_indices",
             "outgoing_rail_indices",
             "global_state",
+            "critic_total_tat",
+            "critic_total_tat_raw",
         ):
             np.testing.assert_array_equal(
                 getattr(normal, name), getattr(reversed_result, name)
@@ -543,7 +569,6 @@ class ContextualObservationTests(unittest.TestCase):
             pclient, next_10_route_oht_count=self.route_ahead
         )
         cached_template = builder._static_physical_template
-        cached_distances = builder.physical_distance_mm
 
         pclient.RAILLINE_DIC[10].PredictedOHTCount = 17.0
         pclient.RAILLINE_DIC[10].ReservationPortCount = 9.0
@@ -554,14 +579,14 @@ class ContextualObservationTests(unittest.TestCase):
         )
 
         self.assertIs(builder._static_physical_template, cached_template)
-        self.assertIs(builder.physical_distance_mm, cached_distances)
         np.testing.assert_array_equal(first[:, :4], second[:, :4])
-        self.assertEqual(second[10, 5], 17.0)
-        self.assertEqual(second[10, 6], 23.0)
-        self.assertEqual(second[10, 7], 9.0)
-        self.assertEqual(second[10, 8 + 5], 1.0)
-        self.assertEqual(second[10, 8:14].sum(), 2.0)
-        self.assertEqual(second[10, 14], 6.0)
+        self.assertEqual(second[10, 4], 17.0)
+        self.assertEqual(second[10, 5], 9.0)
+        self.assertEqual(second[10, 6 + 5], 1.0)
+        self.assertEqual(second[10, 6:12].sum(), 2.0)
+        self.assertEqual(second[10, 12], 6.0)
+        self.assertEqual(second[10, 13], 2.0)
+        self.assertNotIn("next_10_route_oht_count", LOCAL_PHYSICAL_FEATURE_NAMES)
 
     def test_replacing_runtime_rail_dictionary_rebuilds_static_cache(self):
         builder = self.builder()
@@ -584,6 +609,8 @@ class ContextualObservationTests(unittest.TestCase):
         self.assertEqual(builder.local_normalizer.count, PHYSICAL_COUNT)
         self.assertEqual(builder.global_normalizer.update_calls, 1)
         self.assertEqual(builder.global_normalizer.count, 1)
+        self.assertEqual(builder.critic_normalizer.update_calls, 1)
+        self.assertEqual(builder.critic_normalizer.count, 1)
 
     def test_global_is_separate_from_local_physical_tokens(self):
         _, _, batch = self.build(
@@ -593,6 +620,8 @@ class ContextualObservationTests(unittest.TestCase):
         )
         self.assertEqual(batch.center_local.shape[-1], LOCAL_PHYSICAL_DIM)
         self.assertEqual(batch.global_state.shape, (GLOBAL_DIM,))
+        self.assertEqual(batch.actor_global_state.shape, (ACTOR_GLOBAL_DIM,))
+        self.assertEqual(batch.critic_total_tat.shape, (CRITIC_EXTRA_DIM,))
 
     def test_relation_matches_static_topology_and_is_frozen(self):
         builder, _, batch = self.build()
@@ -665,7 +694,7 @@ class ContextualObservationTests(unittest.TestCase):
                 pclient, next_10_route_oht_count=self.route_ahead
             )
 
-    def test_normalizer_save_load_uses_v3_physical_snapshot_keys(self):
+    def test_v5_three_state_normalizers_save_and_load_exact_contract(self):
         first = self.builder(
             normalizer_config=ObservationNormalizerConfig(
                 freeze_after_env_steps=1
@@ -677,12 +706,29 @@ class ContextualObservationTests(unittest.TestCase):
         with np.load(path, allow_pickle=False) as saved:
             self.assertEqual(str(saved["version"].item()), CONTEXTUAL_VERSION)
             self.assertEqual(
+                str(saved["observation_version"].item()), OBSERVATION_VERSION
+            )
+            self.assertEqual(
                 tuple(str(value) for value in saved["local_physical_feature_names"]),
                 LOCAL_PHYSICAL_FEATURE_NAMES,
             )
             self.assertEqual(
+                tuple(str(value) for value in saved["global_feature_names"]),
+                ACTOR_GLOBAL_FEATURE_NAMES,
+            )
+            self.assertEqual(
+                tuple(str(value) for value in saved["critic_feature_names"]),
+                CRITIC_FEATURE_NAMES,
+            )
+            self.assertEqual(
                 int(saved["local_physical_dim"].item()), LOCAL_PHYSICAL_DIM
             )
+            self.assertEqual(int(saved["global_dim"].item()), ACTOR_GLOBAL_DIM)
+            self.assertEqual(
+                int(saved["critic_extra_dim"].item()), CRITIC_EXTRA_DIM
+            )
+            self.assertTrue(bool(saved["critic_frozen"].item()))
+            self.assertEqual(int(saved["critic_count"].item()), 1)
             self.assertNotIn("local_feature_names", saved.files)
             self.assertNotIn("local_dim", saved.files)
 
@@ -693,6 +739,39 @@ class ContextualObservationTests(unittest.TestCase):
         )
         np.testing.assert_array_equal(
             second.global_normalizer.mean, first.global_normalizer.mean
+        )
+        np.testing.assert_array_equal(
+            second.critic_normalizer.mean, first.critic_normalizer.mean
+        )
+        self.assertTrue(second.critic_normalizer.frozen)
+        self.assertEqual(
+            second.critic_normalizer.count, first.critic_normalizer.count
+        )
+
+    def test_v5_0_state_normalizer_remains_compatible_with_v5_1_runtime(self):
+        first = self.builder(
+            normalizer_config=ObservationNormalizerConfig(
+                freeze_after_env_steps=1
+            )
+        )
+        self.build(builder=first)
+        path = Path(self.directory.name) / "v5_0_normalizers.npz"
+        first.save_normalizers(path, require_frozen=True)
+        with np.load(path, allow_pickle=False) as saved:
+            payload = {key: saved[key].copy() for key in saved.files}
+        payload["version"] = np.asarray("v5.0.0")
+        np.savez_compressed(path, **payload)
+
+        second = self.builder()
+        second.load_normalizers(path, require_frozen=True)
+        np.testing.assert_array_equal(
+            second.local_normalizer.mean, first.local_normalizer.mean
+        )
+        np.testing.assert_array_equal(
+            second.global_normalizer.mean, first.global_normalizer.mean
+        )
+        np.testing.assert_array_equal(
+            second.critic_normalizer.mean, first.critic_normalizer.mean
         )
 
     def test_state_normalizer_feature_order_mismatch_fails_fast(self):
@@ -705,13 +784,23 @@ class ContextualObservationTests(unittest.TestCase):
         path = Path(self.directory.name) / "reordered_normalizers.npz"
         first.save_normalizers(path, require_frozen=True)
         with np.load(path, allow_pickle=False) as saved:
-            payload = {key: saved[key].copy() for key in saved.files}
-        payload["local_physical_feature_names"] = np.asarray(
-            tuple(reversed(LOCAL_PHYSICAL_FEATURE_NAMES))
+            original = {key: saved[key].copy() for key in saved.files}
+        cases = (
+            (
+                "local_physical_feature_names",
+                np.asarray(tuple(reversed(LOCAL_PHYSICAL_FEATURE_NAMES))),
+            ),
+            ("critic_feature_names", np.asarray(("wrong_total_tat",))),
         )
-        np.savez_compressed(path, **payload)
-        with self.assertRaisesRegex(ObservationContractError, "order mismatch"):
-            self.builder().load_normalizers(path, require_frozen=True)
+        for key, bad_value in cases:
+            with self.subTest(key=key):
+                payload = {name: value.copy() for name, value in original.items()}
+                payload[key] = bad_value
+                np.savez_compressed(path, **payload)
+                with self.assertRaisesRegex(
+                    ObservationContractError, "order mismatch"
+                ):
+                    self.builder().load_normalizers(path, require_frozen=True)
 
     def _write_identity_cache(self, *, topology_hash=None, mapping_hash=None):
         path = Path(self.directory.name) / "mismatch.npz"
@@ -763,7 +852,7 @@ class ContextualObservationTests(unittest.TestCase):
             },
         )
 
-    def test_configured_warmup_freezes_only_state_normalizers(self):
+    def test_configured_warmup_freezes_all_three_state_normalizers(self):
         builder = self.builder(
             normalizer_config=ObservationNormalizerConfig(
                 freeze_after_env_steps=2
@@ -771,13 +860,27 @@ class ContextualObservationTests(unittest.TestCase):
         )
         self.build(builder=builder)
         self.assertFalse(builder.local_normalizer.frozen)
+        self.assertFalse(builder.global_normalizer.frozen)
+        self.assertFalse(builder.critic_normalizer.frozen)
         self.build(builder=builder)
         self.assertTrue(builder.local_normalizer.frozen)
         self.assertTrue(builder.global_normalizer.frozen)
+        self.assertTrue(builder.critic_normalizer.frozen)
         self.assertTrue(builder.relation_normalizer.frozen)
-        count = builder.local_normalizer.count
+        counts = (
+            builder.local_normalizer.count,
+            builder.global_normalizer.count,
+            builder.critic_normalizer.count,
+        )
         self.build(builder=builder)
-        self.assertEqual(builder.local_normalizer.count, count)
+        self.assertEqual(
+            (
+                builder.local_normalizer.count,
+                builder.global_normalizer.count,
+                builder.critic_normalizer.count,
+            ),
+            counts,
+        )
 
 
 if __name__ == "__main__":

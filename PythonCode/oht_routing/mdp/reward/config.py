@@ -1,8 +1,10 @@
-"""Reward O identity and locked parameters for contextual TD7 v4.
+"""Reward P identity and locked parameters for contextual TD7.
 
-Historical reward profiles remain available from the
-major-scoped experiment logs.  The v4 runtime has one executable reward
-contract: Reward O.
+Reward O remains recorded below as the historical centered
+recent-completion-TAT profile. Reward P uses an unbounded one-sided penalty on
+the simulator's cumulative ``pclient.TotalTat`` level; every coefficient and
+non-TAT term stays locked to Reward O. The current runtime executes Reward P
+only.
 """
 
 from __future__ import annotations
@@ -10,11 +12,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
-REWARD_VERSION = "O"
+REWARD_VERSION = "P"
 TAT_PENALTY_START = 160.0
 TAT_WINDOW_SECONDS = 300.0
 
 TAT_SIGNAL_RECENT_COMPLETED_300S = "recent_completed_tat_300s_mean"
+TAT_SIGNAL_CUMULATIVE_TOTAL = "cumulative_total_tat"
 
 RAIL_REWARD_FREE_FLOW_NEUTRAL_2 = "free_flow_neutral_2"
 
@@ -36,8 +39,23 @@ class RewardContract:
 REWARD_O_CONTRACT = RewardContract(
     version="O",
     tat_signal_mode=TAT_SIGNAL_RECENT_COMPLETED_300S,
-    tat_signal_description="one_sided_recent_completed_tat_300s_mean",
+    tat_signal_description="centered_recent_completed_tat_300s_mean",
     tat_window_seconds=TAT_WINDOW_SECONDS,
+    tat_termination_enabled=True,
+    tat_termination_grace_steps=10_000,
+    tat_termination_threshold=200.0,
+    tat_termination_patience=300,
+    tat_termination_inclusive=True,
+    terminal_tat_penalty=-20.0,
+)
+
+REWARD_P_CONTRACT = RewardContract(
+    version="P",
+    tat_signal_mode=TAT_SIGNAL_CUMULATIVE_TOTAL,
+    tat_signal_description="one_sided_cumulative_total_tat_penalty",
+    # Reward P has no TAT window. The builder still maintains the historical
+    # tracker for diagnostics, but it cannot influence Reward P.
+    tat_window_seconds=0.0,
     tat_termination_enabled=True,
     tat_termination_grace_steps=10_000,
     tat_termination_threshold=200.0,
@@ -52,13 +70,15 @@ REWARD_VERSIONS = (REWARD_VERSION,)
 def canonical_reward_version(version: str) -> str:
     canonical = str(version).strip().upper().replace("-", "_")
     if canonical != REWARD_VERSION:
-        raise ValueError("contextual TD7 v4 supports only reward_version='O'")
+        raise ValueError(
+            "contextual TD7 supports only reward_version='P'"
+        )
     return REWARD_VERSION
 
 
 def reward_contract(version: str = REWARD_VERSION) -> RewardContract:
     canonical_reward_version(version)
-    return REWARD_O_CONTRACT
+    return REWARD_P_CONTRACT
 
 
 REWARD_O_PROFILE = {
@@ -93,14 +113,20 @@ REWARD_O_PROFILE = {
     "rail_tat_clip": 1.0,
 }
 
+# Keep a distinct object so future P changes cannot mutate historical O data.
+REWARD_P_PROFILE = dict(REWARD_O_PROFILE)
+
 __all__ = (
     "RAIL_REWARD_FREE_FLOW_NEUTRAL_2",
     "REWARD_O_CONTRACT",
     "REWARD_O_PROFILE",
+    "REWARD_P_CONTRACT",
+    "REWARD_P_PROFILE",
     "REWARD_VERSION",
     "REWARD_VERSIONS",
     "RewardContract",
     "TAT_PENALTY_START",
+    "TAT_SIGNAL_CUMULATIVE_TOTAL",
     "TAT_SIGNAL_RECENT_COMPLETED_300S",
     "TAT_WINDOW_SECONDS",
     "canonical_reward_version",

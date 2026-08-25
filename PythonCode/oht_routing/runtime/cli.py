@@ -16,6 +16,23 @@ from oht_routing.algorithms.rl.contextual_td7 import (
 )
 
 
+STAGE_ONE_SIM_END_TIME = 2_000
+
+
+def _stage_to_sim_end_time(value: str) -> int:
+    try:
+        stage = int(value)
+    except (TypeError, ValueError) as error:
+        raise argparse.ArgumentTypeError(
+            "--stage must be the integer 1"
+        ) from error
+    if stage != 1:
+        raise argparse.ArgumentTypeError(
+            "only --stage 1 is supported"
+        )
+    return STAGE_ONE_SIM_END_TIME
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Contextual baseline, inference, and Phase 7 training runtime",
@@ -30,7 +47,7 @@ def parse_args():
         type=canonical_reward_version,
         choices=REWARD_VERSIONS,
         help=(
-            "Compatibility flag for the single locked Reward O contract."
+            "Compatibility flag for the single locked Reward P contract."
         ),
     )
     parser.add_argument("--action-enabled", action="store_true")
@@ -249,7 +266,19 @@ def parse_args():
             "exclusive cutoff. Zero disables event logging."
         ),
     )
-    parser.add_argument(
+    episode_length = parser.add_mutually_exclusive_group()
+    episode_length.add_argument(
+        "--stage",
+        dest="sim_end_time",
+        type=_stage_to_sim_end_time,
+        metavar="1",
+        help=(
+            "Run the Stage 1 short-episode policy contract; equivalent to "
+            "--sim-end-time 2000. Normalizer and learning behavior are "
+            "otherwise unchanged."
+        ),
+    )
+    episode_length.add_argument(
         "--sim-end-time",
         type=int,
         help="Override PClient's simulator episode end time after every init/reset.",

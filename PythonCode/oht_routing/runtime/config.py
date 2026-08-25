@@ -1,4 +1,4 @@
-"""Validated runtime configuration for contextual TD7 v3."""
+"""Validated runtime configuration for the current contextual TD7."""
 
 from __future__ import annotations
 
@@ -29,6 +29,7 @@ from oht_routing.version import CONTEXTUAL_VERSION
 RESUME_LAUNCH_CONTROL_FIELDS = {
     "mode",
     "action_enabled",
+    "reward_version",
     "device",
     "topology_cache_path",
     "topology_audit_path",
@@ -187,8 +188,11 @@ def seed_everything(seed):
 
 
 def restore_checkpoint_runtime_config(config_kwargs, checkpoint_path):
-    """Apply saved Reward O settings while preserving launch controls."""
-    saved, _ = read_contextual_runtime_config(checkpoint_path)
+    """Apply compatible saved settings while preserving launch controls."""
+    saved, _ = read_contextual_runtime_config(
+        checkpoint_path,
+        expected_reward_version=config_kwargs["reward_version"],
+    )
     valid_fields = set(ContextualRuntimeConfig.__dataclass_fields__)
     restored = []
     for key, value in saved.items():

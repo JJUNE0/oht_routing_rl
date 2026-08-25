@@ -185,7 +185,11 @@ class ContextualSALETests(unittest.TestCase):
             zsa = learner.sale_fixed.state_action(zs, batch.applied_action)
         actor_output = learner.actor(task_state.detach(), zs)
         critic_output = learner.critic(
-            task_state, batch.applied_action, zs, zsa
+            task_state,
+            batch.applied_action,
+            zs,
+            zsa,
+            critic_total_tat=batch.critic_total_tat,
         )
         (actor_output.action.mean() + critic_output.q1.mean()).backward()
         self.assertTrue(all(
@@ -203,7 +207,57 @@ class ContextualSALETests(unittest.TestCase):
         actor_input = learner.actor.network[0].in_features
         critic_input = learner.critic.q1[0].in_features
         self.assertEqual(actor_input, 32)
-        self.assertEqual(critic_input, 48)
+        self.assertEqual(critic_input, 49)
+
+    def test_total_tat_bypasses_sale_and_actor_but_conditions_critic(self):
+        learner = ContextualTD7Learner(
+            sale_replay(),
+            network_config=SMALL_NETWORK,
+            config=sale_config(),
+            seed=31,
+        )
+        batch = learner.replay.sample(6)
+        observation = batch_observation(batch)
+        low_tat = torch.full_like(batch.critic_total_tat, -1.5)
+        high_tat = torch.full_like(batch.critic_total_tat, 2.25)
+        learner.actor.eval()
+        learner.sale_fixed.eval()
+        learner.critic.eval()
+
+        with torch.inference_mode():
+            task_state = learner.encoder(*observation).state
+            low_sale_state = learner.sale_fixed.state(observation)
+            high_sale_state = learner.sale_fixed.state(observation)
+            low_actor = learner.actor(task_state, low_sale_state).action
+            high_actor = learner.actor(task_state, high_sale_state).action
+            sale_state_action = learner.sale_fixed.state_action(
+                low_sale_state, batch.applied_action
+            )
+            low_q = learner.critic(
+                task_state,
+                batch.applied_action,
+                low_sale_state,
+                sale_state_action,
+                critic_total_tat=low_tat,
+            )
+            high_q = learner.critic(
+                task_state,
+                batch.applied_action,
+                high_sale_state,
+                sale_state_action,
+                critic_total_tat=high_tat,
+            )
+
+        torch.testing.assert_close(
+            low_sale_state, high_sale_state, rtol=0, atol=0
+        )
+        torch.testing.assert_close(low_actor, high_actor, rtol=0, atol=0)
+        self.assertGreater(
+            float((low_q.q1 - high_q.q1).abs().sum()), 0.0
+        )
+        self.assertGreater(
+            float((low_q.q2 - high_q.q2).abs().sum()), 0.0
+        )
 
 
 if __name__ == "__main__":

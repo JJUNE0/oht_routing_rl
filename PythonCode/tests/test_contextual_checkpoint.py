@@ -20,8 +20,15 @@ from oht_routing.algorithms.rl.contextual_td7.checkpoint import (
     save_contextual_checkpoint,
 )
 from oht_routing.version import CONTEXTUAL_VERSION
-from oht_routing.mdp.observation import RunningFeatureNormalizer
+from oht_routing.mdp.observation import (
+    CRITIC_EXTRA_DIM,
+    GLOBAL_DIM,
+    LOCAL_PHYSICAL_DIM,
+    RunningFeatureNormalizer,
+)
 from oht_routing.mdp.reward.builder import ContextualRewardBuilder, ContextualRewardConfig
+from oht_routing.mdp.reward.config import REWARD_VERSION
+from oht_routing.runtime.config import restore_checkpoint_runtime_config
 from test_contextual_learner import SMALL_NETWORK
 from test_contextual_observation import make_topology
 from test_contextual_replay import FakeObservationBuilder, make_snapshot
@@ -30,20 +37,30 @@ from test_contextual_replay import FakeObservationBuilder, make_snapshot
 class CheckpointObservationBuilder(FakeObservationBuilder):
     def __init__(self, topology):
         super().__init__(topology)
-        self.local_normalizer = RunningFeatureNormalizer(16)
-        self.global_normalizer = RunningFeatureNormalizer(18)
+        self.local_normalizer = RunningFeatureNormalizer(LOCAL_PHYSICAL_DIM)
+        self.global_normalizer = RunningFeatureNormalizer(GLOBAL_DIM)
+        self.critic_normalizer = RunningFeatureNormalizer(CRITIC_EXTRA_DIM)
         self.local_normalizer.update(
-            np.ones((4999, 16)), name="checkpoint_local"
+            np.ones((4999, LOCAL_PHYSICAL_DIM)), name="checkpoint_local"
         )
         self.global_normalizer.update(
-            np.ones((1, 18)), name="checkpoint_global"
+            np.ones((1, GLOBAL_DIM)), name="checkpoint_global"
+        )
+        self.critic_normalizer.update(
+            np.ones((1, CRITIC_EXTRA_DIM)), name="checkpoint_critic_total_tat"
         )
         self.local_normalizer.freeze()
         self.global_normalizer.freeze()
+        self.critic_normalizer.freeze()
 
 
 def components(
-    seed=17, *, sale=False, lap=False, reward_version="O", batch_size=16
+    seed=17,
+    *,
+    sale=False,
+    lap=False,
+    reward_version=REWARD_VERSION,
+    batch_size=16,
 ):
     topology = make_topology()
     builder = CheckpointObservationBuilder(topology)
@@ -92,6 +109,46 @@ def components(
 
 
 class ContextualCheckpointTests(unittest.TestCase):
+    def test_critic_total_tat_normalizer_round_trips(self):
+        learner, obs, reward = components()
+        obs.critic_normalizer = RunningFeatureNormalizer(CRITIC_EXTRA_DIM)
+        obs.critic_normalizer.update(
+            np.asarray([[111.0], [222.0]], dtype=np.float64),
+            name="checkpoint_critic_total_tat",
+        )
+        obs.critic_normalizer.freeze()
+        expected = obs.critic_normalizer.state_dict()
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = save_contextual_checkpoint(
+                Path(directory) / "critic_normalizer.pt",
+                learner,
+                observation_builder=obs,
+                reward_builder=reward,
+            )
+            payload = torch.load(path, weights_only=False)
+            saved = payload["observation_critic_total_tat_normalizer"]
+            np.testing.assert_array_equal(saved["mean"], expected["mean"])
+            np.testing.assert_array_equal(saved["m2"], expected["m2"])
+            self.assertEqual(saved["count"], expected["count"])
+            self.assertTrue(saved["frozen"])
+
+            target, target_obs, target_reward = components(seed=99)
+            load_contextual_checkpoint(
+                path,
+                target,
+                observation_builder=target_obs,
+                reward_builder=target_reward,
+            )
+            restored = target_obs.critic_normalizer.state_dict()
+            np.testing.assert_array_equal(restored["mean"], expected["mean"])
+            np.testing.assert_array_equal(restored["m2"], expected["m2"])
+            self.assertEqual(restored["count"], expected["count"])
+            self.assertEqual(
+                restored["update_calls"], expected["update_calls"]
+            )
+            self.assertTrue(restored["frozen"])
+
     def test_reward_step_counter_round_trips(self):
         learner, obs, reward = components()
         reward.reward_steps = 12_345
@@ -112,28 +169,85 @@ class ContextualCheckpointTests(unittest.TestCase):
             )
             self.assertEqual(target_reward.reward_steps, 12_345)
 
-    def test_checkpoint_rejects_non_n_reward_identity(self):
+    def test_v5_0_checkpoint_remains_compatible_with_v5_1_runtime(self):
         learner, obs, reward = components()
+        self.assertEqual(CONTEXTUAL_VERSION, "v5.1.0")
         with tempfile.TemporaryDirectory() as directory:
             path = save_contextual_checkpoint(
-                Path(directory) / "reward_o.pt",
+                Path(directory) / "v5_0.pt",
                 learner,
                 observation_builder=obs,
                 reward_builder=reward,
+                runtime_config={"reward_version": REWARD_VERSION},
             )
             payload = torch.load(path, weights_only=False)
-            payload["reward_version"] = "U"
-            incompatible = Path(directory) / "reward_u.pt"
+            payload["version"] = "v5.0.0"
+            torch.save(payload, path)
+
+            target, target_obs, target_reward = components(seed=99)
+            load_contextual_checkpoint(
+                path,
+                target,
+                observation_builder=target_obs,
+                reward_builder=target_reward,
+            )
+
+    def test_same_v5_reward_o_checkpoint_is_rejected_before_restore(self):
+        learner, obs, reward = components()
+        self.assertEqual(CONTEXTUAL_VERSION, "v5.1.0")
+        with tempfile.TemporaryDirectory() as directory:
+            path = save_contextual_checkpoint(
+                Path(directory) / "reward_p.pt",
+                learner,
+                observation_builder=obs,
+                reward_builder=reward,
+                runtime_config={"reward_version": REWARD_VERSION},
+            )
+            payload = torch.load(path, weights_only=False)
+            payload["version"] = CONTEXTUAL_VERSION
+            payload["reward_version"] = "O"
+            payload["runtime_config"]["reward_version"] = "O"
+            incompatible = Path(directory) / "reward_o.pt"
             torch.save(payload, incompatible)
+            with self.assertRaisesRegex(
+                ContextualCheckpointError,
+                "reward_version mismatch: saved='O', runtime='P'",
+            ):
+                read_contextual_runtime_config(
+                    incompatible, expected_reward_version=REWARD_VERSION
+                )
+            with self.assertRaisesRegex(
+                ContextualCheckpointError,
+                "reward_version mismatch: saved='O', runtime='P'",
+            ):
+                restore_checkpoint_runtime_config(
+                    {"reward_version": REWARD_VERSION}, incompatible
+                )
             target, target_obs, target_reward = components(seed=99)
             with self.assertRaisesRegex(
-                ContextualCheckpointError, "reward_version mismatch"
+                ContextualCheckpointError,
+                "reward_version mismatch: saved='O', runtime='P'",
             ):
                 load_contextual_checkpoint(
                     incompatible,
                     target,
                     observation_builder=target_obs,
                     reward_builder=target_reward,
+                )
+
+    def test_save_rejects_runtime_config_reward_identity_mismatch(self):
+        learner, obs, reward = components()
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(
+                ContextualCheckpointError,
+                "payload='P', runtime_config='O'",
+            ):
+                save_contextual_checkpoint(
+                    Path(directory) / "inconsistent.pt",
+                    learner,
+                    observation_builder=obs,
+                    reward_builder=reward,
+                    runtime_config={"reward_version": "O"},
                 )
 
     def test_runtime_metadata_and_learner_config_do_not_gate_loading(self):
@@ -164,7 +278,7 @@ class ContextualCheckpointTests(unittest.TestCase):
                 learner,
                 observation_builder=obs,
                 reward_builder=reward,
-                runtime_config={"reward_version": "O"},
+                runtime_config={"reward_version": REWARD_VERSION},
             )
             payload = torch.load(path, weights_only=False)
             payload.pop("version")
@@ -183,14 +297,12 @@ class ContextualCheckpointTests(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(
                     ContextualCheckpointError,
-                    "former v2 step_400000.pt promotion is intentionally "
-                    "incompatible",
+                    "checkpoint version mismatch",
                 ):
                     read_contextual_runtime_config(path)
                 with self.assertRaisesRegex(
                     ContextualCheckpointError,
-                    "former v2 step_400000.pt promotion is intentionally "
-                    "incompatible",
+                    "checkpoint version mismatch",
                 ):
                     load_contextual_checkpoint(
                         path,
@@ -199,18 +311,18 @@ class ContextualCheckpointTests(unittest.TestCase):
                         reward_builder=reward,
                     )
 
-    def test_v2_semver_checkpoint_is_rejected(self):
+    def test_v4_semver_checkpoint_is_rejected(self):
         learner, obs, reward = components()
         with tempfile.TemporaryDirectory() as directory:
             path = save_contextual_checkpoint(
-                Path(directory) / "v2_0.pt",
+                Path(directory) / "v4_1.pt",
                 learner,
                 observation_builder=obs,
                 reward_builder=reward,
-                runtime_config={"reward_version": "O"},
+                runtime_config={"reward_version": REWARD_VERSION},
             )
             payload = torch.load(path, weights_only=False)
-            payload["version"] = "v2.0.0"
+            payload["version"] = "v4.1.0"
             torch.save(payload, path)
 
             with self.assertRaisesRegex(

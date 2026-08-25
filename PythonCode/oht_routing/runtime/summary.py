@@ -2,6 +2,13 @@
 
 from oht_routing.algorithms.rl.contextual_td7 import ContextualStepReplayBuffer
 from oht_routing.mdp.action import REGION_B_RL
+from oht_routing.mdp.observation import (
+    ACTOR_GLOBAL_DIM,
+    CRITIC_EXTRA_DIM,
+    LOCAL_PHYSICAL_DIM,
+    OBSERVATION_VERSION,
+    RELATION_DIM,
+)
 from oht_routing.runtime.console import print_header, print_section
 from oht_routing.runtime.config_validation import make_reward_config
 from oht_routing.version import CONTEXTUAL_VERSION
@@ -18,7 +25,7 @@ def print_runtime_summary(client):
         neighbor_count=network.neighbor_count,
         lap_enabled=config.lap_enabled,
     ) / (1024.0 ** 3)
-    replay_storage = "packed local u8/u16, Q15 actions"
+    replay_storage = "packed V5 local u8/u16, critic TAT f32, Q15 actions"
     if config.lap_enabled:
         replay_storage += ", fp16 LAP"
     reward = make_reward_config(config)
@@ -78,9 +85,17 @@ def print_runtime_summary(client):
         (
             ("action mode", config.action_mode),
             ("action scale schedule", action_scale),
-            ("local physical features", network.local_physical_dim),
+            ("observation version", OBSERVATION_VERSION),
+            ("local physical features", LOCAL_PHYSICAL_DIM),
             ("rail embedding dimensions", network.rail_embedding_dim),
-            ("global features", network.global_dim),
+            ("relation features", RELATION_DIM),
+            ("actor global features", ACTOR_GLOBAL_DIM),
+            (
+                "critic-only features",
+                f"{CRITIC_EXTRA_DIM} (normalized total_tat_s)",
+            ),
+            ("actor has TotalTat", False),
+            ("critic has TotalTat", True),
             (
                 "context rails",
                 f"center + {network.neighbor_count} incoming + "
@@ -139,15 +154,20 @@ def print_runtime_summary(client):
         ),
     )
     print_section(
-        "Reward O",
+        f"Reward {config.reward_version}",
         (
             ("version", config.reward_version),
             ("rail reward mode", reward.rail_reward_mode),
             ("free-flow neutral ratio", reward.rail_free_flow_neutral_ratio),
             ("TAT signal", reward.contract.tat_signal_description),
-            ("TAT window seconds", reward.tat_window_seconds),
+            ("TAT source", "pclient.TotalTat (cumulative seconds)"),
+            ("TAT formula", "-4.3 * max(TotalTat - 160, 0) / 165"),
+            ("TAT zero sentinel", "TotalTat == 0 -> zero contribution"),
+            ("TAT no-penalty range", "0 < TotalTat <= 160 -> zero"),
+            ("TAT invalid", "TotalTat < 0 -> fail fast"),
             ("TAT weight", reward.tat_weight),
             ("operation-rate weight", reward.op_weight),
+            ("operation-rate enabled", reward.use_op),
             ("backlog weight", reward.backlog_weight),
             ("backlog-growth weight", reward.backlog_growth_weight),
             ("idle-reserve weight", reward.idle_reserve_weight),

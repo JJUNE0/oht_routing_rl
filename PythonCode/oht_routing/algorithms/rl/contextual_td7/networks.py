@@ -58,6 +58,47 @@ def _require_index_tensor(
         )
 
 
+def _flatten_critic_extra(
+    value: torch.Tensor,
+    config: ContextualNetworkConfig,
+    *,
+    batch_size: int,
+) -> torch.Tensor:
+    if not torch.is_tensor(value):
+        raise TypeError("critic_total_tat must be a torch.Tensor")
+    expected = (
+        int(batch_size),
+        int(config.num_stacks),
+        int(config.critic_extra_dim),
+    )
+    if config.num_stacks == 1 and value.ndim == 2:
+        _require_tensor(
+            "critic_total_tat", value, (config.critic_extra_dim,)
+        )
+        stacked = value.unsqueeze(1)
+    elif value.ndim == 3 and tuple(value.shape) == expected:
+        if not value.is_floating_point():
+            raise TypeError("critic_total_tat must have a floating dtype")
+        if not bool(torch.isfinite(value).all().item()):
+            raise ContextualNetworkError(
+                "critic_total_tat contains NaN or Inf"
+            )
+        stacked = value
+    else:
+        raise ValueError(
+            "critic_total_tat shape must be "
+            f"{expected}"
+            + (
+                f" or ({int(batch_size)}, {config.critic_extra_dim})"
+                if config.num_stacks == 1 else ""
+            )
+            + f", got {tuple(value.shape)}"
+        )
+    if stacked.shape[0] != int(batch_size):
+        raise ValueError("critic TotalTat batch size differs from state")
+    return stacked.reshape(batch_size, config.stacked_critic_extra_dim)
+
+
 class FeatureEncoder(nn.Module):
     def __init__(self, input_dim: int, output_dim: int):
         super().__init__()
@@ -377,10 +418,14 @@ class ContextualTwinCritic(nn.Module):
         if self.sale_enabled:
             from .sale import avg_l1_norm
             self.task_sa_projection = nn.Linear(
-                self.config.critic_input_dim,
+                self.config.critic_state_action_dim,
                 sale_feature_dim,
             )
-            input_dim = sale_feature_dim + 2 * sale_embedding_dim
+            input_dim = (
+                sale_feature_dim
+                + 2 * sale_embedding_dim
+                + self.config.stacked_critic_extra_dim
+            )
             self.q1 = _sale_critic_head(
                 input_dim, self.config.hidden_dim
             )
@@ -397,6 +442,7 @@ class ContextualTwinCritic(nn.Module):
         sale_state: torch.Tensor | None = None,
         sale_state_action: torch.Tensor | None = None,
         *,
+        critic_total_tat: torch.Tensor,
         previous_action: torch.Tensor | None = None,
     ) -> TwinCriticOutput:
         _require_tensor("state", state, (self.config.stacked_context_dim,))
@@ -414,6 +460,11 @@ class ContextualTwinCritic(nn.Module):
             state.shape[0] == action.shape[0] == previous_action.shape[0]
         ):
             raise ValueError("state/previous-action/current-action batches differ")
+        critic_extra = _flatten_critic_extra(
+            critic_total_tat,
+            self.config,
+            batch_size=state.shape[0],
+        )
         state_previous_action = interleave_state_action(
             state,
             previous_action,
@@ -432,10 +483,17 @@ class ContextualTwinCritic(nn.Module):
             from .sale import avg_l1_norm
             if sale_state is None or sale_state_action is None:
                 raise ValueError("SALE critic requires fixed z_s and z_sa")
-            state_action = torch.cat((
-                avg_l1_norm(self.task_sa_projection(state_action)),
-                sale_state.detach(), sale_state_action.detach(),
-            ), -1)
+            state_action = torch.cat(
+                (
+                    avg_l1_norm(self.task_sa_projection(state_action)),
+                    sale_state.detach(),
+                    sale_state_action.detach(),
+                    critic_extra,
+                ),
+                -1,
+            )
+        else:
+            state_action = torch.cat((state_action, critic_extra), dim=-1)
         q1 = self.q1(state_action)
         q2 = self.q2(state_action)
         _require_finite("critic.q1", q1)
@@ -449,6 +507,7 @@ class ContextualTwinCritic(nn.Module):
         sale_state=None,
         sale_state_action=None,
         *,
+        critic_total_tat,
         previous_action=None,
     ):
         return self(
@@ -456,5 +515,6 @@ class ContextualTwinCritic(nn.Module):
             action,
             sale_state,
             sale_state_action,
+            critic_total_tat=critic_total_tat,
             previous_action=previous_action,
         ).q1

@@ -6,7 +6,11 @@ from oht_routing.algorithms.rl.contextual_td7.replay_buffer import (
     ContextualReplayError,
     ContextualStepReplayBuffer,
     REPLAY_SAMPLING_SNAPSHOT,
+    STATIC_PHYSICAL_FEATURE_INDICES,
+    UINT16_PHYSICAL_FEATURE_INDICES,
+    UINT8_PHYSICAL_FEATURE_INDICES,
 )
+from oht_routing.mdp.observation import CRITIC_EXTRA_DIM, GLOBAL_DIM
 from test_contextual_observation import CONTROLLED_COUNT, make_topology
 from test_contextual_replay import FakeObservationBuilder, make_snapshot
 
@@ -76,12 +80,12 @@ class ContextualReplayMemoryTests(unittest.TestCase):
         )
         estimate_100k_gib = estimate_100k / (1024.0 ** 3)
         self.assertLess(estimate_100k_gib, 20.0)
-        self.assertAlmostEqual(estimate_100k_gib, 18.643270, places=5)
+        self.assertAlmostEqual(estimate_100k_gib, 16.772020, places=5)
         estimate_100k_no_lap_gib = replay.estimate_capacity_bytes(
             100_000, lap_enabled=False
         ) / (1024.0 ** 3)
         self.assertAlmostEqual(
-            estimate_100k_no_lap_gib, 17.710830, places=5
+            estimate_100k_no_lap_gib, 15.839580, places=5
         )
 
     def test_packed_storage_dtypes_match_capacity_estimate_contract(self):
@@ -91,11 +95,16 @@ class ContextualReplayMemoryTests(unittest.TestCase):
             capacity_env_steps=3,
             lap_enabled=True,
         )
+        self.assertEqual(STATIC_PHYSICAL_FEATURE_INDICES, (0, 1, 2, 3))
+        self.assertEqual(
+            UINT8_PHYSICAL_FEATURE_INDICES, (4, 6, 7, 8, 9, 10, 11, 13)
+        )
+        self.assertEqual(UINT16_PHYSICAL_FEATURE_INDICES, (5, 12))
         self.assertEqual(replay._physical_static.dtype, np.float32)
-        self.assertEqual(replay._physical_distance_mm.dtype, np.float64)
         self.assertEqual(replay._physical_uint8.dtype, np.uint8)
         self.assertEqual(replay._physical_uint16.dtype, np.uint16)
         self.assertEqual(replay._global.dtype, np.float32)
+        self.assertEqual(replay._critic_total_tat.dtype, np.float32)
         self.assertEqual(replay._previous_applied_action.dtype, np.int16)
         self.assertEqual(replay._policy_action.dtype, np.int16)
         self.assertEqual(replay._applied_action.dtype, np.int16)
@@ -107,7 +116,15 @@ class ContextualReplayMemoryTests(unittest.TestCase):
         )
         self.assertEqual(
             replay._physical_uint16.shape,
-            (2 * replay.capacity, len(self.topology.all_rail_ids), 3),
+            (2 * replay.capacity, len(self.topology.all_rail_ids), 2),
+        )
+        self.assertEqual(
+            replay._global.shape,
+            (2 * replay.capacity, GLOBAL_DIM),
+        )
+        self.assertEqual(
+            replay._critic_total_tat.shape,
+            (2 * replay.capacity, CRITIC_EXTRA_DIM),
         )
 
     def test_repeated_overwrite_has_fixed_storage(self):

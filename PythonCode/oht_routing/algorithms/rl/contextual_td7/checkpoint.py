@@ -38,7 +38,7 @@ def _resolve_checkpoint_version(
     *,
     announce_promotion: bool = False,
 ) -> str:
-    """Return the compatible v3 version; v2 observation artifacts are rejected."""
+    """Return the compatible current-major version."""
     saved_version = payload.get("version")
     if is_compatible_contextual_version(saved_version):
         return CONTEXTUAL_VERSION
@@ -65,13 +65,48 @@ def _resolve_checkpoint_version(
         "checkpoint version mismatch: "
         f"saved={saved_version or legacy_version!r}, "
         f"runtime={CONTEXTUAL_VERSION!r}. A checkpoint must use the current "
-        "major version without being newer than the runtime. The former v2 "
-        "step_400000.pt promotion is intentionally incompatible with the v3 "
-        "observation and network contract."
+        "major version without being newer than the runtime. Earlier-major "
+        "observation and network contracts are intentionally incompatible."
     )
 
 
-def read_contextual_runtime_config(path) -> tuple[dict, bool]:
+def _validate_checkpoint_reward_identity(
+    payload: dict,
+    *,
+    expected_reward_version: str | None = None,
+) -> None:
+    saved_reward_version = payload.get("reward_version")
+    runtime_config = payload.get("runtime_config")
+    configured_reward_version = (
+        runtime_config.get("reward_version")
+        if isinstance(runtime_config, dict)
+        else None
+    )
+    if (
+        configured_reward_version is not None
+        and configured_reward_version != saved_reward_version
+    ):
+        raise ContextualCheckpointError(
+            "checkpoint reward_version mismatch: "
+            f"payload={saved_reward_version!r}, "
+            f"runtime_config={configured_reward_version!r}"
+        )
+    if (
+        expected_reward_version is not None
+        and saved_reward_version != expected_reward_version
+    ):
+        raise ContextualCheckpointError(
+            "checkpoint reward_version mismatch: "
+            f"saved={saved_reward_version!r}, "
+            f"runtime={expected_reward_version!r}"
+        )
+
+
+def read_contextual_runtime_config(
+    path,
+    *,
+    expected_reward_version: str | None = None,
+) -> tuple[dict, bool]:
     """Read saved runtime settings before constructing the runtime.
 
     Current checkpoints contain the complete ContextualRuntimeConfig.
@@ -80,7 +115,14 @@ def read_contextual_runtime_config(path) -> tuple[dict, bool]:
     """
     target = Path(path)
     payload = torch.load(target, map_location="cpu", weights_only=False)
+    if expected_reward_version is not None:
+        _validate_checkpoint_reward_identity(
+            payload,
+            expected_reward_version=expected_reward_version,
+        )
     _resolve_checkpoint_version(target, payload)
+    if expected_reward_version is None:
+        _validate_checkpoint_reward_identity(payload)
     saved = payload.get("runtime_config")
     if isinstance(saved, dict) and saved:
         return dict(saved), True
@@ -185,6 +227,9 @@ def save_contextual_checkpoint(
         "observation_global_normalizer": _normalizer_state(
             observation_builder.global_normalizer
         ),
+        "observation_critic_total_tat_normalizer": _normalizer_state(
+            observation_builder.critic_normalizer
+        ),
         "reward_steps": int(reward_builder.reward_steps),
         "python_random_state": random.getstate(),
         "numpy_random_state": np.random.get_state(),
@@ -214,6 +259,10 @@ def save_contextual_checkpoint(
     payload["current_target_q_max"] = learner.current_target_q_max
     payload["fixed_target_q_min"] = learner.fixed_target_q_min
     payload["fixed_target_q_max"] = learner.fixed_target_q_max
+    _validate_checkpoint_reward_identity(
+        payload,
+        expected_reward_version=reward_builder.reward_version,
+    )
     temporary = target.with_suffix(target.suffix + ".tmp")
     torch.save(payload, temporary)
     temporary.replace(target)
@@ -240,13 +289,16 @@ def load_contextual_checkpoint(
             "Crash checkpoint resume refused. "
             "Crash checkpoints are diagnostic artifacts only."
         )
+    _validate_checkpoint_reward_identity(
+        payload,
+        expected_reward_version=reward_builder.reward_version,
+    )
     _resolve_checkpoint_version(target, payload, announce_promotion=True)
     expected = {
         "topology_hash": learner.replay.topology.topology_hash,
         "mapping_hash": learner.replay.topology.mapping_hash,
         "network_config": asdict(learner.network_config),
         "action_mode": learner.config.action_mode,
-        "reward_version": reward_builder.reward_version,
         "sale_enabled": learner.config.sale_enabled,
         "lap_enabled": learner.config.lap_enabled,
     }
@@ -305,6 +357,10 @@ def load_contextual_checkpoint(
     _load_normalizer(
         observation_builder.global_normalizer,
         payload["observation_global_normalizer"],
+    )
+    _load_normalizer(
+        observation_builder.critic_normalizer,
+        payload["observation_critic_total_tat_normalizer"],
     )
     reward_builder.reward_steps = int(payload["reward_steps"])
     random.setstate(payload["python_random_state"])

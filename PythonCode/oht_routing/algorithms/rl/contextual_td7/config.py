@@ -7,20 +7,21 @@ from .stacking import validate_stack_config
 
 def contextual_algorithm_variant(sale_enabled: bool, lap_enabled: bool) -> str:
     return {
-        (True, True): "contextual_td7_sale_lap_v4_recenttat",
-        (False, True): "contextual_td7_no_sale_lap_v4_recenttat",
-        (True, False): "contextual_td7_sale_uniform_v4_recenttat",
-        (False, False): "contextual_twin_delayed_uniform_v4_recenttat",
+        (True, True): "contextual_td7_sale_lap_v5_compact_critic_tat",
+        (False, True): "contextual_td7_no_sale_lap_v5_compact_critic_tat",
+        (True, False): "contextual_td7_sale_uniform_v5_compact_critic_tat",
+        (False, False): "contextual_twin_delayed_uniform_v5_compact_critic_tat",
     }[(bool(sale_enabled), bool(lap_enabled))]
 
 
 @dataclass(frozen=True)
 class ContextualNetworkConfig:
-    local_physical_dim: int = 16
+    local_physical_dim: int = 14
     rail_embedding_dim: int = 8
     num_rails: int = 4_999
     relation_dim: int = 2
-    global_dim: int = 18
+    global_dim: int = 5
+    critic_extra_dim: int = 1
     neighbor_count: int = 15
     d_model: int = 64
     num_heads: int = 4
@@ -40,6 +41,7 @@ class ContextualNetworkConfig:
             "num_rails",
             "relation_dim",
             "global_dim",
+            "critic_extra_dim",
             "neighbor_count",
             "d_model",
             "num_heads",
@@ -86,7 +88,15 @@ class ContextualNetworkConfig:
 
     @property
     def critic_input_dim(self) -> int:
+        return self.critic_state_action_dim + self.stacked_critic_extra_dim
+
+    @property
+    def critic_state_action_dim(self) -> int:
         return (self.context_dim + 2 * self.action_dim) * self.num_stacks
+
+    @property
+    def stacked_critic_extra_dim(self) -> int:
+        return self.critic_extra_dim * self.num_stacks
 
 
 @dataclass(frozen=True)

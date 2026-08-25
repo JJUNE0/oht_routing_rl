@@ -16,14 +16,16 @@ from oht_routing.utils.wandb_logging import (
     WANDB_METRIC_KEYS,
 )
 
-REWARD_O_EXPORT_COLUMNS = {
+REWARD_P_EXPORT_COLUMNS = {
     "env/recent_completed_tat_300s_mean",
     "env/recent_completed_tat_300s_p90",
     "env/recent_completed_tat_300s_count",
     "env/recent_completed_tat_300s_available",
     "observation/recent_completed_tat_300s_mean",
     "observation/recent_completed_tat_300s_available",
+    "reward/global/tat_raw",
     "reward/global/tat_component_raw",
+    "reward/global/total_tat",
     "reward/global/recent_completed_tat_300s_mean",
     "reward/global/cumulative_total_tat",
     "reward/global/backlog_component_raw",
@@ -113,8 +115,8 @@ if len(WANDB_METRIC_KEYS) != len(set(WANDB_METRIC_KEYS)):
     raise RuntimeError("compact W&B export schema contains duplicate keys")
 if any(key.startswith(REMOVED_WANDB_PREFIXES) for key in WANDB_METRIC_KEYS):
     raise RuntimeError("removed metric group leaked into W&B export schema")
-if not REWARD_O_EXPORT_COLUMNS <= set(WANDB_METRIC_KEYS):
-    raise RuntimeError("Reward O diagnostics are missing from W&B export schema")
+if not REWARD_P_EXPORT_COLUMNS <= set(WANDB_METRIC_KEYS):
+    raise RuntimeError("Reward P diagnostics are missing from W&B export schema")
 if not WARMUP_BOUNDARY_EXPORT_COLUMNS <= set(WANDB_METRIC_KEYS):
     raise RuntimeError("warm-up boundary diagnostics are missing from W&B export schema")
 if not RUNTIME_SAFETY_EXPORT_COLUMNS <= set(WANDB_METRIC_KEYS):

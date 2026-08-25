@@ -485,6 +485,9 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
             and getattr(
                 self.observation_builder.global_normalizer, "frozen", False
             )
+            and getattr(
+                self.observation_builder.critic_normalizer, "frozen", False
+            )
         )
 
     def _state_normalizers_ready_for_bypass(self):
@@ -498,6 +501,11 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
             and int(
                 getattr(
                     self.observation_builder.global_normalizer, "count", 0
+                )
+            ) > 0
+            and int(
+                getattr(
+                    self.observation_builder.critic_normalizer, "count", 0
                 )
             ) > 0
         )

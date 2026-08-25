@@ -15,10 +15,11 @@ from test_contextual_replay import FakeObservationBuilder, make_snapshot
 
 
 SMALL_NETWORK = ContextualNetworkConfig(
-    local_physical_dim=16,
+    local_physical_dim=14,
     rail_embedding_dim=8,
     num_rails=4_999,
-    global_dim=18,
+    global_dim=5,
+    critic_extra_dim=1,
     neighbor_count=15,
     d_model=16, num_heads=4, global_emb_dim=8,
     context_dim=32, hidden_dim=64,
@@ -248,6 +249,59 @@ class ContextualLearnerTests(unittest.TestCase):
         self.assertLessEqual(
             float(captured[0].abs().max()), learner.config.action_scale + 1e-7
         )
+
+    def test_current_and_next_total_tat_reach_only_matching_critics(self):
+        learner = ContextualTD7Learner(
+            make_replay(),
+            network_config=SMALL_NETWORK,
+            config=replace(self.config(), policy_update_delay=1),
+            seed=53,
+        )
+        batch = learner.replay.sample(16)
+        current_tat = torch.full_like(batch.critic_total_tat, -3.25)
+        next_tat = torch.full_like(batch.next_critic_total_tat, 4.75)
+        routed_batch = replace(
+            batch,
+            critic_total_tat=current_tat,
+            next_critic_total_tat=next_tat,
+        )
+        online_seen = []
+        target_seen = []
+
+        def capture(target):
+            def hook(module, args, kwargs):
+                target.append(
+                    kwargs["critic_total_tat"].detach().clone()
+                )
+            return hook
+
+        handles = (
+            learner.critic.register_forward_pre_hook(
+                capture(online_seen), with_kwargs=True
+            ),
+            learner.target_critic.register_forward_pre_hook(
+                capture(target_seen), with_kwargs=True
+            ),
+        )
+        try:
+            result = learner.update(routed_batch)
+        finally:
+            for handle in handles:
+                handle.remove()
+
+        self.assertTrue(result.actor_updated)
+        # Online critic supervision plus actor-loss Q1 both use current state.
+        self.assertEqual(len(online_seen), 2)
+        self.assertEqual(len(target_seen), 1)
+        for observed in online_seen:
+            torch.testing.assert_close(
+                observed, current_tat, rtol=0, atol=0
+            )
+            self.assertFalse(torch.equal(observed, next_tat))
+        torch.testing.assert_close(
+            target_seen[0], next_tat, rtol=0, atol=0
+        )
+        self.assertFalse(torch.equal(target_seen[0], current_tat))
 
     def test_baseline_batch_critic_action_is_zero(self):
         learner = ContextualTD7Learner(

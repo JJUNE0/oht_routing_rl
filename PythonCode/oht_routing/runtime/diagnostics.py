@@ -151,7 +151,9 @@ class ContextualRuntimeDiagnosticsMixin:
             "episode_id": int(completed.episode_id),
             "episode_step": int(completed.env_step),
             "sim_time": float(getattr(pclient, "SimTime", 0.0)),
-            "recent_completed_tat_300s_mean": batch.total_tat_level,
+            "recent_completed_tat_300s_mean": (
+                batch.recent_completed_tat_mean
+            ),
             "recent_completed_tat_300s_p90": (
                 batch.recent_completed_tat_p90
             ),

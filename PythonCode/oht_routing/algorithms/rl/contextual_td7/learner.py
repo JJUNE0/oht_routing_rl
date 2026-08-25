@@ -321,6 +321,7 @@ class ContextualTD7Learner:
         normalizer_frozen = bool(
             getattr(builder.local_normalizer, "frozen", False)
             and getattr(builder.global_normalizer, "frozen", False)
+            and getattr(builder.critic_normalizer, "frozen", False)
         )
         return {
             "minimum_replay_env_steps": (
@@ -470,6 +471,7 @@ class ContextualTD7Learner:
             target_q_pair = self.target_critic(
                 next_state, next_applied,
                 target_sale_zs, target_sale_zsa,
+                critic_total_tat=batch.next_critic_total_tat,
                 previous_action=next_previous_applied,
             )
             tq1, tq2 = target_q_pair.q1, target_q_pair.q2
@@ -518,6 +520,7 @@ class ContextualTD7Learner:
             replay_applied,
             fixed_zs,
             fixed_zsa,
+            critic_total_tat=batch.critic_total_tat,
             previous_action=replay_previous_applied,
         )
         loss_function = (
@@ -594,6 +597,7 @@ class ContextualTD7Learner:
                 actor_applied,
                 actor_sale_zs,
                 actor_sale_zsa,
+                critic_total_tat=batch.critic_total_tat,
                 previous_action=replay_previous_applied,
             )
             pretanh_penalty = (

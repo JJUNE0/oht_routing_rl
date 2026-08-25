@@ -10,13 +10,21 @@ from oht_routing.algorithms.rl.contextual_td7 import (
 from oht_routing.mdp.action import (
     REGION_B_RL,
 )
+from oht_routing.mdp.observation import (
+    ACTOR_GLOBAL_DIM,
+    CRITIC_EXTRA_DIM,
+    LOCAL_PHYSICAL_DIM,
+    OBSERVATION_VERSION,
+    RELATION_DIM,
+)
 from oht_routing.mdp.reward.builder import ContextualRewardConfig
 from oht_routing.mdp.reward.config import (
+    REWARD_VERSION,
     reward_contract,
 )
 from oht_routing.version import CONTEXTUAL_VERSION
 
-_EXP_REWARD_VERSION = "O"
+_EXP_REWARD_VERSION = REWARD_VERSION
 _EXP_REWARD_CONTRACT = reward_contract(_EXP_REWARD_VERSION)
 
 EXP_META = {
@@ -24,11 +32,27 @@ EXP_META = {
     "cost_structure": "b_rl",
     "action_range": "b_rl_0.0-1.0_resume_curriculum_0.05-1",
     "topology": "directed_15in_15out_controlled_centers_v3",
-    "observation": "physical16_embedding8_global18_recent_tat300_v4",
-    "local_physical_dim": 16,
+    "observation_version": OBSERVATION_VERSION,
+    "observation": "compact_local14_actor_global5_critic_only_tat_v5",
+    "local_physical_dim": LOCAL_PHYSICAL_DIM,
     "rail_embedding_dim": 8,
-    "global_dim": 18,
+    "actor_global_dim": ACTOR_GLOBAL_DIM,
+    "global_dim": ACTOR_GLOBAL_DIM,
+    "critic_extra_dim": CRITIC_EXTRA_DIM,
+    "relation_dim": RELATION_DIM,
     "neighbor_count_per_direction": 15,
+    "actor_has_total_tat": False,
+    "critic_has_total_tat": True,
+    "critic_only_feature": "normalized_total_tat_s",
+    "obs/version": OBSERVATION_VERSION,
+    "obs/local_dim": LOCAL_PHYSICAL_DIM,
+    "obs/incoming_neighbors": 15,
+    "obs/outgoing_neighbors": 15,
+    "obs/relation_dim": RELATION_DIM,
+    "obs/actor_global_dim": ACTOR_GLOBAL_DIM,
+    "obs/critic_extra_dim": CRITIC_EXTRA_DIM,
+    "obs/actor_has_total_tat": 0,
+    "obs/critic_has_total_tat": 1,
     "previous_action_input": (
         "actor_and_critic_previous_applied_action_separate_from_encoder"
     ),
@@ -37,12 +61,20 @@ EXP_META = {
     "stack_interval": 1,
     "reward_version": _EXP_REWARD_VERSION,
     "tat_signal": _EXP_REWARD_CONTRACT.tat_signal_description,
-    "calibration_status": "active_rail_calibrated",
+    "calibration_status": "v5_compact_obs_reward_p_one_sided_total_tat",
     "reward_global_alpha": 0.5,
     "reward_local_alpha": 0.5,
     "tat_reference": 165.0,
     "tat_penalty_start": 160.0,
-    "tat_window_seconds": 300.0,
+    "tat_penalty_threshold": 160.0,
+    "tat_one_sided": True,
+    "tat_formula": "-4.3*max(TotalTat-160,0)/165_for_TotalTat_gt_0",
+    "reward_tat_input": "pclient.TotalTat",
+    "reward_recent_300_tat_used": False,
+    "reward_tat_zero_policy": "unavailable_zero_contribution",
+    "reward_tat_at_or_below_threshold_policy": "zero_contribution",
+    "reward_tat_negative_policy": "invalid_fail_fast",
+    "recent_tat_diagnostic_window_seconds": 300.0,
     "tat_weight": 4.3,
     "op_reference": 0.80,
     "op_weight": 0.0,
@@ -95,7 +127,9 @@ EXP_META = {
     ),
     "centering": False,
     "replay_capacity_env_steps": 100_000,
-    "replay_storage": "packed_local_u8_u16_action_q15_lap_fp16_v1",
+    "replay_storage": (
+        "packed_v5_local_u8_u16_critic_tat_f32_action_q15_lap_fp16"
+    ),
     "replay_action_quantization_max_abs_error": 1.0 / (2.0 * 32_767.0),
     "batch_size": 1_024,
     "seed": 0,
@@ -107,14 +141,16 @@ EXP_META = {
     "early_stop_tat_threshold": 200.0,
     "tat_above_threshold_patience": 300,
     "terminal_tat_penalty": -20.0,
-    "note": "activescale",
+    "note": "v5_compact_obs_reward_p_total_tat",
     "description": (
-        "This major release replaces cumulative episode TotalTat in the "
-        "observation and Reward O with the mean TAT of commands completed "
-        "during the latest 300 simulation seconds. Reward scales are "
-        "calibrated from the v2.2 2,000-step capture using active rail-step "
-        "distributions; rail StopTime is summed across resident OHTs without "
-        "clipping."
+        "V5 combines the compact asymmetric observation with Reward P. "
+        "Reward P uses simulator cumulative pclient.TotalTat directly in "
+        "the one-sided "
+        "penalty -4.3 * max(TotalTat - 160, 0) / 165. TotalTat == 0 "
+        "is an unavailable/reset sentinel, 0 < TotalTat <= 160 contributes "
+        "zero, and negative values are invalid. OP remains disabled with "
+        "op_weight=0.0 and use_op=False. V4 checkpoints, replay, and "
+        "normalizers are incompatible with this combined major release."
     ),
 }
 
@@ -490,16 +526,18 @@ WANDB_METRIC_KEYS = (
     "observation/predicted_route10_union_nonzero_ratio",
     "observation/recent_completed_tat_300s_mean",
     "observation/recent_completed_tat_300s_available",
-    # Locked Reward O components and contribution budget.
+    # Locked Reward P components and contribution budget.
     "reward/total_mean",
     "reward/total_std",
     "reward/terminal_penalty",
+    "reward/global/tat_raw",
     "reward/global/tat_component_raw",
     "reward/global/recent_completed_tat_300s_mean",
     "reward/global/recent_completed_tat_300s_p90",
     "reward/global/recent_completed_tat_300s_count",
     "reward/global/recent_completed_tat_300s_window_age",
     "reward/global/recent_completed_tat_events_added",
+    "reward/global/total_tat",
     "reward/global/cumulative_total_tat",
     "reward/global/tat_penalty_start",
     "reward/global/tat_excess",
@@ -737,7 +775,12 @@ def runtime_exp_meta(config) -> dict:
         reward_config.rail_free_flow_neutral_ratio
     )
     meta["tat_reference"] = float(reward_config.tat_reference)
-    meta["tat_window_seconds"] = float(reward_config.tat_window_seconds)
+    # Reward P has no TAT window. Keep the 300-second tracker explicitly
+    # diagnostic-only instead of presenting it as the reward signal window.
+    meta["tat_window_seconds"] = float(contract.tat_window_seconds)
+    meta["recent_tat_diagnostic_window_seconds"] = float(
+        reward_config.tat_window_seconds
+    )
     meta["tat_weight"] = float(reward_config.tat_weight)
     meta["op_reference"] = float(reward_config.op_reference)
     meta["op_weight"] = float(reward_config.op_weight)
@@ -818,9 +861,9 @@ def runtime_exp_meta(config) -> dict:
         config.replay_capacity_env_steps
     )
     meta["replay_storage"] = (
-        "packed_local_u8_u16_action_q15_lap_fp16_v1"
+        "packed_v5_local_u8_u16_critic_tat_f32_action_q15_lap_fp16"
         if config.lap_enabled
-        else "packed_local_u8_u16_action_q15_no_lap_v1"
+        else "packed_v5_local_u8_u16_critic_tat_f32_action_q15_no_lap"
     )
     if action_mode == REGION_B_RL:
         meta["cost_structure"] = "b_rl"

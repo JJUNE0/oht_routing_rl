@@ -103,24 +103,27 @@ class ContextualRewardTests(unittest.TestCase):
             episode_id=0,
         )
 
-    def test_recent_tat_uses_one_sided_unbounded_reward_o_curve(self):
+    def test_total_tat_uses_one_sided_unbounded_reward_p_curve(self):
         config = ContextualRewardConfig(
             use_op=False,
             use_backlog=False,
             backlog_growth_enabled=False,
             idle_reserve_weight=0.0,
         )
-        for recent_tat, expected in (
+        for total_tat, expected in (
             (100.0, 0.0),
             (159.0, 0.0),
             (160.0, 0.0),
             (170.0, -4.3 * 10.0 / 165.0),
             (360.0, -4.3 * 200.0 / 165.0),
         ):
-            with self.subTest(recent_tat=recent_tat):
+            with self.subTest(total_tat=total_tat):
                 client = reward_client()
+                client.TotalTat = total_tat
                 builder = ContextualRewardBuilder(self.topology, config)
-                snapshot = prime_recent_tat(builder, client, recent_tat)
+                # Deliberately disagree with TotalTat: the recent signal is
+                # diagnostic-only in Reward P.
+                snapshot = prime_recent_tat(builder, client, 999.0)
                 self.assertTrue(snapshot.available)
                 batch = builder.build(
                     client,
@@ -131,8 +134,21 @@ class ContextualRewardTests(unittest.TestCase):
                 )
                 self.assertAlmostEqual(batch.tat_raw, expected)
                 self.assertAlmostEqual(batch.global_raw, expected)
+                self.assertAlmostEqual(
+                    builder.diagnostics(batch)["reward/global/tat_excess"],
+                    max(0.0, total_tat - 160.0),
+                )
+                self.assertEqual(batch.total_tat_level, total_tat)
+                self.assertEqual(batch.cumulative_total_tat_level, total_tat)
+                self.assertEqual(batch.recent_completed_tat_mean, 999.0)
+                self.assertEqual(
+                    builder.diagnostics(batch)[
+                        "reward/global/recent_completed_tat_300s_mean"
+                    ],
+                    999.0,
+                )
 
-    def test_completed_count_does_not_scale_recent_tat_reward(self):
+    def test_completed_count_does_not_scale_total_tat_reward(self):
         config = ContextualRewardConfig(
             use_op=False,
             use_backlog=False,
@@ -143,8 +159,8 @@ class ContextualRewardTests(unittest.TestCase):
         for completed in (0, 1, 10_000):
             client = reward_client()
             client.CompletedCommandCount = completed
+            client.TotalTat = 200.0
             builder = ContextualRewardBuilder(self.topology, config)
-            prime_recent_tat(builder, client, 200.0)
             values.append(builder.build(
                 client,
                 applied_action=self.action,
@@ -155,15 +171,23 @@ class ContextualRewardTests(unittest.TestCase):
         self.assertEqual(values[0], values[1])
         self.assertEqual(values[1], values[2])
 
-    def test_unavailable_recent_tat_is_masked_but_cumulative_tat_is_logged(self):
+    def test_zero_total_tat_is_masked_while_recent_tat_is_diagnostic(self):
         client = reward_client()
-        client.TotalTat = 360.0
-        client.SimTime = 100.0
-        batch = self.build(client)
+        client.TotalTat = 0.0
+        builder = ContextualRewardBuilder(self.topology)
+        prime_recent_tat(builder, client, 360.0)
+        batch = builder.build(
+            client,
+            applied_action=self.action,
+            previous_applied_action=None,
+            env_step=0,
+            episode_id=0,
+        )
         self.assertEqual(batch.tat_signal_available, 0.0)
         self.assertEqual(batch.total_tat_level, 0.0)
         self.assertEqual(batch.tat_raw, 0.0)
-        self.assertEqual(batch.cumulative_total_tat_level, 360.0)
+        self.assertEqual(batch.cumulative_total_tat_level, 0.0)
+        self.assertEqual(batch.recent_completed_tat_mean, 360.0)
 
     def test_backlog_growth_pressure_is_one_sided_and_resets(self):
         config = ContextualRewardConfig(
@@ -388,9 +412,19 @@ class ContextualRewardTests(unittest.TestCase):
         np.testing.assert_array_equal(action, original)
 
     def test_nonfinite_inputs_fail_fast(self):
+        for total_tat in (np.nan, np.inf, -np.inf):
+            with self.subTest(total_tat=total_tat):
+                client = reward_client()
+                client.TotalTat = total_tat
+                with self.assertRaisesRegex(
+                    ContextualRewardError, "NaN or Inf"
+                ):
+                    self.build(client)
         client = reward_client()
-        client.TotalTat = np.nan
-        with self.assertRaises(ContextualRewardError):
+        client.TotalTat = -1.0
+        with self.assertRaisesRegex(
+            ContextualRewardError, "TotalTat must be non-negative"
+        ):
             self.build(client)
         bad_action = self.action.copy()
         bad_action[0] = np.inf

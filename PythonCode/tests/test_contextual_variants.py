@@ -15,6 +15,7 @@ from oht_routing.mdp.reward.config import (
     RAIL_REWARD_FREE_FLOW_NEUTRAL_2,
     REWARD_VERSION,
 )
+from oht_routing.version import CONTEXTUAL_VERSION
 from oht_routing.algorithms.rl.contextual_td7 import (
     ContextualLearnerConfig,
     ContextualTD7Learner,
@@ -29,10 +30,10 @@ from test_contextual_sale import sale_replay
 
 
 EXPECTED = {
-    (True, True): "contextual_td7_sale_lap_v4_recenttat",
-    (False, True): "contextual_td7_no_sale_lap_v4_recenttat",
-    (True, False): "contextual_td7_sale_uniform_v4_recenttat",
-    (False, False): "contextual_twin_delayed_uniform_v4_recenttat",
+    (True, True): "contextual_td7_sale_lap_v5_compact_critic_tat",
+    (False, True): "contextual_td7_no_sale_lap_v5_compact_critic_tat",
+    (True, False): "contextual_td7_sale_uniform_v5_compact_critic_tat",
+    (False, False): "contextual_twin_delayed_uniform_v5_compact_critic_tat",
 }
 
 
@@ -43,7 +44,8 @@ class ContextualVariantTests(unittest.TestCase):
         ):
             return parse_args()
 
-    def test_cli_and_runtime_are_locked_to_reward_o(self):
+    def test_cli_and_runtime_are_locked_to_reward_p(self):
+        self.assertEqual(CONTEXTUAL_VERSION, "v5.1.0")
         parsed = self.parse()
         self.assertNotIn("reward_version", vars(parsed))
         self.assertEqual(
@@ -52,17 +54,17 @@ class ContextualVariantTests(unittest.TestCase):
         )
         self.assertEqual(
             runtime_config_from_args(
-                self.parse("--reward-version", "o")
+                self.parse("--reward-version", "p")
             ).reward_version,
-            "O",
+            "P",
         )
         with self.assertRaises(SystemExit):
-            self.parse("--reward-version", "E")
-        with self.assertRaisesRegex(ValueError, "only reward_version='O'"):
-            ContextualRuntimeConfig(reward_version="U")
+            self.parse("--reward-version", "O")
+        with self.assertRaisesRegex(ValueError, "only reward_version='P'"):
+            ContextualRuntimeConfig(reward_version="O")
 
         config = ContextualRuntimeConfig()
-        self.assertEqual(config.reward_version, "O")
+        self.assertEqual(config.reward_version, "P")
         self.assertEqual(config.early_stop_tat_threshold, 200.0)
         self.assertEqual(config.tat_termination_grace_steps, 10_000)
         self.assertEqual(config.tat_above_threshold_patience, 300)
@@ -72,6 +74,11 @@ class ContextualVariantTests(unittest.TestCase):
         self.assertEqual(reward.op_weight, 0.0)
         self.assertFalse(reward.use_op)
         self.assertEqual(reward.tat_window_seconds, 300.0)
+        self.assertEqual(reward.contract.tat_window_seconds, 0.0)
+        self.assertEqual(
+            reward.contract.tat_signal_description,
+            "one_sided_cumulative_total_tat_penalty",
+        )
         self.assertEqual(reward.backlog_weight, 0.0007)
         self.assertEqual(reward.backlog_growth_weight, 0.17)
         self.assertEqual(reward.idle_reserve_weight, 0.09)
@@ -102,6 +109,27 @@ class ContextualVariantTests(unittest.TestCase):
         self.assertFalse(config.wandb_enabled)
         self.assertEqual(config.console_log_interval, 100)
         self.assertEqual(config.sim_end_time, 45_000)
+
+    def test_stage_one_is_a_thin_sim_end_time_alias(self):
+        parsed = self.parse("--stage", "1")
+        self.assertEqual(vars(parsed), {"sim_end_time": 2_000})
+        self.assertNotIn("stage", vars(parsed))
+        self.assertEqual(
+            runtime_config_from_args(parsed).sim_end_time,
+            2_000,
+        )
+
+    def test_stage_rejects_unknown_values_and_explicit_end_time(self):
+        for arguments in (
+            ("--stage", "0"),
+            ("--stage", "2"),
+            ("--stage", "first"),
+            ("--stage", "1", "--sim-end-time", "3000"),
+            ("--sim-end-time", "3000", "--stage", "1"),
+        ):
+            with self.subTest(arguments=arguments):
+                with self.assertRaises(SystemExit):
+                    self.parse(*arguments)
 
     def test_explicit_cli_values_override_only_selected_config_fields(self):
         config = runtime_config_from_args(self.parse(
@@ -135,6 +163,7 @@ class ContextualVariantTests(unittest.TestCase):
     def test_runtime_and_resume_launch_control_contract_is_declared(self):
         self.assertIn("replay_capacity_env_steps", RESUME_LAUNCH_CONTROL_FIELDS)
         self.assertIn("lap_enabled", RESUME_LAUNCH_CONTROL_FIELDS)
+        self.assertIn("reward_version", RESUME_LAUNCH_CONTROL_FIELDS)
         self.assertIn("console_log_interval", RESUME_LAUNCH_CONTROL_FIELDS)
         self.assertIn("sim_end_time", RESUME_LAUNCH_CONTROL_FIELDS)
 
@@ -204,6 +233,7 @@ class ContextualVariantTests(unittest.TestCase):
     def test_resume_keeps_current_lap_and_capacity_controls(self, read_config):
         read_config.return_value = (
             {
+                "reward_version": "P",
                 "lap_enabled": True,
                 "replay_capacity_env_steps": 10_000,
                 "warmup_steps": 321,
@@ -234,7 +264,32 @@ class ContextualVariantTests(unittest.TestCase):
         self.assertEqual(config.console_log_interval, 200)
         self.assertEqual(config.sim_end_time, 55_000)
         self.assertTrue(config.state_normalizer_warmup_bypass)
-        read_config.assert_called_once_with("checkpoint.pt")
+        read_config.assert_called_once_with(
+            "checkpoint.pt", expected_reward_version="P"
+        )
+
+    @patch("oht_routing.runtime.config.read_contextual_runtime_config")
+    def test_stage_one_survives_checkpoint_runtime_restore(self, read_config):
+        read_config.return_value = (
+            {
+                "reward_version": "P",
+                "sim_end_time": 9_000,
+                "warmup_steps": 321,
+            },
+            True,
+        )
+        config = runtime_config_from_args(self.parse(
+            "--resume-checkpoint",
+            "checkpoint.pt",
+            "--stage",
+            "1",
+        ))
+        self.assertEqual(config.sim_end_time, 2_000)
+        self.assertEqual(config.warmup_steps, 321)
+        self.assertTrue(config.state_normalizer_warmup_bypass)
+        read_config.assert_called_once_with(
+            "checkpoint.pt", expected_reward_version="P"
+        )
 
     def test_cli_diagnostics_are_opt_in(self):
         parsed = self.parse()

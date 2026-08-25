@@ -3,6 +3,7 @@ import unittest
 import numpy as np
 
 from oht_routing.mdp.observation import (
+    CRITIC_EXTRA_DIM,
     GLOBAL_DIM,
     LOCAL_PHYSICAL_DIM,
     ContextualObservationBatch,
@@ -52,6 +53,7 @@ def observation(topology, suffix=0):
             (CONTROLLED_COUNT, neighbor_count, 2), np.float32
         ),
         global_state=np.zeros(GLOBAL_DIM, np.float32),
+        critic_total_tat=np.full(CRITIC_EXTRA_DIM, suffix, np.float32),
         previous_applied_action=np.zeros((CONTROLLED_COUNT, 1), np.float32),
         controlled_rail_ids=topology.controlled_rail_ids.copy(),
         topology_hash=topology.topology_hash,
@@ -60,6 +62,9 @@ def observation(topology, suffix=0):
             (PHYSICAL_COUNT, LOCAL_PHYSICAL_DIM), suffix, np.float32
         ),
         global_raw=np.full(GLOBAL_DIM, suffix, np.float32),
+        critic_total_tat_raw=np.full(
+            CRITIC_EXTRA_DIM, 100 + suffix, np.float32
+        ),
     )
 
 
@@ -96,6 +101,14 @@ class ContextualTransitionTests(unittest.TestCase):
         self.assertEqual(completed.next_env_step, 1)
         self.assertIs(completed.next_state, second)
         self.assertIs(self.aligner.pending.observation, second)
+        np.testing.assert_array_equal(
+            completed.state.critic_total_tat_raw,
+            np.asarray([100.0], dtype=np.float32),
+        )
+        np.testing.assert_array_equal(
+            completed.next_state.critic_total_tat_raw,
+            np.asarray([101.0], dtype=np.float32),
+        )
         self.assertEqual(len(self.items), 1)
         self.assertFalse(completed.action.flags.writeable)
 

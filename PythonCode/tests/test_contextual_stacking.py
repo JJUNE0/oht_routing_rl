@@ -99,13 +99,15 @@ class ContextualStackingTests(unittest.TestCase):
     def test_replay_materializes_current_next_and_action_history(self):
         replay = stacked_replay()
         batch = replay.sample(128)
-        self.assertEqual(batch.center_local.shape, (128, 3, 16))
-        self.assertEqual(batch.incoming_local.shape, (128, 3, 15, 16))
-        self.assertEqual(batch.outgoing_local.shape, (128, 3, 15, 16))
+        self.assertEqual(batch.center_local.shape, (128, 3, 14))
+        self.assertEqual(batch.incoming_local.shape, (128, 3, 15, 14))
+        self.assertEqual(batch.outgoing_local.shape, (128, 3, 15, 14))
         self.assertEqual(batch.center_rail_index.shape, (128, 3))
         self.assertEqual(batch.incoming_rail_indices.shape, (128, 3, 15))
         self.assertEqual(batch.outgoing_rail_indices.shape, (128, 3, 15))
-        self.assertEqual(batch.global_state.shape, (128, 3, 18))
+        self.assertEqual(batch.global_state.shape, (128, 3, 5))
+        self.assertEqual(batch.critic_total_tat.shape, (128, 3, 1))
+        self.assertEqual(batch.next_critic_total_tat.shape, (128, 3, 1))
         self.assertEqual(batch.center_rail_index.dtype, torch.long)
         self.assertEqual(batch.incoming_rail_indices.dtype, torch.long)
         self.assertEqual(batch.outgoing_rail_indices.dtype, torch.long)
@@ -146,18 +148,29 @@ class ContextualStackingTests(unittest.TestCase):
                 batch.outgoing_rail_indices[index].numpy(),
                 np.broadcast_to(replay._outgoing_rows[row], (3, 15)),
             )
-            base = float(replay.topology.all_rail_ids[physical_row])
             expected_state_steps = [max(step - offset, 0) for offset in (0, 2, 4)]
             expected_next_steps = [
                 max(step + 1 - offset, 0) for offset in (0, 2, 4)
             ]
             np.testing.assert_allclose(
-                batch.center_local[index, :, 6].numpy(),
-                7.0 * base + np.asarray(expected_state_steps),
+                batch.critic_total_tat[index, :, 0].numpy(),
+                1_000.0 + 10.0 * np.asarray(expected_state_steps),
             )
             np.testing.assert_allclose(
-                batch.next_center_local[index, :, 6].numpy(),
-                7.0 * base + np.asarray(expected_next_steps),
+                batch.next_critic_total_tat[index, :, 0].numpy(),
+                1_000.0 + 10.0 * np.asarray(expected_next_steps),
+            )
+            np.testing.assert_allclose(
+                batch.center_local[index, :, 4].numpy(),
+                (
+                    physical_row + np.asarray(expected_state_steps)
+                ) % 251,
+            )
+            np.testing.assert_allclose(
+                batch.next_center_local[index, :, 4].numpy(),
+                (
+                    physical_row + np.asarray(expected_next_steps)
+                ) % 251,
             )
             row_fraction = (row + 1) / CONTROLLED_COUNT
 
@@ -262,8 +275,15 @@ class ContextualStackingTests(unittest.TestCase):
         actor = ContextualActor(config)
         critic = ContextualTwinCritic(config)
         actor_output = actor(state, previous_action=previous_action)
+        critic_total_tat = torch.arange(
+            2 * config.num_stacks * config.critic_extra_dim,
+            dtype=torch.float32,
+        ).reshape(2, config.num_stacks, config.critic_extra_dim)
         critic_output = critic(
-            state, action, previous_action=previous_action
+            state,
+            action,
+            critic_total_tat=critic_total_tat,
+            previous_action=previous_action,
         )
         self.assertEqual(actor_output.action.shape, (2, 1))
         self.assertEqual(critic_output.q1.shape, (2, 1))

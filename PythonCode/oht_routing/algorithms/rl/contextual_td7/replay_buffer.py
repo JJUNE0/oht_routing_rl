@@ -8,6 +8,7 @@ import numpy as np
 import torch
 
 from oht_routing.mdp.observation import (
+    CRITIC_EXTRA_DIM,
     GLOBAL_DIM,
     LOCAL_PHYSICAL_DIM,
 )
@@ -47,8 +48,8 @@ REPLAY_SAMPLING_MODES = (
 # Replay storage is deliberately narrower than the learner contract. Samples
 # are always materialized as float32 before normalization/model use.
 STATIC_PHYSICAL_FEATURE_INDICES = (0, 1, 2, 3)
-UINT8_PHYSICAL_FEATURE_INDICES = (5, 8, 9, 10, 11, 12, 13, 15)
-UINT16_PHYSICAL_FEATURE_INDICES = (6, 7, 14)
+UINT8_PHYSICAL_FEATURE_INDICES = (4, 6, 7, 8, 9, 10, 11, 13)
+UINT16_PHYSICAL_FEATURE_INDICES = (5, 12)
 STATE_COUNT_UINT8_POSITIONS = (1, 2, 3, 4, 5, 6)
 ACTION_FIXED_POINT_SCALE = float(np.iinfo(np.int16).max)
 ACTION_FIXED_POINT_MAX_ABS_ERROR = 0.5 / ACTION_FIXED_POINT_SCALE
@@ -120,9 +121,21 @@ def snapshot_from_transition(
     """Copy the raw state and controlled vectors from a completed transition."""
     state_raw = transition.state.physical_local_raw
     state_global = transition.state.global_raw
+    state_total_tat = transition.state.critic_total_tat_raw
     next_raw = transition.next_state.physical_local_raw
     next_global = transition.next_state.global_raw
-    if any(value is None for value in (state_raw, state_global, next_raw, next_global)):
+    next_total_tat = transition.next_state.critic_total_tat_raw
+    if any(
+        value is None
+        for value in (
+            state_raw,
+            state_global,
+            state_total_tat,
+            next_raw,
+            next_global,
+            next_total_tat,
+        )
+    ):
         raise ContextualReplayError(
             "transition observations do not contain raw snapshot exports"
         )
@@ -135,6 +148,9 @@ def snapshot_from_transition(
             (physical_count, LOCAL_PHYSICAL_DIM),
         ),
         global_state=_copy_array("global_state", state_global, (GLOBAL_DIM,)),
+        critic_total_tat=_copy_array(
+            "critic_total_tat", state_total_tat, (CRITIC_EXTRA_DIM,)
+        ),
         previous_applied_action=_copy_array(
             "previous_applied_action",
             transition.state.previous_applied_action,
@@ -156,6 +172,11 @@ def snapshot_from_transition(
         ),
         next_global_state=_copy_array(
             "next_global_state", next_global, (GLOBAL_DIM,)
+        ),
+        next_critic_total_tat=_copy_array(
+            "next_critic_total_tat",
+            next_total_tat,
+            (CRITIC_EXTRA_DIM,),
         ),
         next_previous_applied_action=_copy_array(
             "next_previous_applied_action",
@@ -278,9 +299,6 @@ class ContextualStepReplayBuffer:
             (self.physical_count, len(STATIC_PHYSICAL_FEATURE_INDICES)),
             np.float32,
         )
-        self._physical_distance_mm = np.empty(
-            self.physical_count, np.float64
-        )
         self._physical_static_initialized = False
         self._physical_uint8 = np.empty(
             (
@@ -300,6 +318,9 @@ class ContextualStepReplayBuffer:
         )
         self._global = np.empty(
             (self.state_capacity, GLOBAL_DIM), np.float32
+        )
+        self._critic_total_tat = np.empty(
+            (self.state_capacity, CRITIC_EXTRA_DIM), np.float32
         )
         self._state_generation = np.zeros(self.state_capacity, np.int64)
         self._state_valid = np.zeros(self.state_capacity, bool)
@@ -382,6 +403,11 @@ class ContextualStepReplayBuffer:
         _copy_array("physical_local_state", snapshot.physical_local_state,
                     (self.physical_count, LOCAL_PHYSICAL_DIM))
         _copy_array("global_state", snapshot.global_state, (GLOBAL_DIM,))
+        _copy_array(
+            "critic_total_tat",
+            snapshot.critic_total_tat,
+            (CRITIC_EXTRA_DIM,),
+        )
         _quantize_action(
             "previous_applied_action",
             snapshot.previous_applied_action,
@@ -403,6 +429,11 @@ class ContextualStepReplayBuffer:
                     (self.physical_count, LOCAL_PHYSICAL_DIM))
         _copy_array("next_global_state", snapshot.next_global_state,
                     (GLOBAL_DIM,))
+        _copy_array(
+            "next_critic_total_tat",
+            snapshot.next_critic_total_tat,
+            (CRITIC_EXTRA_DIM,),
+        )
         _copy_array("next_previous_applied_action",
                     snapshot.next_previous_applied_action,
                     (self.controlled_count, 1))
@@ -419,23 +450,7 @@ class ContextualStepReplayBuffer:
         static = np.ascontiguousarray(
             array[:, STATIC_PHYSICAL_FEATURE_INDICES]
         )
-        if not self._physical_static_initialized:
-            distance = np.asarray(
-                self.observation_builder.physical_distance_mm,
-                dtype=np.float64,
-            )
-            if distance.shape != (self.physical_count,):
-                raise ContextualReplayError(
-                    "physical_distance_mm shape mismatch: "
-                    f"actual={distance.shape}, "
-                    f"expected=({self.physical_count},)"
-                )
-            if not np.isfinite(distance).all() or (distance <= 0.0).any():
-                raise ContextualReplayError(
-                    "physical_distance_mm must be finite and positive"
-                )
-        else:
-            distance = self._physical_distance_mm
+        if self._physical_static_initialized:
             if not np.array_equal(self._physical_static, static):
                 raise ContextualReplayError(
                     "static physical replay features changed after initialization"
@@ -471,19 +486,8 @@ class ContextualStepReplayBuffer:
             raise ContextualReplayError(
                 "stop_time_sum exceeds the one-byte StopTime protocol bound"
             )
-        density = (
-            occupancy.astype(np.float64)
-            / (distance / 1_000.0)
-        ).astype(np.float32)
-        if not np.array_equal(density, array[:, 4]):
-            error = float(np.max(np.abs(density - array[:, 4]), initial=0.0))
-            raise ContextualReplayError(
-                "oht_density cannot be reconstructed bit-exactly from OHT "
-                f"state counts and rail Distance: max_abs_error={error}"
-            )
         if not self._physical_static_initialized:
             self._physical_static[:] = static
-            self._physical_distance_mm[:] = distance
             self._physical_static_initialized = True
         return uint8_values, uint16_values
 
@@ -499,17 +503,10 @@ class ContextualStepReplayBuffer:
         )
         result[..., UINT8_PHYSICAL_FEATURE_INDICES] = uint8_values
         result[..., UINT16_PHYSICAL_FEATURE_INDICES] = uint16_values
-        occupancy = uint8_values[
-            ..., STATE_COUNT_UINT8_POSITIONS
-        ].sum(axis=-1, dtype=np.uint16)
-        distance = self._physical_distance_mm[physical_rows]
-        result[..., 4] = (
-            occupancy.astype(np.float64) / (distance / 1_000.0)
-        ).astype(np.float32)
         return result
 
     def _store_state(
-        self, key, physical, global_state
+        self, key, physical, global_state, critic_total_tat
     ) -> tuple[int, int]:
         physical_uint8, physical_uint16 = self._pack_physical(physical)
         existing = self._key_to_state.get(key)
@@ -527,6 +524,9 @@ class ContextualStepReplayBuffer:
                         self._physical_uint16[slot], physical_uint16
                     )
                     and np.array_equal(self._global[slot], global_state)
+                    and np.array_equal(
+                        self._critic_total_tat[slot], critic_total_tat
+                    )
                 ):
                     raise ContextualReplayError(
                         "same episode/env step has different raw state"
@@ -542,6 +542,7 @@ class ContextualStepReplayBuffer:
         self._physical_uint8[slot] = physical_uint8
         self._physical_uint16[slot] = physical_uint16
         self._global[slot] = global_state
+        self._critic_total_tat[slot] = critic_total_tat
         self._state_generation[slot] = generation
         self._state_valid[slot] = True
         self._state_keys[slot] = key
@@ -636,10 +637,13 @@ class ContextualStepReplayBuffer:
             state_key,
             snapshot.physical_local_state,
             snapshot.global_state,
+            snapshot.critic_total_tat,
         )
         next_slot, next_gen = self._store_state(
-            next_key, snapshot.next_physical_local_state,
+            next_key,
+            snapshot.next_physical_local_state,
             snapshot.next_global_state,
+            snapshot.next_critic_total_tat,
         )
 
         slot = self._transition_cursor
@@ -1075,6 +1079,8 @@ class ContextualStepReplayBuffer:
         batch_count = int(transition_slots.size)
         state_global_raw = self._global[state_slots]
         next_global_raw = self._global[next_slots]
+        state_total_tat_raw = self._critic_total_tat[state_slots]
+        next_total_tat_raw = self._critic_total_tat[next_slots]
         action_rows = controlled_rows[:, None]
         previous_applied_action = _decode_action(
             self._previous_applied_action[action_slots, action_rows]
@@ -1102,6 +1108,16 @@ class ContextualStepReplayBuffer:
             self.observation_builder.global_normalizer,
             next_global_raw.reshape(-1, GLOBAL_DIM), "replay_next_global"
         ).reshape(batch_count, self.num_stacks, GLOBAL_DIM)
+        critic_total_tat = self._readonly_normalize(
+            self.observation_builder.critic_normalizer,
+            state_total_tat_raw.reshape(-1, CRITIC_EXTRA_DIM),
+            "replay_critic_total_tat",
+        ).reshape(batch_count, self.num_stacks, CRITIC_EXTRA_DIM)
+        next_critic_total_tat = self._readonly_normalize(
+            self.observation_builder.critic_normalizer,
+            next_total_tat_raw.reshape(-1, CRITIC_EXTRA_DIM),
+            "replay_next_critic_total_tat",
+        ).reshape(batch_count, self.num_stacks, CRITIC_EXTRA_DIM)
         center_rows = self._center_rows[controlled_rows]
         incoming_rows = self._incoming_rows[controlled_rows]
         outgoing_rows = self._outgoing_rows[controlled_rows]
@@ -1206,11 +1222,13 @@ class ContextualStepReplayBuffer:
             incoming_relation = incoming_relation[:, 0]
             outgoing_relation = outgoing_relation[:, 0]
             global_norm = global_norm[:, 0]
+            critic_total_tat = critic_total_tat[:, 0]
             previous_applied_action = previous_applied_action[:, 0, None]
             next_center = next_center[:, 0]
             next_incoming = next_incoming[:, 0]
             next_outgoing = next_outgoing[:, 0]
             next_global_norm = next_global_norm[:, 0]
+            next_critic_total_tat = next_critic_total_tat[:, 0]
             next_previous_applied_action = (
                 next_previous_applied_action[:, 0, None]
             )
@@ -1236,6 +1254,7 @@ class ContextualStepReplayBuffer:
             "incoming_relation": incoming_relation,
             "outgoing_relation": outgoing_relation,
             "global_state": global_norm,
+            "critic_total_tat": critic_total_tat,
             "previous_applied_action": previous_applied_action,
             "policy_action": policy_action,
             "applied_action": applied_action,
@@ -1246,6 +1265,7 @@ class ContextualStepReplayBuffer:
             "next_incoming_relation": incoming_relation,
             "next_outgoing_relation": outgoing_relation,
             "next_global_state": next_global_norm,
+            "next_critic_total_tat": next_critic_total_tat,
             "next_previous_applied_action": next_previous_applied_action,
             "next_applied_action": next_applied_action,
             "done": self._done[transition_slots][:, None],
@@ -1328,10 +1348,11 @@ class ContextualStepReplayBuffer:
             + 2 * len(UINT16_PHYSICAL_FEATURE_INDICES)
         )
         static_physical = physical_count * (
-            len(STATIC_PHYSICAL_FEATURE_INDICES) * 4 + 8
+            len(STATIC_PHYSICAL_FEATURE_INDICES) * 4
         )
         state = state_capacity * (
-            physical_count * packed_physical_bytes + GLOBAL_DIM * 4
+            physical_count * packed_physical_bytes
+            + (GLOBAL_DIM + CRITIC_EXTRA_DIM) * 4
         ) + static_physical
         # Previous, deterministic policy, and applied actions use signed
         # int16 fixed point. Reward remains float32.

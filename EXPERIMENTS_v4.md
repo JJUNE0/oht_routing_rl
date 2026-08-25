@@ -13,7 +13,7 @@ latest 300 simulation seconds.
 - The global observation changes from 17 to 18 features. It replaces
   cumulative TAT with `recent_completed_tat_300s_mean_s`, adds an availability
   bit, and changes the 60-second trend to the same recent signal.
-- Reward O uses `-11 * max(0, recent_tat - 160) / 165`.
+- Reward O uses `-4.3 * max(0, recent_tat - 160) / 165`.
 - A sample is recorded only at a verified
   `UNLOADING -> IDLE/MOVE_TO_LOAD/LOADING` boundary using the final state-5
   `CmdTat`; command IDs are deduplicated for the episode.
@@ -65,3 +65,42 @@ observation and ordinary TAT reward use recent TAT. No v4 simulator result is
 claimed here. The calibration is an offline replay of a fixed v2.2 trajectory;
 active-rail term distributions must be checked again on the first v4 capture
 before any further retuning.
+
+## v4.1.0 — centered recent-completion TAT
+
+### Purpose
+
+Remove only the one-sided `max(..., 0)` dead zone from Reward O. Observation,
+network, topology, action, replay, SALE/LAP, the 300-second completion window,
+and every reward coefficient remain unchanged from v4.0.0. Same-major v4.0
+checkpoints therefore remain compatible.
+
+### Reward change
+
+```text
+v4.0: -4.3 * max(recent_tat_300s - 160, 0) / 165
+v4.1:  4.3 * (160 - recent_tat_300s) / 165
+```
+
+The signal is still zero while the recent-completion window is unavailable.
+Once available, 160 seconds is neutral; lower TAT gives positive credit and
+higher TAT gives the same negative penalty as v4.0. The cumulative
+`TotalTat >= 200` termination rule is unchanged.
+
+### Scale analysis on the v4 diagnostic capture
+
+The counterfactual was evaluated against
+`results/reward_diagnostics/v4_reward_o_activescale_seed0` with recorded
+states and actions held fixed.
+
+| Window | Available samples below 160 s | v4.0 TAT abs share | v4.1 counterfactual TAT abs share | Mean total-reward shift |
+| --- | ---: | ---: | ---: | ---: |
+| 0--1999 | 340 / 1700 (20.00%) | 41.27% | 48.12% | +0.0392 |
+| 10000--11999 | 309 / 1700 (18.18%) | 37.26% | 45.14% | +0.0367 |
+| 20000--21999 | 0 / 2000 (0.00%) | 49.73% | 49.73% | 0.0000 |
+
+Only available samples below 160 seconds change. The requested edit keeps the
+TAT coefficient at `4.3`, so the observed absolute TAT share remains above the
+original 28.42% calibration target. Existing W&B field names
+`tat_penalty_start` and `tat_excess` are retained for v4 schema compatibility;
+in v4.1 `tat_excess` is a signed `(recent_tat - 160)` delta.

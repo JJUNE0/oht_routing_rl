@@ -56,6 +56,16 @@ def make_inputs(batch=4, *, requires_grad=False, scale=1.0, device="cpu"):
 FLOAT_INPUT_INDICES = (0, 1, 2, 6, 7, 8)
 
 
+def make_critic_total_tat(batch, config=None, *, value=0.0, device="cpu"):
+    config = config or ContextualNetworkConfig()
+    return torch.full(
+        (batch, config.critic_extra_dim),
+        float(value),
+        dtype=torch.float32,
+        device=device,
+    )
+
+
 class ContextualNetworkTests(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(23)
@@ -76,7 +86,10 @@ class ContextualNetworkTests(unittest.TestCase):
         self.assertTrue((actor_output.action <= 1.0).all())
         action = actor_output.action.detach().requires_grad_(True)
         critic_output = self.critic(
-            state, action, previous_action=previous_action
+            state,
+            action,
+            critic_total_tat=make_critic_total_tat(11, self.config),
+            previous_action=previous_action,
         )
         self.assertEqual(critic_output.q1.shape, (11, 1))
         self.assertEqual(critic_output.q2.shape, (11, 1))
@@ -98,10 +111,16 @@ class ContextualNetworkTests(unittest.TestCase):
         actor_low = self.actor(state, previous_action=low).action
         actor_high = self.actor(state, previous_action=high).action
         critic_low = self.critic(
-            state, current_action, previous_action=low
+            state,
+            current_action,
+            critic_total_tat=make_critic_total_tat(7, self.config),
+            previous_action=low,
         )
         critic_high = self.critic(
-            state, current_action, previous_action=high
+            state,
+            current_action,
+            critic_total_tat=make_critic_total_tat(7, self.config),
+            previous_action=high,
         )
 
         self.assertGreater(
@@ -116,6 +135,68 @@ class ContextualNetworkTests(unittest.TestCase):
         self.assertEqual(
             self.critic.q1.network[0].in_features,
             self.config.critic_input_dim,
+        )
+
+    def test_total_tat_is_critic_only_and_changes_twin_q(self):
+        batch = 7
+        state = torch.randn(batch, self.config.stacked_context_dim)
+        previous_action = torch.randn(
+            batch, self.config.stacked_action_dim
+        ).tanh()
+        self.actor.eval()
+        with torch.inference_mode():
+            actor_before = self.actor(
+                state, previous_action=previous_action
+            ).action
+            actor_after = self.actor(
+                state, previous_action=previous_action
+            ).action
+        torch.testing.assert_close(actor_before, actor_after, rtol=0, atol=0)
+
+        low_tat = make_critic_total_tat(
+            batch, self.config, value=-1.25
+        )
+        high_tat = make_critic_total_tat(
+            batch, self.config, value=2.5
+        )
+        captured = []
+        hook = self.critic.q1.register_forward_pre_hook(
+            lambda module, inputs: captured.append(inputs[0].detach().clone())
+        )
+        try:
+            low = self.critic(
+                state,
+                actor_before,
+                critic_total_tat=low_tat,
+                previous_action=previous_action,
+            )
+            high = self.critic(
+                state,
+                actor_before,
+                critic_total_tat=high_tat,
+                previous_action=previous_action,
+            )
+        finally:
+            hook.remove()
+
+        self.assertEqual(len(captured), 2)
+        torch.testing.assert_close(
+            captured[0][:, -self.config.stacked_critic_extra_dim :],
+            low_tat,
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            captured[1][:, -self.config.stacked_critic_extra_dim :],
+            high_tat,
+            rtol=0,
+            atol=0,
+        )
+        self.assertGreater(
+            float((low.q1 - high.q1).detach().abs().sum()), 0.0
+        )
+        self.assertGreater(
+            float((low.q2 - high.q2).detach().abs().sum()), 0.0
         )
 
     def test_actor_loss_reaches_every_observation_group(self):
@@ -157,7 +238,11 @@ class ContextualNetworkTests(unittest.TestCase):
         inputs = make_inputs(4)
         state = self.encoder(*inputs).state
         actor_output = self.actor(state)
-        critic_output = self.critic(state, actor_output.action)
+        critic_output = self.critic(
+            state,
+            actor_output.action,
+            critic_total_tat=make_critic_total_tat(4, self.config),
+        )
         loss = (
             actor_output.action.square().mean()
             + critic_output.q1.square().mean()
@@ -207,7 +292,11 @@ class ContextualNetworkTests(unittest.TestCase):
         sale_state = torch.randn(batch, 16)
         sale_state_action = torch.randn(batch, 16)
         output = critic(
-            state, action, sale_state, sale_state_action
+            state,
+            action,
+            sale_state,
+            sale_state_action,
+            critic_total_tat=make_critic_total_tat(batch, self.config),
         )
         self.assertTrue(torch.isfinite(output.q1).all())
         self.assertTrue(torch.isfinite(output.q2).all())
@@ -240,7 +329,13 @@ class ContextualNetworkTests(unittest.TestCase):
                 inputs = make_inputs(3, scale=scale)
                 encoding = self.encoder(*inputs)
                 actor_output = self.actor(encoding.state)
-                critic_output = self.critic(encoding.state, actor_output.action)
+                critic_output = self.critic(
+                    encoding.state,
+                    actor_output.action,
+                    critic_total_tat=make_critic_total_tat(
+                        3, self.config, value=scale
+                    ),
+                )
                 for tensor in (
                     encoding.state,
                     actor_output.pre_tanh,
@@ -279,7 +374,12 @@ class ContextualNetworkTests(unittest.TestCase):
         inputs = make_inputs(4)
         state = self.encoder(*inputs).state
         actor_output = self.actor(state)
-        critic_output = self.critic(state, actor_output.action)
+        critic_total_tat = make_critic_total_tat(4, self.config, value=0.75)
+        critic_output = self.critic(
+            state,
+            actor_output.action,
+            critic_total_tat=critic_total_tat,
+        )
         stream = io.BytesIO()
         torch.save(
             {
@@ -299,7 +399,11 @@ class ContextualNetworkTests(unittest.TestCase):
         critic.load_state_dict(saved["critic"])
         loaded_state = encoder(*inputs).state
         loaded_actor = actor(loaded_state)
-        loaded_critic = critic(loaded_state, loaded_actor.action)
+        loaded_critic = critic(
+            loaded_state,
+            loaded_actor.action,
+            critic_total_tat=critic_total_tat,
+        )
         torch.testing.assert_close(state, loaded_state)
         torch.testing.assert_close(actor_output.action, loaded_actor.action)
         torch.testing.assert_close(critic_output.q1, loaded_critic.q1)
@@ -308,7 +412,11 @@ class ContextualNetworkTests(unittest.TestCase):
     def test_diagnostics_have_required_finite_values(self):
         state = torch.randn(8, 128)
         actor_output = self.actor(state)
-        critic_output = self.critic(state, actor_output.action)
+        critic_output = self.critic(
+            state,
+            actor_output.action,
+            critic_total_tat=make_critic_total_tat(8, self.config),
+        )
         diagnostics = {}
         diagnostics.update(actor_diagnostics(actor_output))
         diagnostics.update(critic_diagnostics(critic_output))
@@ -334,11 +442,18 @@ class ContextualNetworkTests(unittest.TestCase):
         state_before = state.clone()
         action = self.actor(state).action
         action_before = action.clone()
-        self.critic(state, action)
+        critic_total_tat = make_critic_total_tat(3, self.config)
+        critic_total_tat_before = critic_total_tat.clone()
+        self.critic(
+            state, action, critic_total_tat=critic_total_tat
+        )
         for original, current in zip(before, inputs):
             torch.testing.assert_close(original, current)
         torch.testing.assert_close(state_before, state)
         torch.testing.assert_close(action_before, action)
+        torch.testing.assert_close(
+            critic_total_tat_before, critic_total_tat
+        )
 
     def test_forward_backward_smoke_100_iterations(self):
         optimizer = torch.optim.Adam(
@@ -351,7 +466,11 @@ class ContextualNetworkTests(unittest.TestCase):
             optimizer.zero_grad(set_to_none=True)
             state = self.encoder(*make_inputs(2)).state
             actor_output = self.actor(state)
-            critic_output = self.critic(state, actor_output.action)
+            critic_output = self.critic(
+                state,
+                actor_output.action,
+                critic_total_tat=make_critic_total_tat(2, self.config),
+            )
             loss = (
                 actor_output.pre_tanh.square().mean()
                 + critic_output.q1.square().mean()

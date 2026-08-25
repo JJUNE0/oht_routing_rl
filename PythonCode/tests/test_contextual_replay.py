@@ -14,6 +14,7 @@ from oht_routing.algorithms.rl.contextual_td7.replay_buffer import (
 )
 from oht_routing.algorithms.rl.contextual_td7.replay_types import ContextualStepSnapshot
 from oht_routing.mdp.observation import (
+    CRITIC_EXTRA_DIM,
     GLOBAL_DIM,
     LOCAL_PHYSICAL_DIM,
 )
@@ -44,10 +45,7 @@ class FakeObservationBuilder:
     def __init__(self, topology):
         self.local_normalizer = IdentityNormalizer()
         self.global_normalizer = IdentityNormalizer()
-        physical_rows = np.arange(len(topology.all_rail_ids), dtype=np.int64)
-        self.physical_distance_mm = np.ascontiguousarray(
-            1_000.0 * (1.0 + physical_rows % 4), dtype=np.float64
-        )
+        self.critic_normalizer = IdentityNormalizer()
         shape = topology.incoming_neighbor_ids.shape + (2,)
         self._incoming_relation = np.arange(
             np.prod(shape), dtype=np.float32
@@ -68,20 +66,14 @@ def make_physical_local_state(topology, step):
     physical[:, 3] = rows % 2
 
     # Packed integer fields exercise both uint8 and uint16 storage.
-    physical[:, 5] = (rows + int(step)) % 251
-    physical[:, 6] = (7 * rows + int(step)) % 60_001
-    physical[:, 7] = (11 * rows + 2 * int(step)) % 50_001
+    physical[:, 4] = (rows + int(step)) % 251
+    physical[:, 5] = (11 * rows + 2 * int(step)) % 50_001
     occupancy = ((rows + int(step)) % 4).astype(np.uint8)
     state = (rows + int(step)) % 6
-    physical[rows, 8 + state] = occupancy
+    physical[rows, 6 + state] = occupancy
     stopped = np.where((rows + int(step)) % 5 == 0, occupancy, 0)
-    physical[:, 14] = stopped * ((rows + int(step)) % 251)
-    physical[:, 15] = stopped
-
-    distance_mm = 1_000.0 * (1.0 + rows % 4)
-    physical[:, 4] = (
-        occupancy.astype(np.float64) / (distance_mm / 1_000.0)
-    ).astype(np.float32)
+    physical[:, 12] = stopped * ((rows + int(step)) % 251)
+    physical[:, 13] = stopped
     return np.ascontiguousarray(physical)
 
 
@@ -92,12 +84,18 @@ def make_snapshot(topology, step, episode=0, done=False):
     return ContextualStepSnapshot(
         physical_local_state=physical,
         global_state=np.arange(GLOBAL_DIM, dtype=np.float32) + step,
+        critic_total_tat=np.asarray(
+            [1_000.0 + 10.0 * step], dtype=np.float32
+        ),
         previous_applied_action=(rows / CONTROLLED_COUNT * 0.25)[:, None],
         policy_action=(rows / CONTROLLED_COUNT)[:, None],
         applied_action=(rows / CONTROLLED_COUNT * 0.25)[:, None],
         reward=rows + step * 10,
         next_physical_local_state=next_physical,
         next_global_state=np.arange(GLOBAL_DIM, dtype=np.float32) + step + 1.0,
+        next_critic_total_tat=np.asarray(
+            [1_000.0 + 10.0 * (step + 1)], dtype=np.float32
+        ),
         next_previous_applied_action=(
             rows / CONTROLLED_COUNT * 0.25
         )[:, None],
@@ -129,27 +127,31 @@ class ContextualReplayTests(unittest.TestCase):
             CONTROLLED_COUNT,
         )
         batch = replay.sample(16)
-        self.assertEqual(LOCAL_PHYSICAL_DIM, 16)
-        self.assertEqual(GLOBAL_DIM, 18)
+        self.assertEqual(LOCAL_PHYSICAL_DIM, 14)
+        self.assertEqual(GLOBAL_DIM, 5)
+        self.assertEqual(CRITIC_EXTRA_DIM, 1)
         self.assertEqual(self.topology.incoming_neighbor_ids.shape[1], 15)
         self.assertEqual(self.topology.outgoing_neighbor_ids.shape[1], 15)
         expected_shapes = {
-            "center_local": (16, 16),
-            "incoming_local": (16, 15, 16),
-            "outgoing_local": (16, 15, 16),
+            "center_local": (16, 14),
+            "incoming_local": (16, 15, 14),
+            "outgoing_local": (16, 15, 14),
             "center_rail_index": (16,),
             "incoming_rail_indices": (16, 15),
             "outgoing_rail_indices": (16, 15),
             "incoming_relation": (16, 15, 2),
             "outgoing_relation": (16, 15, 2),
-            "global_state": (16, 18),
+            "global_state": (16, 5),
+            "critic_total_tat": (16, 1),
             "previous_applied_action": (16, 1),
             "policy_action": (16, 1),
             "applied_action": (16, 1),
             "reward": (16, 1),
-            "next_center_local": (16, 16),
-            "next_incoming_local": (16, 15, 16),
-            "next_outgoing_local": (16, 15, 16),
+            "next_center_local": (16, 14),
+            "next_incoming_local": (16, 15, 14),
+            "next_outgoing_local": (16, 15, 14),
+            "next_global_state": (16, 5),
+            "next_critic_total_tat": (16, 1),
             "next_previous_applied_action": (16, 1),
             "done": (16, 1),
             "controlled_rail_id": (16,),
@@ -225,6 +227,18 @@ class ContextualReplayTests(unittest.TestCase):
                 + float(np.finfo(np.float32).eps),
             )
             self.assertAlmostEqual(float(batch.reward[index, 0]), float(row))
+            self.assertEqual(
+                float(batch.critic_total_tat[index, 0]),
+                float(snapshot.critic_total_tat[0]),
+            )
+            self.assertEqual(
+                float(batch.next_critic_total_tat[index, 0]),
+                float(snapshot.next_critic_total_tat[0]),
+            )
+            self.assertNotEqual(
+                float(batch.critic_total_tat[index, 0]),
+                float(batch.next_critic_total_tat[index, 0]),
+            )
 
         self.assertEqual(replay._physical_uint8.dtype, np.uint8)
         self.assertEqual(replay._physical_uint16.dtype, np.uint16)
@@ -271,6 +285,8 @@ class ContextualReplayTests(unittest.TestCase):
             self.builder.local_normalizer.update_calls,
             self.builder.global_normalizer.count,
             self.builder.global_normalizer.update_calls,
+            self.builder.critic_normalizer.count,
+            self.builder.critic_normalizer.update_calls,
         )
         replay.sample(32)
         after = (
@@ -278,6 +294,8 @@ class ContextualReplayTests(unittest.TestCase):
             self.builder.local_normalizer.update_calls,
             self.builder.global_normalizer.count,
             self.builder.global_normalizer.update_calls,
+            self.builder.critic_normalizer.count,
+            self.builder.critic_normalizer.update_calls,
         )
         self.assertEqual(before, after)
 
@@ -308,11 +326,13 @@ class ContextualReplayTests(unittest.TestCase):
                 completed.state,
                 physical_local_raw=packed.physical_local_state,
                 global_raw=packed.global_state,
+                critic_total_tat_raw=packed.critic_total_tat,
             ),
             next_state=replace(
                 completed.next_state,
                 physical_local_raw=packed.next_physical_local_state,
                 global_raw=packed.next_global_state,
+                critic_total_tat_raw=packed.next_critic_total_tat,
             ),
         )
         snapshot = snapshot_from_transition(completed)
@@ -347,14 +367,23 @@ class ContextualReplayTests(unittest.TestCase):
         bad_reward[0] = np.nan
         with self.assertRaises(ContextualReplayError):
             replay.push(replace(base, reward=bad_reward))
+        for field in ("critic_total_tat", "next_critic_total_tat"):
+            with self.subTest(field=field):
+                with self.assertRaises(ContextualReplayError):
+                    replay.push(
+                        replace(
+                            base,
+                            **{field: np.asarray([np.nan], np.float32)},
+                        )
+                    )
 
     def test_packed_integer_features_reject_fractional_and_overflow(self):
         base = make_snapshot(self.topology, 0)
         cases = (
-            (5, 1.5, "uint8 physical replay features must be exactly integral"),
-            (5, 256.0, "uint8 physical replay feature overflow"),
-            (6, 1.5, "uint16 physical replay features must be exactly integral"),
-            (6, 65_536.0, "uint16 physical replay feature overflow"),
+            (4, 1.5, "uint8 physical replay features must be exactly integral"),
+            (4, 256.0, "uint8 physical replay feature overflow"),
+            (5, 1.5, "uint16 physical replay features must be exactly integral"),
+            (5, 65_536.0, "uint16 physical replay feature overflow"),
         )
         for feature, value, message in cases:
             with self.subTest(feature=feature, value=value):
@@ -411,7 +440,7 @@ class ContextualReplayTests(unittest.TestCase):
         # duplicate live transition key must be rejected before any state is
         # packed, inserted, or overwritten.
         duplicate_physical = snapshot.physical_local_state.copy()
-        duplicate_physical[0, 5] = 1.5
+        duplicate_physical[0, 4] = 1.5
         with self.assertRaisesRegex(
             ContextualReplayError, "duplicate live transition"
         ):
@@ -488,13 +517,13 @@ class ContextualReplayTests(unittest.TestCase):
         self.assertEqual(replay._policy_action.dtype, np.int16)
         self.assertEqual(replay._applied_action.dtype, np.int16)
 
-    def test_replay_is_locked_to_reward_o(self):
-        with self.assertRaisesRegex(ValueError, "only reward_version='O'"):
+    def test_replay_is_locked_to_reward_p(self):
+        with self.assertRaisesRegex(ValueError, "only reward_version='P'"):
             ContextualStepReplayBuffer(
                 self.topology,
                 self.builder,
                 capacity_env_steps=2,
-                reward_version="T",
+                reward_version="O",
             )
         replay = ContextualStepReplayBuffer(
             self.topology, self.builder, capacity_env_steps=2
@@ -544,10 +573,10 @@ class ContextualReplayTests(unittest.TestCase):
         batch = replay.sample(2)
         expected_rows = 2 * CONTROLLED_COUNT
         self.assertEqual(
-            tuple(batch.center_local.shape), (expected_rows, 16)
+            tuple(batch.center_local.shape), (expected_rows, 14)
         )
         self.assertEqual(
-            tuple(batch.incoming_local.shape), (expected_rows, 15, 16)
+            tuple(batch.incoming_local.shape), (expected_rows, 15, 14)
         )
         self.assertEqual(
             tuple(batch.center_rail_index.shape), (expected_rows,)

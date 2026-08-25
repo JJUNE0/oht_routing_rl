@@ -22,14 +22,14 @@ from oht_routing.version import (
 )
 
 
+OBSERVATION_VERSION = "v5"
+
 LOCAL_PHYSICAL_FEATURE_NAMES = (
     "free_flow_time_s",
     "port_count",
     "incoming_degree",
     "outgoing_degree",
-    "oht_density",
     "predicted_oht_count",
-    "next_10_route_oht_count",
     "reservation_port_count",
     "idle_count",
     "stage_count",
@@ -40,33 +40,26 @@ LOCAL_PHYSICAL_FEATURE_NAMES = (
     "stop_time_sum",
     "stopped_oht_count",
 )
-GLOBAL_FEATURE_NAMES = (
-    "recent_completed_tat_300s_mean_s",
-    "recent_completed_tat_300s_available",
+ACTOR_GLOBAL_FEATURE_NAMES = (
     "operation_rate",
     "queued_ratio",
     "waiting_ratio",
     "transferring_ratio",
     "mean_reassign",
-    "idle_oht_ratio",
-    "stage_oht_ratio",
-    "move_to_load_ratio",
-    "loading_ratio",
-    "move_to_unload_ratio",
-    "unloading_ratio",
-    "stopped_oht_ratio",
-    "mean_stop_time_s",
-    "backlog_delta_60s",
-    "recent_completed_tat_delta_60s",
-    "completion_rate_60s",
 )
+CRITIC_FEATURE_NAMES = ("total_tat_s",)
+# The existing internal name remains an actor-global alias so the nine-tensor
+# actor observation tuple does not need a compatibility wrapper.
+GLOBAL_FEATURE_NAMES = ACTOR_GLOBAL_FEATURE_NAMES
 RELATION_FEATURE_NAMES = (
     "directed_hop",
     "cumulative_free_flow_time_s",
 )
 
 LOCAL_PHYSICAL_DIM = len(LOCAL_PHYSICAL_FEATURE_NAMES)
-GLOBAL_DIM = len(GLOBAL_FEATURE_NAMES)
+ACTOR_GLOBAL_DIM = len(ACTOR_GLOBAL_FEATURE_NAMES)
+CRITIC_EXTRA_DIM = len(CRITIC_FEATURE_NAMES)
+GLOBAL_DIM = ACTOR_GLOBAL_DIM
 RELATION_DIM = len(RELATION_FEATURE_NAMES)
 TREND_WINDOW_SECONDS = 60.0
 VALID_OHT_STATES = frozenset(range(6))
@@ -223,12 +216,22 @@ class ContextualObservationBatch:
     incoming_relation: np.ndarray
     outgoing_relation: np.ndarray
     global_state: np.ndarray
+    critic_total_tat: np.ndarray
     previous_applied_action: np.ndarray
     controlled_rail_ids: np.ndarray
     topology_hash: str
     mapping_hash: str
     physical_local_raw: np.ndarray | None = None
     global_raw: np.ndarray | None = None
+    critic_total_tat_raw: np.ndarray | None = None
+
+    @property
+    def actor_global_state(self) -> np.ndarray:
+        return self.global_state
+
+    @property
+    def actor_global_raw(self) -> np.ndarray | None:
+        return self.global_raw
 
 
 def _cache_identity(cache_path: str | Path) -> tuple[str, str, str]:
@@ -285,6 +288,11 @@ class ContextualObservationBuilder:
         self.global_normalizer = RunningFeatureNormalizer(
             GLOBAL_DIM, epsilon=self.config.epsilon, clip=self.config.clip
         )
+        self.critic_normalizer = RunningFeatureNormalizer(
+            CRITIC_EXTRA_DIM,
+            epsilon=self.config.epsilon,
+            clip=self.config.clip,
+        )
         self.relation_normalizer = RunningFeatureNormalizer(
             RELATION_DIM, epsilon=self.config.epsilon, clip=self.config.clip
         )
@@ -293,7 +301,6 @@ class ContextualObservationBuilder:
             tuple[float, float, float, float, bool]
         ] = deque()
         self.last_diagnostics: dict[str, float] = {}
-        self._physical_distance_mm: np.ndarray | None = None
         self._cached_runtime_rail_lines = None
         self._cached_runtime_rail_count = 0
         self._ordered_runtime_rails: tuple[object, ...] = ()
@@ -475,16 +482,6 @@ class ContextualObservationBuilder:
     def diagnostics(self) -> dict[str, float]:
         return dict(self.last_diagnostics)
 
-    @property
-    def physical_distance_mm(self) -> np.ndarray:
-        """Static float64 rail distances used for exact replay density rebuilds."""
-        if self._physical_distance_mm is None:
-            raise ObservationContractError(
-                "physical rail distances are unavailable before the first "
-                "raw observation build"
-            )
-        return self._physical_distance_mm
-
     def _ensure_static_rail_cache(self, rail_lines) -> None:
         """Cache topology-ordered rail references and invariant raw features."""
         if (
@@ -507,7 +504,6 @@ class ContextualObservationBuilder:
         static_template = np.zeros(
             (physical_count, LOCAL_PHYSICAL_DIM), dtype=np.float64
         )
-        physical_distance_mm = np.empty(physical_count, dtype=np.float64)
         ordered_rails = []
         for physical_row, rail_id_value in enumerate(self.topology.all_rail_ids):
             rail_id = int(rail_id_value)
@@ -521,7 +517,6 @@ class ContextualObservationBuilder:
                 raise ObservationContractError(
                     f"rail {rail_id} Distance must be positive"
                 )
-            physical_distance_mm[physical_row] = distance_mm
             static_template[physical_row, :4] = (
                 self._finite_nonnegative(
                     getattr(rail, "DistancePerVelocity"),
@@ -533,17 +528,6 @@ class ContextualObservationBuilder:
                 ),
                 float(len(getattr(rail, "LevelJoiningLineIDList"))),
                 float(len(getattr(rail, "DivergingLineIDList"))),
-            )
-
-        if self._physical_distance_mm is None:
-            physical_distance_mm = np.ascontiguousarray(physical_distance_mm)
-            physical_distance_mm.setflags(write=False)
-            self._physical_distance_mm = physical_distance_mm
-        elif not np.array_equal(
-            self._physical_distance_mm, physical_distance_mm
-        ):
-            raise ObservationContractError(
-                "runtime physical rail Distance changed after initialization"
             )
 
         static_template = np.ascontiguousarray(static_template)
@@ -571,9 +555,7 @@ class ContextualObservationBuilder:
         self._ensure_static_rail_cache(rail_lines)
         assert self._static_physical_template is not None
         physical_local = self._static_physical_template.copy()
-        global_state_counts = np.zeros(6, dtype=np.float64)
-        global_stop_time_sum = 0.0
-        global_stopped_oht_count = 0.0
+        route_ahead = np.zeros(len(self.topology.all_rail_ids), np.float64)
 
         oht_placement: dict[int, int] = {}
         for physical_row, (rail_id_value, rail) in enumerate(
@@ -603,14 +585,9 @@ class ContextualObservationBuilder:
                     getattr(oht, "StopTime", 0.0),
                     name=f"OHT {oht_id} StopTime",
                 )
-                physical_local[physical_row, 8 + state] += 1.0
-                physical_local[physical_row, 14] += stop_time
-                physical_local[physical_row, 15] += float(stop_time > 0.0)
-                global_state_counts[state] += 1.0
-                global_stop_time_sum += stop_time
-                global_stopped_oht_count += float(stop_time > 0.0)
-            distance_mm = self._physical_distance_mm[physical_row]
-            density_per_meter = len(rail_oht_ids) / (distance_mm / 1_000.0)
+                physical_local[physical_row, 6 + state] += 1.0
+                physical_local[physical_row, 12] += stop_time
+                physical_local[physical_row, 13] += float(stop_time > 0.0)
             predicted_oht_count = self._finite_nonnegative(
                 getattr(rail, "PredictedOHTCount"),
                 name=f"rail {rail_id} PredictedOHTCount",
@@ -623,12 +600,11 @@ class ContextualObservationBuilder:
                 getattr(rail, "ReservationPortCount"),
                 name=f"rail {rail_id} ReservationPortCount",
             )
-            physical_local[physical_row, 4:8] = (
-                float(density_per_meter),
+            physical_local[physical_row, 4:6] = (
                 predicted_oht_count,
-                route_oht_count,
                 reservation_port_count,
             )
+            route_ahead[physical_row] = route_oht_count
 
         if len(oht_placement) != len(ohts):
             placed_oht_ids = set(oht_placement)
@@ -673,26 +649,17 @@ class ContextualObservationBuilder:
             recent_completed_tat_s
             if recent_completed_tat_available else 0.0
         )
-        global_raw = np.asarray(
+        actor_global_raw = np.asarray(
             (
-                recent_completed_tat_feature,
-                float(recent_completed_tat_available),
                 operation_rate,
                 queued / denominator,
                 waiting / denominator,
                 transferring / denominator,
                 self._mean_reassign(pclient),
-                *(global_state_counts / denominator).tolist(),
-                global_stopped_oht_count / denominator,
-                global_stop_time_sum / denominator,
-                backlog_delta,
-                tat_delta,
-                completion_rate,
             ),
             dtype=np.float64,
         )
-        predicted = physical_local[:, 5]
-        route_ahead = physical_local[:, 6]
+        predicted = physical_local[:, 4]
         union_nonzero = (predicted > 0.0) | (route_ahead > 0.0)
         predicted_union = predicted[union_nonzero]
         route_ahead_union = route_ahead[union_nonzero]
@@ -730,9 +697,11 @@ class ContextualObservationBuilder:
         }
         if not np.isfinite(physical_local).all():
             raise ObservationContractError("physical_local_raw contains NaN or Inf")
-        if not np.isfinite(global_raw).all():
-            raise ObservationContractError("global_raw contains NaN or Inf")
-        return physical_local, global_raw
+        if not np.isfinite(actor_global_raw).all():
+            raise ObservationContractError(
+                "actor_global_raw contains NaN or Inf"
+            )
+        return physical_local, actor_global_raw
 
     def build(
         self,
@@ -751,6 +720,15 @@ class ContextualObservationBuilder:
                 recent_completed_tat_available
             ),
         )
+        critic_total_tat_raw = np.asarray(
+            (
+                self._finite_nonnegative(
+                    getattr(pclient, "TotalTat", 0.0),
+                    name="cumulative TotalTat",
+                ),
+            ),
+            dtype=np.float64,
+        )
 
         # Contractual order: normalize the whole physical snapshot using the
         # pre-step statistics, gather, then update each dynamic normalizer once.
@@ -759,6 +737,9 @@ class ContextualObservationBuilder:
         )
         global_norm = self.global_normalizer.normalize(
             global_raw, name="global_raw"
+        )[0]
+        critic_total_tat = self.critic_normalizer.normalize(
+            critic_total_tat_raw, name="critic_total_tat_raw"
         )[0]
 
         center = physical_norm[self.topology.controlled_row_to_physical_index]
@@ -789,10 +770,14 @@ class ContextualObservationBuilder:
 
         self.local_normalizer.update(physical_raw, name="physical_local_raw")
         self.global_normalizer.update(global_raw, name="global_raw")
+        self.critic_normalizer.update(
+            critic_total_tat_raw, name="critic_total_tat_raw"
+        )
         self.env_steps += 1
         if self.env_steps >= int(self.config.freeze_after_env_steps):
             self.local_normalizer.freeze()
             self.global_normalizer.freeze()
+            self.critic_normalizer.freeze()
 
         batch = ContextualObservationBatch(
             center_local=np.ascontiguousarray(center),
@@ -810,6 +795,7 @@ class ContextualObservationBuilder:
             incoming_relation=self._incoming_relation,
             outgoing_relation=self._outgoing_relation,
             global_state=np.ascontiguousarray(global_norm),
+            critic_total_tat=np.ascontiguousarray(critic_total_tat),
             previous_applied_action=np.ascontiguousarray(previous_action),
             controlled_rail_ids=np.ascontiguousarray(
                 self.topology.controlled_rail_ids.copy()
@@ -820,6 +806,9 @@ class ContextualObservationBuilder:
                 physical_raw.astype(np.float32)
             ),
             global_raw=np.ascontiguousarray(global_raw.astype(np.float32)),
+            critic_total_tat_raw=np.ascontiguousarray(
+                critic_total_tat_raw.astype(np.float32)
+            ),
         )
         self._validate_output(batch)
         return batch
@@ -845,6 +834,7 @@ class ContextualObservationBuilder:
                 controlled_count, neighbor_count, RELATION_DIM
             ),
             "global_state": (GLOBAL_DIM,),
+            "critic_total_tat": (CRITIC_EXTRA_DIM,),
             "previous_applied_action": (controlled_count, 1),
             "controlled_rail_ids": (controlled_count,),
         }
@@ -879,6 +869,7 @@ class ContextualObservationBuilder:
                 len(self.topology.all_rail_ids), LOCAL_PHYSICAL_DIM
             ),
             "global_raw": (GLOBAL_DIM,),
+            "critic_total_tat_raw": (CRITIC_EXTRA_DIM,),
         }
         for name, shape in raw_expected.items():
             array = getattr(batch, name)
@@ -899,21 +890,25 @@ class ContextualObservationBuilder:
         if require_frozen and not (
             self.local_normalizer.frozen
             and self.global_normalizer.frozen
+            and self.critic_normalizer.frozen
             and self.local_normalizer.count > 0
             and self.global_normalizer.count > 0
+            and self.critic_normalizer.count > 0
         ):
             raise ObservationContractError(
-                "refusing to save a warm-up bypass snapshot before both "
+                "refusing to save a warm-up bypass snapshot before all "
                 "state normalizers are populated and frozen"
             )
         target.parent.mkdir(parents=True, exist_ok=True)
         local = self.local_normalizer.state_dict()
         global_state = self.global_normalizer.state_dict()
+        critic_state = self.critic_normalizer.state_dict()
         temporary = target.with_suffix(target.suffix + ".tmp")
         with temporary.open("wb") as stream:
             np.savez_compressed(
                 stream,
                 version=np.asarray(CONTEXTUAL_VERSION),
+                observation_version=np.asarray(OBSERVATION_VERSION),
                 topology_version=np.asarray(TOPOLOGY_VERSION),
                 topology_hash=np.asarray(self.topology.topology_hash),
                 mapping_hash=np.asarray(self.topology.mapping_hash),
@@ -921,11 +916,15 @@ class ContextualObservationBuilder:
                     LOCAL_PHYSICAL_FEATURE_NAMES
                 ),
                 global_feature_names=np.asarray(GLOBAL_FEATURE_NAMES),
+                critic_feature_names=np.asarray(CRITIC_FEATURE_NAMES),
                 relation_feature_names=np.asarray(RELATION_FEATURE_NAMES),
                 local_physical_dim=np.asarray(
                     LOCAL_PHYSICAL_DIM, dtype=np.int64
                 ),
                 global_dim=np.asarray(GLOBAL_DIM, dtype=np.int64),
+                critic_extra_dim=np.asarray(
+                    CRITIC_EXTRA_DIM, dtype=np.int64
+                ),
                 relation_dim=np.asarray(RELATION_DIM, dtype=np.int64),
                 env_steps=np.asarray(self.env_steps, dtype=np.int64),
                 local_epsilon=np.asarray(local["epsilon"], dtype=np.float64),
@@ -962,6 +961,27 @@ class ContextualObservationBuilder:
                     global_state["update_calls"], dtype=np.int64
                 ),
                 global_frozen=np.asarray(global_state["frozen"]),
+                critic_epsilon=np.asarray(
+                    critic_state["epsilon"], dtype=np.float64
+                ),
+                critic_clip_is_none=np.asarray(
+                    critic_state["clip"] is None
+                ),
+                critic_clip=np.asarray(
+                    0.0
+                    if critic_state["clip"] is None
+                    else critic_state["clip"],
+                    dtype=np.float64,
+                ),
+                critic_mean=critic_state["mean"],
+                critic_m2=critic_state["m2"],
+                critic_count=np.asarray(
+                    critic_state["count"], dtype=np.int64
+                ),
+                critic_update_calls=np.asarray(
+                    critic_state["update_calls"], dtype=np.int64
+                ),
+                critic_frozen=np.asarray(critic_state["frozen"]),
             )
         temporary.replace(target)
         return target
@@ -983,6 +1003,7 @@ class ContextualObservationBuilder:
                         f"saved={saved_version!r}, current={CONTEXTUAL_VERSION!r}"
                     )
                 expected_scalars = {
+                    "observation_version": OBSERVATION_VERSION,
                     "topology_version": TOPOLOGY_VERSION,
                     "topology_hash": self.topology.topology_hash,
                     "mapping_hash": self.topology.mapping_hash,
@@ -999,6 +1020,7 @@ class ContextualObservationBuilder:
                         LOCAL_PHYSICAL_FEATURE_NAMES
                     ),
                     "global_feature_names": GLOBAL_FEATURE_NAMES,
+                    "critic_feature_names": CRITIC_FEATURE_NAMES,
                     "relation_feature_names": RELATION_FEATURE_NAMES,
                 }
                 for key, expected in expected_features.items():
@@ -1011,6 +1033,7 @@ class ContextualObservationBuilder:
                 expected_dims = {
                     "local_physical_dim": LOCAL_PHYSICAL_DIM,
                     "global_dim": GLOBAL_DIM,
+                    "critic_extra_dim": CRITIC_EXTRA_DIM,
                     "relation_dim": RELATION_DIM,
                 }
                 for key, expected in expected_dims.items():
@@ -1030,6 +1053,11 @@ class ContextualObservationBuilder:
                     None
                     if bool(saved["global_clip_is_none"].item())
                     else float(saved["global_clip"].item())
+                )
+                critic_clip = (
+                    None
+                    if bool(saved["critic_clip_is_none"].item())
+                    else float(saved["critic_clip"].item())
                 )
                 local_state = {
                     "dim": LOCAL_PHYSICAL_DIM,
@@ -1053,6 +1081,18 @@ class ContextualObservationBuilder:
                     ),
                     "frozen": bool(saved["global_frozen"].item()),
                 }
+                critic_state = {
+                    "dim": CRITIC_EXTRA_DIM,
+                    "epsilon": float(saved["critic_epsilon"].item()),
+                    "clip": critic_clip,
+                    "mean": saved["critic_mean"].copy(),
+                    "m2": saved["critic_m2"].copy(),
+                    "count": int(saved["critic_count"].item()),
+                    "update_calls": int(
+                        saved["critic_update_calls"].item()
+                    ),
+                    "frozen": bool(saved["critic_frozen"].item()),
+                }
                 env_steps = int(saved["env_steps"].item())
         except ObservationContractError:
             raise
@@ -1071,8 +1111,14 @@ class ContextualObservationBuilder:
             epsilon=self.global_normalizer.epsilon,
             clip=self.global_normalizer.clip,
         )
+        critic_candidate = RunningFeatureNormalizer(
+            CRITIC_EXTRA_DIM,
+            epsilon=self.critic_normalizer.epsilon,
+            clip=self.critic_normalizer.clip,
+        )
         local_candidate.load_state_dict(local_state)
         global_candidate.load_state_dict(global_state)
+        critic_candidate.load_state_dict(critic_state)
         if env_steps < 0:
             raise ObservationContractError(
                 "saved state normalizer env_steps must be non-negative"
@@ -1080,14 +1126,18 @@ class ContextualObservationBuilder:
         if require_frozen and not (
             local_candidate.frozen
             and global_candidate.frozen
+            and critic_candidate.frozen
             and local_candidate.count > 0
             and global_candidate.count > 0
+            and critic_candidate.count > 0
         ):
             raise ObservationContractError(
-                "warm-up bypass requires populated, frozen local and global "
+                "warm-up bypass requires populated, frozen local, global, "
+                "and critic-only "
                 "state normalizers"
             )
 
         self.local_normalizer.load_state_dict(local_state)
         self.global_normalizer.load_state_dict(global_state)
+        self.critic_normalizer.load_state_dict(critic_state)
         self.env_steps = env_steps
