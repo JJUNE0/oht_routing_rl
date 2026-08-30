@@ -30,10 +30,10 @@ from test_contextual_sale import sale_replay
 
 
 EXPECTED = {
-    (True, True): "contextual_td7_sale_lap_v5_compact_critic_tat",
-    (False, True): "contextual_td7_no_sale_lap_v5_compact_critic_tat",
-    (True, False): "contextual_td7_sale_uniform_v5_compact_critic_tat",
-    (False, False): "contextual_twin_delayed_uniform_v5_compact_critic_tat",
+    (True, True): "contextual_td7_sale_lap_v6_compact_critic_tat",
+    (False, True): "contextual_td7_no_sale_lap_v6_compact_critic_tat",
+    (True, False): "contextual_td7_sale_uniform_v6_compact_critic_tat",
+    (False, False): "contextual_twin_delayed_uniform_v6_compact_critic_tat",
 }
 
 
@@ -45,7 +45,7 @@ class ContextualVariantTests(unittest.TestCase):
             return parse_args()
 
     def test_cli_and_runtime_are_locked_to_reward_p(self):
-        self.assertEqual(CONTEXTUAL_VERSION, "v5.1.0")
+        self.assertEqual(CONTEXTUAL_VERSION, "v6.1.0")
         parsed = self.parse()
         self.assertNotIn("reward_version", vars(parsed))
         self.assertEqual(
@@ -106,23 +106,52 @@ class ContextualVariantTests(unittest.TestCase):
         self.assertIsNone(config.save_state_normalizer_path)
         self.assertTrue(config.sale_enabled)
         self.assertTrue(config.lap_enabled)
+        self.assertFalse(config.use_attention)
         self.assertFalse(config.wandb_enabled)
         self.assertEqual(config.console_log_interval, 100)
+        self.assertIsNone(config.stage)
         self.assertEqual(config.sim_end_time, 45_000)
+        self.assertIsNone(config.load_stage1_policy_path)
+        self.assertEqual(config.periodic_checkpoint_interval, 5_000)
+        self.assertEqual(config.resume_warmstart_steps, 0)
 
-    def test_stage_one_is_a_thin_sim_end_time_alias(self):
+    def test_stage_one_preserves_identity_and_resolves_end_time(self):
         parsed = self.parse("--stage", "1")
-        self.assertEqual(vars(parsed), {"sim_end_time": 2_000})
-        self.assertNotIn("stage", vars(parsed))
-        self.assertEqual(
-            runtime_config_from_args(parsed).sim_end_time,
-            2_000,
-        )
+        self.assertEqual(vars(parsed), {"stage": 1})
+        config = runtime_config_from_args(parsed)
+        self.assertEqual(config.stage, 1)
+        self.assertEqual(config.sim_end_time, 2_000)
+
+    def test_stage_two_requires_and_accepts_frozen_stage1_policy(self):
+        for option in ("--load-stage1-policy", "--load_stage1_policy"):
+            with self.subTest(option=option):
+                parsed = self.parse(
+                    "--mode", "training", "--action-enabled",
+                    "--stage", "2", option, "stage1.pt",
+                )
+                config = runtime_config_from_args(parsed)
+                self.assertEqual(config.stage, 2)
+                self.assertEqual(config.sim_end_time, 45_000)
+                self.assertEqual(config.load_stage1_policy_path, "stage1.pt")
+                self.assertEqual(config.effective_warmup_steps, 0)
+                self.assertTrue(config.state_normalizer_warmup_bypass)
+
+        with self.assertRaisesRegex(
+            ValueError, "stage 2 requires --load-stage1-policy"
+        ):
+            runtime_config_from_args(self.parse(
+                "--mode", "training", "--action-enabled", "--stage", "2"
+            ))
+        with self.assertRaisesRegex(ValueError, "requires stage 2"):
+            runtime_config_from_args(self.parse(
+                "--mode", "training", "--action-enabled",
+                "--load_stage1_policy", "stage1.pt",
+            ))
 
     def test_stage_rejects_unknown_values_and_explicit_end_time(self):
         for arguments in (
             ("--stage", "0"),
-            ("--stage", "2"),
+            ("--stage", "3"),
             ("--stage", "first"),
             ("--stage", "1", "--sim-end-time", "3000"),
             ("--sim-end-time", "3000", "--stage", "1"),
@@ -130,6 +159,10 @@ class ContextualVariantTests(unittest.TestCase):
             with self.subTest(arguments=arguments):
                 with self.assertRaises(SystemExit):
                     self.parse(*arguments)
+
+    def test_removed_episode_burnin_flag_is_rejected(self):
+        with self.assertRaises(SystemExit):
+            self.parse("--episode-burnin-steps", "100")
 
     def test_explicit_cli_values_override_only_selected_config_fields(self):
         config = runtime_config_from_args(self.parse(
@@ -146,6 +179,9 @@ class ContextualVariantTests(unittest.TestCase):
             "cpu",
             "--console-log-interval",
             "200",
+            "--periodic-checkpoint-interval",
+            "2000",
+            "--use-attention",
             "--sim-end-time",
             "55000",
         ))
@@ -156,6 +192,8 @@ class ContextualVariantTests(unittest.TestCase):
         self.assertFalse(config.terminate_on_warmup_complete)
         self.assertEqual(config.device, "cpu")
         self.assertEqual(config.console_log_interval, 200)
+        self.assertEqual(config.periodic_checkpoint_interval, 2_000)
+        self.assertTrue(config.use_attention)
         self.assertEqual(config.sim_end_time, 55_000)
         self.assertEqual(config.warmup_steps, 10_000)
         self.assertEqual(config.replay_capacity_env_steps, 100_000)
@@ -166,6 +204,21 @@ class ContextualVariantTests(unittest.TestCase):
         self.assertIn("reward_version", RESUME_LAUNCH_CONTROL_FIELDS)
         self.assertIn("console_log_interval", RESUME_LAUNCH_CONTROL_FIELDS)
         self.assertIn("sim_end_time", RESUME_LAUNCH_CONTROL_FIELDS)
+        self.assertIn("stage", RESUME_LAUNCH_CONTROL_FIELDS)
+        self.assertIn("load_stage1_policy_path", RESUME_LAUNCH_CONTROL_FIELDS)
+        self.assertIn(
+            "periodic_checkpoint_interval", RESUME_LAUNCH_CONTROL_FIELDS
+        )
+        self.assertIn("resume_warmstart_steps", RESUME_LAUNCH_CONTROL_FIELDS)
+        self.assertIn("use_attention", RESUME_LAUNCH_CONTROL_FIELDS)
+
+    def test_periodic_checkpoint_interval_must_be_positive(self):
+        with self.assertRaisesRegex(
+            ValueError, "training counts/intervals must be positive"
+        ):
+            runtime_config_from_args(self.parse(
+                "--periodic-checkpoint-interval", "0"
+            ))
 
     def test_mode_aware_wandb_default_and_explicit_cli_overrides(self):
         self.assertFalse(ContextualRuntimeConfig().wandb_enabled)
@@ -239,6 +292,7 @@ class ContextualVariantTests(unittest.TestCase):
                 "warmup_steps": 321,
                 "console_log_interval": 7,
                 "sim_end_time": 9,
+                "periodic_checkpoint_interval": 5_000,
             },
             True,
         )
@@ -252,6 +306,8 @@ class ContextualVariantTests(unittest.TestCase):
             "100000",
             "--console-log-interval",
             "200",
+            "--periodic-checkpoint-interval",
+            "2000",
             "--sim-end-time",
             "55000",
         ))
@@ -262,11 +318,67 @@ class ContextualVariantTests(unittest.TestCase):
         self.assertEqual(config.replay_capacity_env_steps, 100_000)
         self.assertEqual(config.warmup_steps, 321)
         self.assertEqual(config.console_log_interval, 200)
+        self.assertEqual(config.periodic_checkpoint_interval, 2_000)
         self.assertEqual(config.sim_end_time, 55_000)
         self.assertTrue(config.state_normalizer_warmup_bypass)
         read_config.assert_called_once_with(
             "checkpoint.pt", expected_reward_version="P"
         )
+
+    @patch("oht_routing.runtime.config.read_contextual_runtime_config")
+    def test_resume_warmstart_steps_stay_launch_controlled(self, read_config):
+        read_config.return_value = (
+            {
+                "reward_version": "P",
+                "resume_warmstart_steps": 0,
+            },
+            True,
+        )
+        config = runtime_config_from_args(self.parse(
+            "--mode",
+            "training",
+            "--action-enabled",
+            "--resume-checkpoint",
+            "checkpoint.pt",
+            "--resume-warmstart-steps",
+            "100",
+        ))
+        self.assertEqual(config.resume_warmstart_steps, 100)
+        read_config.assert_called_once_with(
+            "checkpoint.pt", expected_reward_version="P"
+        )
+
+    @patch("oht_routing.runtime.config.read_contextual_runtime_config")
+    def test_retired_episode_burnin_config_is_ignored_on_resume(
+        self, read_config
+    ):
+        read_config.return_value = (
+            {
+                "reward_version": "P",
+                "episode_burnin_steps": 100,
+            },
+            True,
+        )
+        config = runtime_config_from_args(self.parse(
+            "--resume-checkpoint", "checkpoint.pt"
+        ))
+        self.assertFalse(hasattr(config, "episode_burnin_steps"))
+
+    @patch("oht_routing.runtime.config.read_contextual_runtime_config")
+    def test_attention_mode_stays_launch_controlled_on_resume(self, read_config):
+        read_config.return_value = (
+            {"reward_version": "P", "use_attention": True},
+            True,
+        )
+        default_flat = runtime_config_from_args(self.parse(
+            "--resume-checkpoint", "checkpoint.pt"
+        ))
+        self.assertFalse(default_flat.use_attention)
+
+        opted_in = runtime_config_from_args(self.parse(
+            "--resume-checkpoint", "checkpoint.pt", "--use-attention"
+        ))
+        self.assertTrue(opted_in.use_attention)
 
     @patch("oht_routing.runtime.config.read_contextual_runtime_config")
     def test_stage_one_survives_checkpoint_runtime_restore(self, read_config):
@@ -341,6 +453,11 @@ class ContextualVariantTests(unittest.TestCase):
                 self.assertIs(config.lap_enabled, lap)
         with self.assertRaises(SystemExit):
             self.parse("--sale", "false")
+        self.assertTrue(
+            runtime_config_from_args(self.parse("--use-attention")).use_attention
+        )
+        with self.assertRaises(SystemExit):
+            self.parse("--use-attention", "false")
 
     def test_cli_replay_sampling_modes_are_mutually_exclusive(self):
         cases = (

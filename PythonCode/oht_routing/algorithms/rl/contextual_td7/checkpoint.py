@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import random
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import numpy as np
@@ -22,6 +23,20 @@ CRITIC_INITIALIZATION = "independent"
 
 class ContextualCheckpointError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class FrozenContextualPolicy:
+    """Inference-only Stage 1 modules isolated from the Stage 2 learner."""
+
+    encoder: torch.nn.Module
+    actor: torch.nn.Module
+    sale_fixed: torch.nn.Module | None
+    action_mode: str
+    applied_action_scale: float
+    checkpoint_path: Path
+    checkpoint_sha256: str
+    runtime_metadata: dict
 
 
 def _checkpoint_sha256(path: Path) -> str:
@@ -161,6 +176,199 @@ def _twin_state_max_abs_diff(state_dict) -> float:
     )
 
 
+def _freeze_policy_module(module: torch.nn.Module | None) -> None:
+    if module is None:
+        return
+    module.eval()
+    for parameter in module.parameters():
+        if not torch.isfinite(parameter).all():
+            raise ContextualCheckpointError(
+                "frozen Stage 1 policy contains NaN or Inf"
+            )
+        parameter.requires_grad_(False)
+
+
+def _validate_frozen_normalizer_state(name: str, state: object) -> None:
+    if not isinstance(state, dict):
+        raise ContextualCheckpointError(
+            f"checkpoint {name} normalizer state is missing"
+        )
+    if not bool(state.get("frozen", False)):
+        raise ContextualCheckpointError(
+            f"checkpoint {name} normalizer must be frozen"
+        )
+    if int(state.get("count", 0)) <= 0:
+        raise ContextualCheckpointError(
+            f"checkpoint {name} normalizer must be populated"
+        )
+
+
+def load_frozen_contextual_policy(
+    path,
+    learner,
+    *,
+    observation_builder,
+    expected_reward_version: str,
+) -> FrozenContextualPolicy:
+    """Load only the policy-side Stage 1 contract for a Stage 2 prefix.
+
+    Unlike :func:`load_contextual_checkpoint`, this function intentionally
+    leaves the Stage 2 critic, target networks, optimizers, counters, replay,
+    reward state, and every process RNG untouched.
+    """
+    target = Path(path)
+    checkpoint_sha256 = _checkpoint_sha256(target)
+    payload = torch.load(target, map_location="cpu", weights_only=False)
+    runtime_metadata = dict(payload.get("runtime_metadata", {}))
+    if (
+        runtime_metadata.get("checkpoint_kind") == "crash"
+        or runtime_metadata.get("training_failed") is True
+    ):
+        raise ContextualCheckpointError(
+            "Crash checkpoint Stage 1 policy load refused. "
+            "Crash checkpoints are diagnostic artifacts only."
+        )
+    _validate_checkpoint_reward_identity(
+        payload,
+        expected_reward_version=expected_reward_version,
+    )
+    _resolve_checkpoint_version(target, payload, announce_promotion=True)
+
+    saved_action_mode = payload.get("action_mode")
+    if saved_action_mode is None:
+        saved_action_mode = dict(payload.get("learner_config", {})).get(
+            "action_mode"
+        )
+
+    expected = {
+        "topology_hash": learner.replay.topology.topology_hash,
+        "mapping_hash": learner.replay.topology.mapping_hash,
+        "network_config": asdict(learner.network_config),
+        "action_mode": learner.config.action_mode,
+        "sale_enabled": learner.config.sale_enabled,
+    }
+    for key, value in expected.items():
+        saved = (
+            saved_action_mode if key == "action_mode" else payload.get(key)
+        )
+        if saved != value:
+            raise ContextualCheckpointError(
+                f"Stage 1 checkpoint {key} mismatch: saved={saved!r}, "
+                f"stage2={value!r}"
+            )
+    saved_learner_config = dict(payload.get("learner_config", {}))
+    for key in ("sale_embedding_dim", "sale_feature_dim"):
+        if not learner.config.sale_enabled:
+            break
+        saved = saved_learner_config.get(key)
+        expected_value = getattr(learner.config, key)
+        if saved != expected_value:
+            raise ContextualCheckpointError(
+                f"Stage 1 checkpoint {key} mismatch: saved={saved!r}, "
+                f"stage2={expected_value!r}"
+            )
+
+    required_states = ["online_encoder", "online_actor"]
+    if learner.config.sale_enabled:
+        required_states.append("sale_fixed")
+    missing = [key for key in required_states if key not in payload]
+    if missing:
+        raise ContextualCheckpointError(
+            f"Stage 1 checkpoint policy state is missing: {missing}"
+        )
+
+    normalizer_states = {
+        "local": payload.get("observation_local_normalizer"),
+        "global": payload.get("observation_global_normalizer"),
+        "critic": payload.get(
+            "observation_critic_total_tat_normalizer"
+        ),
+    }
+    for name, state in normalizer_states.items():
+        _validate_frozen_normalizer_state(name, state)
+
+    devices = (
+        [learner.device]
+        if torch.device(learner.device).type == "cuda"
+        else []
+    )
+    with torch.random.fork_rng(devices=devices):
+        frozen_encoder = copy.deepcopy(learner.encoder).to(learner.device)
+        frozen_actor = copy.deepcopy(learner.actor).to(learner.device)
+        frozen_sale = (
+            copy.deepcopy(learner.sale_fixed).to(learner.device)
+            if learner.config.sale_enabled
+            else None
+        )
+        frozen_encoder.load_state_dict(payload["online_encoder"], strict=True)
+        frozen_actor.load_state_dict(payload["online_actor"], strict=True)
+        if frozen_sale is not None:
+            frozen_sale.load_state_dict(payload["sale_fixed"], strict=True)
+        for module in (frozen_encoder, frozen_actor, frozen_sale):
+            _freeze_policy_module(module)
+
+    stage2_parameter_ids = {
+        id(parameter)
+        for module in (learner.encoder, learner.actor, learner.sale_fixed)
+        if module is not None
+        for parameter in module.parameters()
+    }
+    frozen_parameter_ids = {
+        id(parameter)
+        for module in (frozen_encoder, frozen_actor, frozen_sale)
+        if module is not None
+        for parameter in module.parameters()
+    }
+    if stage2_parameter_ids & frozen_parameter_ids:
+        raise ContextualCheckpointError(
+            "Stage 1 frozen policy shares parameters with the Stage 2 learner"
+        )
+
+    try:
+        _load_normalizer(
+            observation_builder.local_normalizer,
+            normalizer_states["local"],
+        )
+        _load_normalizer(
+            observation_builder.global_normalizer,
+            normalizer_states["global"],
+        )
+        _load_normalizer(
+            observation_builder.critic_normalizer,
+            normalizer_states["critic"],
+        )
+    except Exception as error:
+        raise ContextualCheckpointError(
+            f"Stage 1 checkpoint normalizer load failed: {error}"
+        ) from error
+
+    applied_action_scale = float(
+        payload.get("applied_action_scale", payload.get("action_scale", 0.0))
+    )
+    if (
+        not np.isfinite(applied_action_scale)
+        or applied_action_scale <= 0.0
+        or applied_action_scale > 1.0
+    ):
+        raise ContextualCheckpointError(
+            "Stage 1 checkpoint applied_action_scale must be finite and in (0, 1]"
+        )
+    if _checkpoint_sha256(target) != checkpoint_sha256:
+        raise ContextualCheckpointError(
+            "Stage 1 checkpoint changed while it was being loaded"
+        )
+    return FrozenContextualPolicy(
+        encoder=frozen_encoder,
+        actor=frozen_actor,
+        sale_fixed=frozen_sale,
+        action_mode=str(saved_action_mode),
+        applied_action_scale=applied_action_scale,
+        checkpoint_path=target.resolve(),
+        checkpoint_sha256=checkpoint_sha256,
+        runtime_metadata=runtime_metadata,
+    )
+
+
 def save_contextual_checkpoint(
     path,
     learner,
@@ -277,7 +485,7 @@ def load_contextual_checkpoint(
     reward_builder,
     exploration_rng=None,
     exploration_seed=0,
-) -> None:
+) -> dict:
     target = Path(path)
     payload = torch.load(target, map_location=learner.device, weights_only=False)
     runtime_metadata = dict(payload.get("runtime_metadata", {}))

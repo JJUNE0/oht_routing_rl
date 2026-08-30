@@ -11,6 +11,10 @@ from oht_routing.mdp.observation import (
 )
 from oht_routing.runtime.console import print_header, print_section
 from oht_routing.runtime.config_validation import make_reward_config
+from oht_routing.runtime.stages import (
+    STAGE_TWO,
+    STAGE_TWO_STAGE1_POLICY_STEPS,
+)
 from oht_routing.version import CONTEXTUAL_VERSION
 
 
@@ -76,6 +80,7 @@ def print_runtime_summary(client):
             ("device", client.device),
             ("seed", config.seed),
             ("dispatch mode", config.dispatch_mode),
+            ("stage", config.stage),
             ("sim end time", config.sim_end_time),
             ("console log interval", config.console_log_interval),
         ),
@@ -88,6 +93,12 @@ def print_runtime_summary(client):
             ("observation version", OBSERVATION_VERSION),
             ("local physical features", LOCAL_PHYSICAL_DIM),
             ("rail embedding dimensions", network.rail_embedding_dim),
+            (
+                "neighbor aggregation",
+                "directional cross-attention"
+                if network.use_attention
+                else "directional flat projection (default)",
+            ),
             ("relation features", RELATION_DIM),
             ("actor global features", ACTOR_GLOBAL_DIM),
             (
@@ -103,7 +114,13 @@ def print_runtime_summary(client):
             ),
             ("observation stacks", config.num_stacks),
             ("stack interval", config.stack_interval),
-            ("episode burn-in steps", config.episode_burnin_steps),
+            (
+                "Stage 1 frozen prefix",
+                (
+                    STAGE_TWO_STAGE1_POLICY_STEPS
+                    if config.stage == STAGE_TWO else "disabled"
+                ),
+            ),
             (
                 "warm-up steps",
                 f"{config.warmup_steps} -> {config.effective_warmup_steps}",
@@ -113,6 +130,7 @@ def print_runtime_summary(client):
                 config.terminate_on_warmup_complete,
             ),
             ("normalizer load", config.load_state_normalizer_path),
+            ("Stage 1 policy", config.load_stage1_policy_path),
             ("normalizer save", config.save_state_normalizer_path),
         ),
     )
@@ -130,6 +148,10 @@ def print_runtime_summary(client):
             ("estimated full replay RAM", f"{estimated_replay_gib:.2f} GiB"),
             ("batch size", config.batch_size),
             (
+                "periodic checkpoint interval",
+                config.periodic_checkpoint_interval,
+            ),
+            (
                 "resume refill",
                 f"{refill_mode} (target={config.resume_refill_target_env_steps})",
             ),
@@ -137,6 +159,7 @@ def print_runtime_summary(client):
                 "deterministic first episode",
                 config.resume_deterministic_first_episode,
             ),
+            ("resume warm-start steps", config.resume_warmstart_steps),
         ),
     )
     print_section(

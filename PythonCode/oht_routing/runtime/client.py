@@ -27,6 +27,7 @@ from oht_routing.algorithms.rl.contextual_td7 import (
     encode_observation_stack,
     flatten_action_stack,
     flatten_state_stack,
+    load_frozen_contextual_policy,
     load_contextual_checkpoint,
     save_contextual_checkpoint,
 )
@@ -57,6 +58,10 @@ from oht_routing.runtime.console import print_entries, print_header
 from oht_routing.runtime.diagnostics import ContextualRuntimeDiagnosticsMixin
 from oht_routing.runtime.config import ContextualRuntimeConfig
 from oht_routing.runtime.config_validation import make_reward_config
+from oht_routing.runtime.stages import (
+    STAGE_TWO,
+    STAGE_TWO_STAGE1_POLICY_STEPS,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -67,6 +72,30 @@ TOPOLOGY_CACHE_DIR = (
 
 class ContextualTrainingFailure(RuntimeError):
     """Fatal training failure requiring an explicit process restart."""
+
+
+def _normalizer_state_dicts_equal(left: dict, right: dict) -> bool:
+    if left.keys() != right.keys():
+        return False
+    for key in left:
+        left_value = left[key]
+        right_value = right[key]
+        if isinstance(left_value, np.ndarray) or isinstance(
+            right_value, np.ndarray
+        ):
+            if not np.array_equal(left_value, right_value):
+                return False
+        elif left_value != right_value:
+            return False
+    return True
+
+
+def _observation_normalizer_states(observation_builder) -> dict[str, dict]:
+    return {
+        "local": observation_builder.local_normalizer.state_dict(),
+        "global": observation_builder.global_normalizer.state_dict(),
+        "critic": observation_builder.critic_normalizer.state_dict(),
+    }
 
 
 class _InferenceReplayContext:
@@ -102,6 +131,7 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
             network_config = ContextualNetworkConfig(
                 num_stacks=self.config.num_stacks,
                 stack_interval=self.config.stack_interval,
+                use_attention=self.config.use_attention,
             )
             self.encoder = DirectionalContextEncoder(network_config).to(self.device)
             self.actor = ContextualActor(network_config).to(self.device)
@@ -148,7 +178,9 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
         self.checkpoint_loaded = False
         self.replay_buffer = None
         self.learner = None
+        self.stage1_policy = None
         self.action_enabled_env_steps = 0
+        self.stage2_env_steps = 0
         self.state_normalizer_loaded = False
         self.state_normalizer_saved = False
         self.warmup_episode_boundary_sent = False
@@ -173,10 +205,11 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
         self._last_replay_push_ms = 0.0
         self._resume_requires_refill = False
         self._resume_deterministic_episode_active = False
+        self._resume_warmstart_episode_active = False
         self._last_sim_time: float | None = None
         self._stale_sim_time_ticks = 0
-        self._burnin_last_applied_action = None
-        self._burnin_previous_applied_action = None
+        self._stage1_last_applied_action = None
+        self._stage1_previous_applied_action = None
         self.dispatcher = OHTDispatcher(self.config.dispatch_mode)
         self.checkpoint_root = Path(
             self.config.checkpoint_root
@@ -205,8 +238,10 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
     def runtime_variant(self):
         return (
             f"{CONTEXTUAL_VERSION}_{self.algorithm_variant}_"
+            f"stage{self.config.stage or 0}_"
             f"{self.config.action_mode}_reward_{self.config.reward_version}_"
             f"s{self.config.num_stacks}i{self.config.stack_interval}_"
+            f"{'attention' if self.config.use_attention else 'flat'}_"
             f"{self.config.replay_sampling_mode}_"
             f"curr{self.config.curriculum_scale_start:g}-"
             f"{self.config.curriculum_scale_end:g}-"
@@ -220,6 +255,8 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
         return (
             f"ctx_td7_{CONTEXTUAL_VERSION}_s{int(self.config.sale_enabled)}_"
             f"l{int(self.config.lap_enabled)}_"
+            f"a{int(self.config.use_attention)}_"
+            f"g{self.config.stage or 0}_"
             f"k{self.config.num_stacks}_i{self.config.stack_interval}_"
             f"r{self.config.reward_version}_"
             f"{self.config.action_mode}_"
@@ -371,6 +408,7 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
             neighbor_count=int(self.topology.incoming_neighbor_ids.shape[1]),
             num_stacks=self.config.num_stacks,
             stack_interval=self.config.stack_interval,
+            use_attention=self.config.use_attention,
         )
         self.learner = ContextualTD7Learner(
             learner_replay,
@@ -389,8 +427,10 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
             if self.config.mode == "training"
             else None
         )
+        resumed_runtime_metadata = {}
+        resumed_normalizer_states = None
         if self.config.resume_checkpoint_path:
-            runtime_metadata = load_contextual_checkpoint(
+            resumed_runtime_metadata = load_contextual_checkpoint(
                 self.config.resume_checkpoint_path,
                 self.learner,
                 observation_builder=self.observation_builder,
@@ -399,15 +439,58 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
                 exploration_seed=self.config.seed,
             )
             self.total_steps = int(
-                runtime_metadata.get("runtime_env_step", self.total_steps)
+                resumed_runtime_metadata.get(
+                    "runtime_env_step", self.total_steps
+                )
             )
             self.episode_id = int(
-                runtime_metadata.get("episode_id", self.episode_id)
+                resumed_runtime_metadata.get("episode_id", self.episode_id)
             )
+            if self.config.stage == STAGE_TWO:
+                if resumed_runtime_metadata.get("stage") != STAGE_TWO:
+                    raise ContextualTrainingFailure(
+                        "Stage 2 resume requires a Stage 2 checkpoint; use "
+                        "--load-stage1-policy alone to start a fresh Stage 2 "
+                        "learner from a Stage 1 artifact"
+                    )
+                saved_stage2_steps = resumed_runtime_metadata.get(
+                    "stage2_env_steps"
+                )
+                if (
+                    isinstance(saved_stage2_steps, bool)
+                    or not isinstance(saved_stage2_steps, (int, np.integer))
+                    or int(saved_stage2_steps) < 0
+                ):
+                    raise ContextualTrainingFailure(
+                        "Stage 2 checkpoint requires a non-negative integer "
+                        "stage2_env_steps value"
+                    )
+                self.stage2_env_steps = int(saved_stage2_steps)
+                if resumed_runtime_metadata.get(
+                    "checkpoint_schedule_step"
+                ) != self.stage2_env_steps:
+                    raise ContextualTrainingFailure(
+                        "Stage 2 checkpoint schedule clock mismatch"
+                    )
+                if resumed_runtime_metadata.get(
+                    "stage1_policy_prefix_steps"
+                ) != STAGE_TWO_STAGE1_POLICY_STEPS:
+                    raise ContextualTrainingFailure(
+                        "Stage 2 checkpoint Stage 1 prefix contract mismatch"
+                    )
+                resumed_normalizer_states = (
+                    _observation_normalizer_states(self.observation_builder)
+                )
+            else:
+                self.stage2_env_steps = int(
+                    resumed_runtime_metadata.get(
+                        "stage2_env_steps", self.stage2_env_steps
+                    )
+                )
             self.transition_aligner.episode_id = self.episode_id
             self.checkpoint_loaded = True
             self.warmup_episode_boundary_sent = bool(
-                runtime_metadata.get(
+                resumed_runtime_metadata.get(
                     "warmup_episode_boundary_sent",
                     self.warmup_episode_boundary_sent,
                 )
@@ -424,6 +507,10 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
             self._resume_deterministic_episode_active = bool(
                 self.config.mode == "training"
                 and self.config.resume_deterministic_first_episode
+            )
+            self._resume_warmstart_episode_active = bool(
+                self.config.mode == "training"
+                and self.config.resume_warmstart_steps > 0
             )
             self.action_enabled_env_steps = 0
             print_header("checkpoint-loaded")
@@ -449,8 +536,100 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
                 ),
                 indent=2,
             )
+        if self.config.load_stage1_policy_path:
+            self.stage1_policy = load_frozen_contextual_policy(
+                self.config.load_stage1_policy_path,
+                self.learner,
+                observation_builder=self.observation_builder,
+                expected_reward_version=self.config.reward_version,
+            )
+            resumed_stage1_sha256 = resumed_runtime_metadata.get(
+                "stage1_policy_sha256"
+            )
+            if (
+                self.config.resume_checkpoint_path
+                and (
+                    not isinstance(resumed_stage1_sha256, str)
+                    or not resumed_stage1_sha256
+                )
+            ):
+                raise ContextualTrainingFailure(
+                    "Stage 2 checkpoint is missing Stage 1 policy SHA-256 "
+                    "provenance"
+                )
+            if (
+                resumed_stage1_sha256 is not None
+                and resumed_stage1_sha256
+                != self.stage1_policy.checkpoint_sha256
+            ):
+                raise ContextualTrainingFailure(
+                    "Stage 2 resume Stage 1 policy mismatch: "
+                    f"saved_sha256={resumed_stage1_sha256}, "
+                    "loaded_sha256="
+                    f"{self.stage1_policy.checkpoint_sha256}"
+                )
+            if self.config.resume_checkpoint_path:
+                saved_stage1_scale = resumed_runtime_metadata.get(
+                    "stage1_applied_action_scale"
+                )
+                if (
+                    isinstance(saved_stage1_scale, bool)
+                    or not isinstance(saved_stage1_scale, (int, float))
+                    or not np.isfinite(saved_stage1_scale)
+                    or float(saved_stage1_scale)
+                    != self.stage1_policy.applied_action_scale
+                ):
+                    raise ContextualTrainingFailure(
+                        "Stage 2 checkpoint Stage 1 applied-action scale "
+                        "mismatch"
+                    )
+            if resumed_normalizer_states is not None:
+                loaded_normalizer_states = _observation_normalizer_states(
+                    self.observation_builder
+                )
+                mismatched_normalizers = [
+                    name
+                    for name in resumed_normalizer_states
+                    if not _normalizer_state_dicts_equal(
+                        resumed_normalizer_states[name],
+                        loaded_normalizer_states[name],
+                    )
+                ]
+                if mismatched_normalizers:
+                    raise ContextualTrainingFailure(
+                        "Stage 2 checkpoint and Stage 1 policy normalizer "
+                        "mismatch: "
+                        f"{mismatched_normalizers}"
+                    )
+            if not self._state_normalizers_ready_for_bypass():
+                raise ContextualTrainingFailure(
+                    "Stage 2 requires populated, frozen Stage 1 observation "
+                    "normalizers"
+                )
+            print_header("stage1-policy-loaded")
+            print_entries(
+                (
+                    ("source", self.stage1_policy.checkpoint_path),
+                    ("sha256", self.stage1_policy.checkpoint_sha256),
+                    ("frozen", True),
+                    ("prefix steps", STAGE_TWO_STAGE1_POLICY_STEPS),
+                    (
+                        "applied action scale",
+                        self.stage1_policy.applied_action_scale,
+                    ),
+                ),
+                indent=2,
+            )
 
     def _on_completed_transition(self, transition):
+        if (
+            self.config.stage == STAGE_TWO
+            and int(transition.env_step) < STAGE_TWO_STAGE1_POLICY_STEPS
+        ):
+            raise ContextualTrainingFailure(
+                "Stage 1 transition reached the Stage 2 replay boundary: "
+                f"env_step={int(transition.env_step)}"
+            )
         started = time.perf_counter()
         self.replay_buffer.push_transition(transition)
         self._last_replay_push_ms = (
@@ -537,6 +716,12 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
             "gate/resume_deterministic_episode_complete": (
                 not self._resume_deterministic_episode_active
             ),
+            "gate/resume_warmstart_complete": (
+                not self._resume_warmstart_episode_active
+            ),
+            "gate/stage2_policy_active": (
+                not self._stage1_prefix_active()
+            ),
             "gate/not_failed": not self.training_failed,
         }
         return states, all(states.values())
@@ -557,6 +742,25 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
             ),
             "runtime_env_step": self.total_steps,
             "episode_id": self.episode_id,
+            "stage": self.config.stage,
+            "stage2_env_steps": self.stage2_env_steps,
+            "checkpoint_schedule_step": self._checkpoint_schedule_step(),
+            "stage1_policy_prefix_steps": (
+                STAGE_TWO_STAGE1_POLICY_STEPS
+                if self.config.stage == STAGE_TWO else 0
+            ),
+            "stage1_policy_path": (
+                str(self.stage1_policy.checkpoint_path)
+                if self.stage1_policy is not None else None
+            ),
+            "stage1_policy_sha256": (
+                self.stage1_policy.checkpoint_sha256
+                if self.stage1_policy is not None else None
+            ),
+            "stage1_applied_action_scale": (
+                self.stage1_policy.applied_action_scale
+                if self.stage1_policy is not None else None
+            ),
             "action_enabled_env_steps": self.action_enabled_env_steps,
             "normalizers_frozen": self._normalizers_frozen(),
             "checkpoint_kind": str(checkpoint_kind),
@@ -576,7 +780,7 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
         elif kind == "periodic":
             path = (
                 self.checkpoint_root / "periodic"
-                / f"step_{self.total_steps:05d}.pt"
+                / f"step_{self._checkpoint_schedule_step():05d}.pt"
             )
         elif kind == "crash":
             path = self.checkpoint_root / "crash" / "checkpoint.pt"
@@ -593,16 +797,23 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
         )
         return self.last_checkpoint_path
 
-    def _maybe_checkpoint(self, *, force_latest=False):
+    def _maybe_checkpoint(
+        self,
+        *,
+        force_latest=False,
+        schedule_advanced=True,
+    ):
         if self.training_failed:
             return
+        schedule_step = self._checkpoint_schedule_step()
         if force_latest or (
-            self.total_steps
-            and self.total_steps % self.config.latest_checkpoint_interval == 0
+            schedule_advanced
+            and schedule_step
+            and schedule_step % self.config.latest_checkpoint_interval == 0
         ):
             self._save_runtime_checkpoint("latest")
-        if self.total_steps and (
-            self.total_steps % self.config.periodic_checkpoint_interval == 0
+        if schedule_advanced and schedule_step and (
+            schedule_step % self.config.periodic_checkpoint_interval == 0
         ):
             self._save_runtime_checkpoint("periodic")
 
@@ -618,10 +829,12 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
         self.last_applied_action = None
         self.last_policy_action = None
         self.last_exploratory_action = None
+        self._last_replay_summary = {}
+        self._last_replay_push_ms = 0.0
         self._last_sim_time = None
         self._stale_sim_time_ticks = 0
-        self._burnin_last_applied_action = None
-        self._burnin_previous_applied_action = None
+        self._stage1_last_applied_action = None
+        self._stage1_previous_applied_action = None
         self.tat_above_threshold_count = 0
         self._tat_terminal_penalty_applied = False
         if hasattr(self, "leading_indicator_tracker"):
@@ -753,6 +966,17 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
 
     def Reset(self, pclient):
         if (
+            getattr(self, "_resume_warmstart_episode_active", False)
+            and self.episode_steps > 0
+        ):
+            self._resume_warmstart_episode_active = False
+            print(
+                "[checkpoint-resume] deterministic throwaway warm-start "
+                "complete; replay collection, exploration, and learner "
+                "updates begin in this episode",
+                flush=True,
+            )
+        if (
             getattr(self, "_resume_deterministic_episode_active", False)
             and self.episode_steps > 0
         ):
@@ -775,10 +999,12 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
         self.last_policy_action = None
         self.last_exploratory_action = None
         self.last_diagnostics = {}
+        self._last_replay_summary = {}
+        self._last_replay_push_ms = 0.0
         self._last_sim_time = None
         self._stale_sim_time_ticks = 0
-        self._burnin_last_applied_action = None
-        self._burnin_previous_applied_action = None
+        self._stage1_last_applied_action = None
+        self._stage1_previous_applied_action = None
         # Delay-estimator state is episode-local and affects baseline cost.
         self.parameterDw.clear()
         self.parameterPassTimes.clear()
@@ -875,6 +1101,23 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
             values.clear()
         self.parameterC = parameter_c
 
+    def _stage1_prefix_active(self) -> bool:
+        return bool(
+            self.config.stage == STAGE_TWO
+            and self.episode_steps < STAGE_TWO_STAGE1_POLICY_STEPS
+        )
+
+    def _stage2_schedule_step(self) -> int:
+        return int(
+            self.stage2_env_steps
+            if self.config.stage == STAGE_TWO
+            else self.total_steps
+        )
+
+    def _checkpoint_schedule_step(self) -> int:
+        """Use learner-active Stage 2 time for Stage 2 checkpoint cadence."""
+        return self._stage2_schedule_step()
+
     def _action_scale(self) -> float:
         if self.config.action_mode == EXP_RESIDUAL:
             return float(self.config.action_scale)
@@ -882,7 +1125,7 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
         end = int(self.config.curriculum_end_step)
         scale_start = float(self.config.curriculum_scale_start)
         scale_end = float(self.config.curriculum_scale_end)
-        step = int(self.total_steps)
+        step = self._stage2_schedule_step()
         if step >= end:
             return scale_end
         if step <= start:
@@ -900,7 +1143,9 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
             return 0.0
         final = min(start, float(self.config.exploration_noise_final_std))
         post_warmup_step = max(
-            0, self.total_steps - self.config.effective_warmup_steps
+            0,
+            self._stage2_schedule_step()
+            - self.config.effective_warmup_steps,
         )
         progress = np.clip(
             post_warmup_step / self.config.exploration_noise_anneal_steps,
@@ -909,39 +1154,24 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
         )
         return float(start + (final - start) * progress)
 
-    def _burnin_active(self) -> bool:
-        return bool(
-            self.config.mode == "training"
-            and self.episode_steps < self.config.episode_burnin_steps
-        )
-
-    def _has_trained_policy(self) -> bool:
-        return bool(
-            self.checkpoint_loaded
-            or (
-                self.learner is not None
-                and int(getattr(self.learner, "learner_update_count", 0)) > 0
-            )
-        )
-
-    def _advance_burnin_reward_history(self, pclient) -> None:
-        """Advance reward/TAT state without staging or storing a transition."""
+    def _advance_stage1_reward_history(self, pclient) -> None:
+        """Advance Stage 1 reward state without creating a replay transition."""
         if (
-            self.config.episode_burnin_steps <= 0
+            self.config.stage != STAGE_TWO
             or self.episode_steps <= 0
-            or self.episode_steps > self.config.episode_burnin_steps
-            or self._burnin_last_applied_action is None
+            or self.episode_steps > STAGE_TWO_STAGE1_POLICY_STEPS
+            or self._stage1_last_applied_action is None
         ):
             return
         self.reward_builder.build(
             pclient,
-            applied_action=self._burnin_last_applied_action,
-            previous_applied_action=self._burnin_previous_applied_action,
+            applied_action=self._stage1_last_applied_action,
+            previous_applied_action=self._stage1_previous_applied_action,
             env_step=self.episode_steps - 1,
             episode_id=self.episode_id,
         )
         self.transition_aligner.previous_applied_action = (
-            self._burnin_last_applied_action.reshape(-1, 1).copy()
+            self._stage1_last_applied_action.reshape(-1, 1).copy()
         )
 
     @staticmethod
@@ -1036,7 +1266,19 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
             frame.previous_applied_action for frame in frames
         ], axis=1)))
 
-    def _actor_inference(self, observation, *, attention_diagnostics=False):
+    def _policy_inference(
+        self,
+        observation,
+        *,
+        encoder,
+        actor,
+        sale_fixed,
+        network_config,
+        attention_diagnostics=False,
+    ):
+        attention_diagnostics = bool(
+            attention_diagnostics and network_config.use_attention
+        )
         t0 = time.perf_counter()
         cpu_tensors = self._cpu_tensors(observation)
         cpu_previous_action = self._cpu_previous_applied_action(observation)
@@ -1061,35 +1303,31 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
         t0 = time.perf_counter()
         with torch.inference_mode():
             encoded_stack = encode_observation_stack(
-                self.encoder,
+                encoder,
                 structured_batch,
                 return_attention=attention_diagnostics,
             )
             actor_state = flatten_state_stack(
-                encoded_stack.state, self.config.num_stacks
+                encoded_stack.state, network_config.num_stacks
             )
             actor_previous_action = flatten_action_stack(
                 previous_action,
-                num_stacks=self.config.num_stacks,
+                num_stacks=network_config.num_stacks,
                 action_dim=1,
             )
             sale_state = (
-                self.learner.sale_fixed.state(structured_batch)
-                if self.learner is not None
-                and getattr(
-                    getattr(self.learner, "config", None),
-                    "sale_enabled", False
-                )
+                sale_fixed.state(structured_batch)
+                if sale_fixed is not None
                 else None
             )
             actor_output = (
-                self.actor(
+                actor(
                     actor_state,
                     sale_state,
                     previous_action=actor_previous_action,
                 )
                 if sale_state is not None
-                else self.actor(
+                else actor(
                     actor_state,
                     previous_action=actor_previous_action,
                 )
@@ -1121,7 +1359,7 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
                 ),
             ):
                 weights = weights.reshape(
-                    batch, self.config.num_stacks, *weights.shape[1:]
+                    batch, network_config.num_stacks, *weights.shape[1:]
                 )[:, 0]
                 probabilities = weights.clamp_min(1e-12)
                 diagnostics[f"attention/{direction}_entropy"] = float(
@@ -1132,6 +1370,33 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
                     probabilities.max(-1).values.mean().detach().cpu()
                 )
         return controlled_action, diagnostics
+
+    def _actor_inference(self, observation, *, attention_diagnostics=False):
+        return self._policy_inference(
+            observation,
+            encoder=self.encoder,
+            actor=self.actor,
+            sale_fixed=(
+                getattr(self.learner, "sale_fixed", None)
+                if self.learner is not None else None
+            ),
+            network_config=self.encoder.config,
+            attention_diagnostics=attention_diagnostics,
+        )
+
+    def _stage1_actor_inference(self, observation):
+        if self.stage1_policy is None:
+            raise ContextualTrainingFailure(
+                "Stage 2 reached its Stage 1 prefix without a frozen policy"
+            )
+        return self._policy_inference(
+            observation,
+            encoder=self.stage1_policy.encoder,
+            actor=self.stage1_policy.actor,
+            sale_fixed=self.stage1_policy.sale_fixed,
+            network_config=self.stage1_policy.encoder.config,
+            attention_diagnostics=False,
+        )
 
     def Algorithm(self, pclient):
         self._current_baseline = None
@@ -1194,6 +1459,15 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
         self.warmup_episode_boundary_sent = True
         return True
 
+    def _update_resume_warmstart_boundary(self) -> bool:
+        """End the checkpoint-resume throwaway episode after exactly N ticks."""
+        return bool(
+            self.config.mode == "training"
+            and self._resume_warmstart_episode_active
+            and self.config.resume_warmstart_steps > 0
+            and self.episode_steps + 1 >= self.config.resume_warmstart_steps
+        )
+
     def _algorithm_impl(self, pclient):
         total_start = time.perf_counter()
         self._ensure_initialized(pclient)
@@ -1212,6 +1486,7 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
         done_by_queue = queued > self.config.early_stop_queued_threshold
         done_by_tat = self._update_tat_termination(total_tat)
         done_by_warmup = self._update_warmup_episode_boundary()
+        done_by_resume_warmstart = self._update_resume_warmstart_boundary()
         protocol_stalled = (
             self.config.mode == "training" and protocol_stalled
         )
@@ -1219,6 +1494,7 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
             done_by_queue
             or done_by_tat
             or done_by_warmup
+            or done_by_resume_warmstart
             or protocol_stalled
         )
         termination_reason = (
@@ -1226,6 +1502,7 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
             else 1.0 if done_by_queue
             else 2.0 if done_by_tat
             else 4.0 if done_by_warmup
+            else 5.0 if done_by_resume_warmstart
             else 0.0
         )
         # Every active-data tick expects exactly one fixed-width termination
@@ -1270,13 +1547,12 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
         self.last_observation = observation
 
         if (
-            self.config.mode == "training"
-            and self.config.episode_burnin_steps > 0
-            and self.episode_steps == self.config.episode_burnin_steps
+            self.config.stage == STAGE_TWO
+            and self.episode_steps == STAGE_TWO_STAGE1_POLICY_STEPS
         ):
-            # Burn-in transitions are intentionally absent from replay. Start
-            # the policy stack at the same boundary so online and replay
-            # padding contracts remain identical.
+            # Stage 1 frames are intentionally absent from replay. Start the
+            # Stage 2 policy stack at the same boundary so online and replay
+            # left-padding contracts remain identical.
             self.observation_history.clear()
         self.observation_history.append(
             observation,
@@ -1284,9 +1560,9 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
             episode_id=self.episode_id,
         )
 
-        burnin_active = self._burnin_active()
-        has_trained_policy = self._has_trained_policy()
-        self._advance_burnin_reward_history(pclient)
+        stage1_prefix_active = self._stage1_prefix_active()
+        resume_warmstart_active = self._resume_warmstart_episode_active
+        self._advance_stage1_reward_history(pclient)
         completed = self.transition_aligner.complete_previous(
             observation=observation,
             pclient=pclient,
@@ -1328,22 +1604,26 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
         deterministic_policy = np.zeros(
             len(self.topology.controlled_rail_ids), dtype=np.float32
         )
-        use_actor = (
-            self.config.mode == "actor_inference"
-            or (
-                self.config.mode == "training"
-                and not done_by_warmup
-                and (
-                    (burnin_active and has_trained_policy)
-                    or (
-                        not burnin_active
-                        and self.total_steps
-                        >= self.config.effective_warmup_steps
-                    )
+        use_stage2_actor = (
+            not stage1_prefix_active
+            and (
+                self.config.mode == "actor_inference"
+                or (
+                    self.config.mode == "training"
+                    and not done_by_warmup
+                    and self._stage2_schedule_step()
+                    >= self.config.effective_warmup_steps
                 )
             )
         )
-        if use_actor:
+        if stage1_prefix_active:
+            deterministic_policy, inference_timing = (
+                self._stage1_actor_inference(
+                    self.observation_history.frames()
+                )
+            )
+            timing.update(inference_timing)
+        elif use_stage2_actor:
             deterministic_policy, inference_timing = self._actor_inference(
                 self.observation_history.frames(),
                 attention_diagnostics=(
@@ -1359,18 +1639,19 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
             self._exploration_noise_std()
             if (
                 self.config.mode == "training"
-                and not burnin_active
+                and not stage1_prefix_active
                 and not self._resume_deterministic_episode_active
+                and not resume_warmstart_active
             )
             else 0.0
         )
         should_apply = (
             self.config.action_enabled
             and (
-                (burnin_active and has_trained_policy)
+                stage1_prefix_active
                 or (
-                    not burnin_active
-                    and self.total_steps
+                    not stage1_prefix_active
+                    and self._stage2_schedule_step()
                     >= self.config.effective_warmup_steps
                 )
             )
@@ -1380,8 +1661,9 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
         if (
             self.config.mode == "training"
             and should_apply
-            and not burnin_active
+            and not stage1_prefix_active
             and not self._resume_deterministic_episode_active
+            and not resume_warmstart_active
         ):
             raw_exploration_noise = self.exploration_rng.normal(
                 0.0,
@@ -1420,7 +1702,17 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
         self.last_policy_action = deterministic_policy.copy()
         self.last_exploratory_action = controlled_action.copy()
         self.last_controlled_action = controlled_action.copy()
-        current_action_scale = self._action_scale()
+        stage2_action_scale = self._action_scale()
+        current_action_scale = (
+            self.stage1_policy.applied_action_scale
+            if stage1_prefix_active and self.stage1_policy is not None
+            else stage2_action_scale
+        )
+        current_action_mode = (
+            self.stage1_policy.action_mode
+            if stage1_prefix_active and self.stage1_policy is not None
+            else self.config.action_mode
+        )
         t0 = time.perf_counter()
         action_result = apply_controlled_action(
             baseline,
@@ -1428,7 +1720,7 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
             self.topology,
             action_enabled=should_apply,
             action_scale=current_action_scale,
-            action_mode=self.config.action_mode,
+            action_mode=current_action_mode,
             base_cost=base_cost,
             congestion_cost=congestion_cost,
         )
@@ -1452,13 +1744,14 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
         gate_states = {}
         gate_open = False
         if self.config.mode == "training":
-            self.learner.set_applied_action_scale(current_action_scale)
+            if not stage1_prefix_active:
+                self.learner.set_applied_action_scale(stage2_action_scale)
             gate_states, gate_open = self._training_gate()
             try:
                 if (
-                    not burnin_active
+                    not stage1_prefix_active
                     and gate_open
-                    and self.total_steps
+                    and self._stage2_schedule_step()
                     % self.config.learn_every_env_steps == 0
                 ):
                     for _ in range(self.config.updates_per_env_step):
@@ -1483,10 +1776,14 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
 
             # Replay commit is transactional with the learner work for this
             # tick. A failed tick never stores its completed transition.
-            if completed is not None:
+            if completed is not None and not resume_warmstart_active:
                 self._on_completed_transition(completed)
 
-        if not done and not burnin_active:
+        if (
+            not done
+            and not stage1_prefix_active
+            and not resume_warmstart_active
+        ):
             self.transition_aligner.stage_current(
                 observation=observation,
                 controlled_action=deterministic_policy,
@@ -1498,19 +1795,21 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
             )
         else:
             self.transition_aligner.pending = None
-        if burnin_active:
-            self._burnin_previous_applied_action = (
+        if stage1_prefix_active:
+            self._stage1_previous_applied_action = (
                 None
-                if self._burnin_last_applied_action is None
-                else self._burnin_last_applied_action.copy()
+                if self._stage1_last_applied_action is None
+                else self._stage1_last_applied_action.copy()
             )
-            self._burnin_last_applied_action = applied_action.copy()
+            self._stage1_last_applied_action = applied_action.copy()
             self.transition_aligner.previous_applied_action = (
                 applied_action.reshape(-1, 1).copy()
             )
 
         self.total_steps += 1
         self.episode_steps += 1
+        if self.config.stage == STAGE_TWO and not stage1_prefix_active:
+            self.stage2_env_steps += 1
         self.last_diagnostics = {
             **action_result.diagnostics,
             **self.observation_builder.diagnostics(),
@@ -1616,20 +1915,39 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
                 if self.replay_buffer is not None else 0
             ),
             "episode/step": float(self.episode_steps - 1),
-            "burnin/active": float(burnin_active),
-            "burnin/remaining_steps": float(
+            "stage/id": float(self.config.stage or 0),
+            "stage/active_policy": float(
+                1 if stage1_prefix_active
+                else 2 if self.config.stage == STAGE_TWO
+                else self.config.stage or 0
+            ),
+            "stage1/active": float(stage1_prefix_active),
+            "stage1/remaining_steps": float(
+                max(0, STAGE_TWO_STAGE1_POLICY_STEPS - self.episode_steps)
+                if self.config.stage == STAGE_TWO else 0
+            ),
+            "stage1/applied_action_scale": float(
+                self.stage1_policy.applied_action_scale
+                if self.stage1_policy is not None else 0.0
+            ),
+            "stage1/policy_frozen": float(self.stage1_policy is not None),
+            "stage2/active": float(
+                self.config.stage == STAGE_TWO and not stage1_prefix_active
+            ),
+            "stage2/env_steps": float(self.stage2_env_steps),
+            "stage2/episode_step": float(
                 max(
                     0,
-                    self.config.episode_burnin_steps
-                    - (self.episode_steps - 1),
+                    (self.episode_steps - 1)
+                    - STAGE_TWO_STAGE1_POLICY_STEPS,
                 )
-                if burnin_active else 0
+                if self.config.stage == STAGE_TWO
+                and not stage1_prefix_active else 0
             ),
-            "burnin/has_trained_policy": float(has_trained_policy),
-            "burnin/action_source": float(
-                1 if burnin_active and has_trained_policy
-                else 2 if burnin_active
-                else 0
+            "resume_warmstart/active": float(resume_warmstart_active),
+            "resume_warmstart/remaining_steps": float(
+                max(0, self.config.resume_warmstart_steps - self.episode_steps)
+                if resume_warmstart_active else 0
             ),
             "learner/updates": float(
                 getattr(self.learner, "learner_update_count", 0)
@@ -1737,6 +2055,9 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
             "termination/by_queue": float(done_by_queue),
             "termination/by_tat": float(done_by_tat),
             "termination/by_warmup": float(done_by_warmup),
+            "termination/by_resume_warmstart": float(
+                done_by_resume_warmstart
+            ),
             "warmup/episode_boundary_sent": float(
                 self.warmup_episode_boundary_sent
             ),
@@ -1810,7 +2131,13 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
             self.last_diagnostics.update(cycle_summary)
         checkpoint_started = time.perf_counter()
         if self.config.mode == "training" and not self.training_failed:
-            self._maybe_checkpoint(force_latest=done_by_warmup)
+            self._maybe_checkpoint(
+                force_latest=(done_by_warmup or done_by_resume_warmstart),
+                schedule_advanced=(
+                    self.config.stage != STAGE_TWO
+                    or not stage1_prefix_active
+                ),
+            )
         checkpoint_ms = (time.perf_counter() - checkpoint_started) * 1000.0
         total_algorithm_ms = (time.perf_counter() - total_start) * 1000.0
         self.last_diagnostics.update({

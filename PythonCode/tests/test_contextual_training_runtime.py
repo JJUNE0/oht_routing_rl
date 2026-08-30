@@ -1,5 +1,7 @@
+import copy
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -223,7 +225,6 @@ def training_runtime(**overrides):
         "action_scale": 0.05,
         "warmup_steps": 4,
         "terminate_on_warmup_complete": False,
-        "episode_burnin_steps": 0,
         "normalizer_freeze_steps": 4,
         "device": "cpu",
         "seed": 12,
@@ -300,26 +301,32 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
                 replay_sampling_mode="random_rail",
             )
         )
+        attention_region = ClientAlgorithm(
+            ContextualRuntimeConfig(use_attention=True)
+        )
 
         variants = {
             sale_lap_region.runtime_variant,
             uniform_region.runtime_variant,
             sale_lap_residual.runtime_variant,
             sale_uniform_random_rail.runtime_variant,
+            attention_region.runtime_variant,
         }
         roots = {
             sale_lap_region.checkpoint_root,
             uniform_region.checkpoint_root,
             sale_lap_residual.checkpoint_root,
             sale_uniform_random_rail.checkpoint_root,
+            attention_region.checkpoint_root,
         }
-        self.assertEqual(len(variants), 4)
-        self.assertEqual(len(roots), 4)
+        self.assertEqual(len(variants), 5)
+        self.assertEqual(len(roots), 5)
         for runtime in (
             sale_lap_region,
             uniform_region,
             sale_lap_residual,
             sale_uniform_random_rail,
+            attention_region,
         ):
             self.assertIn(runtime.algorithm_variant, runtime.runtime_variant)
             self.assertIn(runtime.config.action_mode, runtime.runtime_variant)
@@ -327,6 +334,10 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
             self.assertLess(len(runtime.checkpoint_root.name), 80)
             self.assertEqual(
                 runtime.checkpoint_root.name, runtime.checkpoint_variant
+            )
+            self.assertIn(
+                "attention" if runtime.config.use_attention else "flat",
+                runtime.runtime_variant,
             )
 
         scheduled_n = ClientAlgorithm(ContextualRuntimeConfig(
@@ -546,9 +557,9 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
                 mode="training", action_enabled=False, action_scale=0.05
             )
         with self.assertRaisesRegex(ValueError, "must be an integer"):
-            ContextualRuntimeConfig(episode_burnin_steps=1.5)
+            ContextualRuntimeConfig(resume_warmstart_steps=1.5)
         with self.assertRaisesRegex(ValueError, "non-negative"):
-            ContextualRuntimeConfig(episode_burnin_steps=-1)
+            ContextualRuntimeConfig(resume_warmstart_steps=-1)
         with self.assertRaisesRegex(ValueError, "locked full reward profile"):
             ContextualRuntimeConfig(early_stop_tat_threshold=0.0)
         with self.assertRaisesRegex(ValueError, "locked full reward profile"):
@@ -571,6 +582,21 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "requires checkpoint resume"):
             ContextualRuntimeConfig(
                 resume_deterministic_first_episode=True
+            )
+        with self.assertRaisesRegex(ValueError, "requires checkpoint resume"):
+            ContextualRuntimeConfig(resume_warmstart_steps=1)
+        with self.assertRaisesRegex(ValueError, "requires training mode"):
+            ContextualRuntimeConfig(
+                resume_checkpoint_path="checkpoint.pt",
+                resume_warmstart_steps=1,
+            )
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            ContextualRuntimeConfig(
+                mode="training",
+                action_enabled=True,
+                resume_checkpoint_path="checkpoint.pt",
+                resume_deterministic_first_episode=True,
+                resume_warmstart_steps=1,
             )
 
     def test_warmup_exploration_and_learning_gate(self):
@@ -651,140 +677,398 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
         self.assertEqual(pclient.sent_is_end, [0, 0, 1, 0])
         self.assertEqual(actor_steps, [3])
 
-    def test_episode_burnin_boundary_excludes_replay_and_stale_action(self):
+    @staticmethod
+    def _enable_test_stage2(runtime):
+        runtime.config = replace(
+            runtime.config,
+            stage=2,
+            load_stage1_policy_path="stage1.pt",
+        )
+        runtime.stage1_policy = SimpleNamespace(
+            applied_action_scale=1.0,
+            action_mode=runtime.config.action_mode,
+            checkpoint_path=Path("stage1.pt"),
+            checkpoint_sha256="test-stage1-sha256",
+        )
+
+    def _initialize_mock_stage2_resume(
+        self,
+        metadata,
+        *,
+        loaded_stage1_sha256="stage1-sha256",
+        shift_stage1_normalizer=False,
+    ):
+        config = ContextualRuntimeConfig(
+            mode="training",
+            action_enabled=True,
+            stage=2,
+            resume_checkpoint_path="stage2.pt",
+            load_stage1_policy_path="stage1.pt",
+            device="cpu",
+            replay_capacity_env_steps=64,
+            batch_size=16,
+            minimum_replay_env_steps=1,
+            minimum_action_enabled_env_steps=1,
+            wandb_enabled=False,
+            sale_enabled=False,
+            lap_enabled=False,
+        )
+        runtime = ClientAlgorithm(config)
+        runtime.topology = make_topology()
+        runtime.observation_builder = TrainingObservationBuilder(
+            runtime.topology, freeze_steps=1
+        )
+
+        def load_stage2(*args, observation_builder, **kwargs):
+            for normalizer, dim in (
+                (observation_builder.local_normalizer, LOCAL_PHYSICAL_DIM),
+                (observation_builder.global_normalizer, GLOBAL_DIM),
+                (observation_builder.critic_normalizer, CRITIC_EXTRA_DIM),
+            ):
+                normalizer.update(np.ones((1, dim)), name="stage2_resume")
+                normalizer.freeze()
+            return dict(metadata)
+
+        def load_stage1(*args, observation_builder, **kwargs):
+            if shift_stage1_normalizer:
+                state = observation_builder.local_normalizer.state_dict()
+                state["mean"] = state["mean"] + 1.0
+                observation_builder.local_normalizer.load_state_dict(state)
+            return SimpleNamespace(
+                encoder=torch.nn.Linear(1, 1),
+                actor=torch.nn.Linear(1, 1),
+                sale_fixed=None,
+                applied_action_scale=1.0,
+                action_mode=runtime.config.action_mode,
+                checkpoint_path=Path("stage1.pt"),
+                checkpoint_sha256=loaded_stage1_sha256,
+            )
+
+        learner = SimpleNamespace(
+            encoder=torch.nn.Linear(1, 1),
+            actor=torch.nn.Linear(1, 1),
+        )
+        with (
+            patch(
+                "oht_routing.runtime.client.ContextualTD7Learner",
+                return_value=learner,
+            ),
+            patch(
+                "oht_routing.runtime.client.load_contextual_checkpoint",
+                side_effect=load_stage2,
+            ),
+            patch(
+                "oht_routing.runtime.client.load_frozen_contextual_policy",
+                side_effect=load_stage1,
+            ),
+        ):
+            runtime._ensure_initialized(make_runtime_pclient())
+        return runtime
+
+    @staticmethod
+    def _valid_stage2_resume_metadata():
+        return {
+            "runtime_env_step": 4_000,
+            "episode_id": 2,
+            "stage": 2,
+            "stage2_env_steps": 2_000,
+            "checkpoint_schedule_step": 2_000,
+            "stage1_policy_prefix_steps": 2_000,
+            "stage1_policy_sha256": "stage1-sha256",
+            "stage1_applied_action_scale": 1.0,
+        }
+
+    def test_stage2_boundary_excludes_stage1_replay_and_uses_saved_scale(self):
         runtime, pclient = training_runtime(
-            episode_burnin_steps=3,
             warmup_steps=0,
             normalizer_freeze_steps=1,
             exploration_noise_std=0.0,
+            exploration_noise_final_std=0.0,
         )
-        runtime.checkpoint_loaded = True
+        self._enable_test_stage2(runtime)
         timing = {
             "runtime/tensor_conversion_ms": 0.0,
             "runtime/host_to_device_ms": 0.0,
             "runtime/encoder_actor_ms": 0.0,
             "runtime/device_to_host_ms": 0.0,
         }
-        actions = {
-            0: 0.1, 1: 0.2, 2: 0.3, 3: 0.7, 4: 0.8,
-        }
+        stage1_actions = iter((0.1, 0.2, 0.3))
+        runtime._stage1_actor_inference = lambda *args, **kwargs: (
+            np.full(CONTROLLED_COUNT, next(stage1_actions), np.float32),
+            dict(timing),
+        )
         runtime._actor_inference = lambda *args, **kwargs: (
-            np.full(
-                CONTROLLED_COUNT,
-                actions[runtime.episode_steps],
-                dtype=np.float32,
-            ),
+            np.full(CONTROLLED_COUNT, 0.7, np.float32),
             dict(timing),
         )
 
-        for step in range(3):
-            runtime.Algorithm(pclient)
-            self.assertEqual(runtime.last_diagnostics["episode/step"], step)
-            self.assertEqual(runtime.last_diagnostics["burnin/active"], 1.0)
-            self.assertEqual(runtime.last_diagnostics["burnin/action_source"], 1.0)
-            self.assertEqual(runtime.last_diagnostics["action/exploration_noise_std"], 0.0)
-            self.assertEqual(runtime.replay_buffer.push_count, 0)
-            self.assertIsNone(runtime.transition_aligner.pending)
+        with patch(
+            "oht_routing.runtime.client.STAGE_TWO_STAGE1_POLICY_STEPS", 3
+        ):
+            for step in range(3):
+                runtime.Algorithm(pclient)
+                self.assertEqual(runtime.last_diagnostics["episode/step"], step)
+                self.assertEqual(runtime.last_diagnostics["stage1/active"], 1.0)
+                self.assertEqual(runtime.last_diagnostics["stage/active_policy"], 1.0)
+                self.assertEqual(
+                    runtime.last_diagnostics["action/exploration_noise_std"], 0.0
+                )
+                self.assertEqual(
+                    runtime.last_diagnostics["curriculum/action_scale"], 1.0
+                )
+                self.assertEqual(runtime.replay_buffer.push_count, 0)
+                self.assertEqual(runtime.learner.learner_update_count, 0)
+                self.assertIsNone(runtime.transition_aligner.pending)
 
-        reward_steps_before = runtime.reward_builder.reward_steps
-        last_burnin_applied = (
-            runtime.transition_aligner.previous_applied_action.copy()
-        )
-        runtime.Algorithm(pclient)
-        self.assertEqual(runtime.last_diagnostics["burnin/active"], 0.0)
-        self.assertEqual(runtime.replay_buffer.push_count, 0)
-        self.assertFalse(hasattr(runtime.reward_builder, "_tat_ema"))
-        self.assertEqual(
-            runtime.reward_builder.reward_steps, reward_steps_before + 1
-        )
-        np.testing.assert_array_equal(
-            runtime.transition_aligner.previous_applied_action,
-            last_burnin_applied,
-        )
-        np.testing.assert_array_equal(
-            runtime.transition_aligner.pending.controlled_action,
-            np.full((CONTROLLED_COUNT, 1), 0.7, dtype=np.float32),
-        )
-        runtime.Algorithm(pclient)
-        self.assertEqual(runtime.replay_buffer.push_count, 1)
-        decoded_policy = (
-            runtime.replay_buffer._policy_action[0].astype(np.float32)
-            / np.float32(ACTION_FIXED_POINT_SCALE)
-        )
-        np.testing.assert_allclose(
-            decoded_policy,
-            np.full(CONTROLLED_COUNT, 0.7, dtype=np.float32),
-            rtol=0,
-            atol=(
-                ACTION_FIXED_POINT_MAX_ABS_ERROR
-                + float(np.finfo(np.float32).eps)
+            reward_steps_before = runtime.reward_builder.reward_steps
+            last_stage1_applied = (
+                runtime.transition_aligner.previous_applied_action.copy()
+            )
+            episode_id_before_switch = runtime.episode_id
+            runtime.Algorithm(pclient)
+            self.assertEqual(runtime.episode_id, episode_id_before_switch)
+            self.assertEqual(runtime.episode_steps, 4)
+            self.assertEqual(runtime.last_diagnostics["stage2/active"], 1.0)
+            self.assertEqual(runtime.last_diagnostics["stage2/episode_step"], 0.0)
+            self.assertEqual(runtime.last_diagnostics["stage2/env_steps"], 1.0)
+            self.assertEqual(
+                runtime.last_diagnostics["curriculum/action_scale"], 0.05
+            )
+            self.assertEqual(pclient.sent_is_end, [0, 0, 0, 0])
+            self.assertEqual(runtime.replay_buffer.push_count, 0)
+            self.assertEqual(
+                runtime.reward_builder.reward_steps, reward_steps_before + 1
+            )
+            np.testing.assert_array_equal(
+                runtime.transition_aligner.previous_applied_action,
+                last_stage1_applied,
+            )
+            np.testing.assert_array_equal(
+                runtime.transition_aligner.pending.controlled_action,
+                np.full((CONTROLLED_COUNT, 1), 0.7, dtype=np.float32),
+            )
+
+            runtime.Algorithm(pclient)
+            self.assertEqual(runtime.replay_buffer.push_count, 1)
+            self.assertEqual(int(runtime.replay_buffer._env_step[0]), 3)
+            decoded_policy = (
+                runtime.replay_buffer._policy_action[0].astype(np.float32)
+                / np.float32(ACTION_FIXED_POINT_SCALE)
+            )
+            np.testing.assert_allclose(
+                decoded_policy,
+                np.full(CONTROLLED_COUNT, 0.7, dtype=np.float32),
+                rtol=0,
+                atol=(
+                    ACTION_FIXED_POINT_MAX_ABS_ERROR
+                    + float(np.finfo(np.float32).eps)
+                ),
+            )
+
+    def test_stage2_resume_requires_exact_policy_provenance_and_clocks(self):
+        metadata = self._valid_stage2_resume_metadata()
+        runtime = self._initialize_mock_stage2_resume(metadata)
+        self.assertEqual(runtime.total_steps, 4_000)
+        self.assertEqual(runtime.stage2_env_steps, 2_000)
+
+        bad_cases = (
+            ({**metadata, "stage": 1}, {}, "requires a Stage 2 checkpoint"),
+            (
+                {key: value for key, value in metadata.items()
+                 if key != "stage1_policy_sha256"},
+                {},
+                "missing Stage 1 policy SHA-256",
+            ),
+            (metadata, {"loaded_stage1_sha256": "other"}, "policy mismatch"),
+            (
+                {**metadata, "checkpoint_schedule_step": 1_999},
+                {},
+                "schedule clock mismatch",
+            ),
+            (
+                metadata,
+                {"shift_stage1_normalizer": True},
+                "normalizer mismatch",
             ),
         )
+        for changed_metadata, options, message in bad_cases:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(
+                    ContextualTrainingFailure, message
+                ):
+                    self._initialize_mock_stage2_resume(
+                        changed_metadata, **options
+                    )
 
-    def test_episode_burnin_untrained_fallback_skips_actor(self):
+    def test_stage2_switch_clears_stacked_stage1_frames(self):
         runtime, pclient = training_runtime(
-            episode_burnin_steps=3,
+            num_stacks=3,
+            stack_interval=1,
             warmup_steps=0,
             normalizer_freeze_steps=1,
+            exploration_noise_std=0.0,
+            exploration_noise_final_std=0.0,
         )
-        runtime._actor_inference = lambda *args, **kwargs: (
-            (_ for _ in ()).throw(AssertionError("untrained actor used"))
+        self._enable_test_stage2(runtime)
+        policy = np.full(CONTROLLED_COUNT, 0.25, np.float32)
+        timing = {
+            "runtime/tensor_conversion_ms": 0.0,
+            "runtime/host_to_device_ms": 0.0,
+            "runtime/encoder_actor_ms": 0.0,
+            "runtime/device_to_host_ms": 0.0,
+        }
+        stage2_frames = []
+        runtime._stage1_actor_inference = lambda *args, **kwargs: (
+            policy.copy(), dict(timing)
         )
-        baseline = np.asarray([
-            pclient.RAILLINE_DIC[int(rail_id)].DistancePerVelocity
-            for rail_id in runtime.topology.all_rail_ids
-        ])
-        for _ in range(3):
-            result = runtime.Algorithm(pclient)
-            np.testing.assert_array_equal(result.final_cost, baseline)
-            self.assertEqual(runtime.last_diagnostics["burnin/action_source"], 2.0)
-            self.assertEqual(runtime.learner.learner_update_count, 0)
-            self.assertEqual(runtime.replay_buffer.push_count, 0)
 
-    def test_episode_reset_preserves_replay_and_pauses_existing_learner(self):
+        def stage2_inference(frames, **kwargs):
+            stage2_frames.append(tuple(frames))
+            return policy.copy(), dict(timing)
+
+        runtime._actor_inference = stage2_inference
+        with patch(
+            "oht_routing.runtime.client.STAGE_TWO_STAGE1_POLICY_STEPS", 3
+        ):
+            for _ in range(4):
+                runtime.Algorithm(pclient)
+
+        self.assertEqual(runtime.observation_history.size, 1)
+        self.assertEqual(len(stage2_frames), 1)
+        self.assertEqual(len(stage2_frames[0]), 3)
+        self.assertTrue(all(
+            frame is stage2_frames[0][0] for frame in stage2_frames[0]
+        ))
+
+    def test_stage2_checkpoint_cadence_uses_stage2_environment_steps(self):
+        runtime, _ = training_runtime(
+            latest_checkpoint_interval=2,
+            periodic_checkpoint_interval=2,
+        )
+        self._enable_test_stage2(runtime)
+        saved_kinds = []
+        runtime._save_runtime_checkpoint = saved_kinds.append
+
+        runtime.total_steps = 2_000
+        runtime.stage2_env_steps = 0
+        runtime._maybe_checkpoint()
+        self.assertEqual(saved_kinds, [])
+
+        runtime.total_steps = 2_001
+        runtime.stage2_env_steps = 1
+        runtime._maybe_checkpoint()
+        self.assertEqual(saved_kinds, [])
+
+        runtime.total_steps = 2_002
+        runtime.stage2_env_steps = 2
+        runtime._maybe_checkpoint()
+        self.assertEqual(saved_kinds, ["latest", "periodic"])
+
+        runtime._maybe_checkpoint(schedule_advanced=False)
+        runtime._maybe_checkpoint(schedule_advanced=False)
+        self.assertEqual(saved_kinds, ["latest", "periodic"])
+
+    def test_stage2_periodic_name_and_metadata_use_separate_clocks(self):
+        runtime, _ = training_runtime(checkpoint_root="stage2-checkpoints")
+        self._enable_test_stage2(runtime)
+        runtime.total_steps = 4_000
+        runtime.stage2_env_steps = 2_000
+
+        with patch(
+            "oht_routing.runtime.client.save_contextual_checkpoint"
+        ) as save_checkpoint:
+            save_checkpoint.return_value = Path("saved.pt")
+            runtime._save_runtime_checkpoint("periodic")
+
+        target = save_checkpoint.call_args.args[0]
+        metadata = save_checkpoint.call_args.kwargs["runtime_metadata"]
+        self.assertEqual(target.name, "step_02000.pt")
+        self.assertEqual(metadata["checkpoint_schedule_step"], 2_000)
+        self.assertEqual(metadata["stage2_env_steps"], 2_000)
+        self.assertEqual(metadata["runtime_env_step"], 4_000)
+
+    def test_stage1_prefix_pauses_existing_stage2_learner_after_reset(self):
         runtime, pclient = training_runtime(
-            episode_burnin_steps=3,
             warmup_steps=0,
             normalizer_freeze_steps=1,
+            exploration_noise_std=0.0,
+            exploration_noise_final_std=0.0,
             minimum_replay_env_steps=1,
             minimum_action_enabled_env_steps=1,
         )
-        for _ in range(6):
-            runtime.Algorithm(pclient)
-        replay_size = runtime.replay_buffer.size_env_steps
-        replay_pushes = runtime.replay_buffer.push_count
-        updates = runtime.learner.learner_update_count
-        actor_updates = runtime.learner.actor_update_count
-        target_updates = runtime.learner.target_update_count
-        self.assertGreater(replay_size, 0)
-        self.assertGreater(updates, 0)
+        self._enable_test_stage2(runtime)
+        runtime.config = replace(
+            runtime.config,
+            latest_checkpoint_interval=4,
+            periodic_checkpoint_interval=4,
+        )
+        saved_kinds = []
+        runtime._save_runtime_checkpoint = saved_kinds.append
+        policy = np.full(CONTROLLED_COUNT, 0.25, np.float32)
+        timing = {
+            "runtime/tensor_conversion_ms": 0.0,
+            "runtime/host_to_device_ms": 0.0,
+            "runtime/encoder_actor_ms": 0.0,
+            "runtime/device_to_host_ms": 0.0,
+        }
+        runtime._stage1_actor_inference = lambda *args, **kwargs: (
+            policy.copy(), dict(timing)
+        )
+        runtime._actor_inference = lambda *args, **kwargs: (
+            policy.copy(), dict(timing)
+        )
 
-        runtime.Reset(pclient)
-        self.assertEqual(runtime.replay_buffer.size_env_steps, replay_size)
-        sample = runtime.replay_buffer.sample(1, device="cpu")
-        self.assertTrue(torch.isfinite(sample.reward).all())
-        for _ in range(3):
-            runtime.Algorithm(pclient)
-        self.assertEqual(runtime.replay_buffer.size_env_steps, replay_size)
-        self.assertEqual(runtime.replay_buffer.push_count, replay_pushes)
-        self.assertEqual(runtime.learner.learner_update_count, updates)
-        self.assertEqual(runtime.learner.actor_update_count, actor_updates)
-        self.assertEqual(runtime.learner.target_update_count, target_updates)
+        with patch(
+            "oht_routing.runtime.client.STAGE_TWO_STAGE1_POLICY_STEPS", 3
+        ):
+            for _ in range(7):
+                runtime.Algorithm(pclient)
+            replay_size = runtime.replay_buffer.size_env_steps
+            replay_pushes = runtime.replay_buffer.push_count
+            updates = runtime.learner.learner_update_count
+            self.assertGreater(replay_size, 0)
+            self.assertGreater(updates, 0)
+            self.assertEqual(saved_kinds, ["latest", "periodic"])
 
-    def test_zero_episode_burnin_is_exactly_disabled(self):
+            sample_calls = 0
+            original_sample = runtime.replay_buffer.sample
+
+            def counted_sample(*args, **kwargs):
+                nonlocal sample_calls
+                sample_calls += 1
+                return original_sample(*args, **kwargs)
+
+            runtime.replay_buffer.sample = counted_sample
+            exploration_state = copy.deepcopy(
+                runtime.exploration_rng.bit_generator.state
+            )
+
+            runtime.Reset(pclient)
+            for _ in range(3):
+                runtime.Algorithm(pclient)
+            self.assertEqual(runtime.replay_buffer.size_env_steps, replay_size)
+            self.assertEqual(runtime.replay_buffer.push_count, replay_pushes)
+            self.assertEqual(runtime.learner.learner_update_count, updates)
+            self.assertEqual(runtime.last_diagnostics["gate/open"], 0.0)
+            self.assertEqual(sample_calls, 0)
+            self.assertEqual(
+                runtime.exploration_rng.bit_generator.state,
+                exploration_state,
+            )
+            self.assertEqual(saved_kinds, ["latest", "periodic"])
+
+    def test_non_stage_training_starts_transition_immediately(self):
         runtime, pclient = training_runtime(
-            episode_burnin_steps=0,
             warmup_steps=0,
             normalizer_freeze_steps=1,
         )
         runtime.Algorithm(pclient)
-        self.assertEqual(runtime.last_diagnostics["burnin/active"], 0.0)
-        self.assertEqual(runtime.last_diagnostics["burnin/action_source"], 0.0)
+        self.assertEqual(runtime.last_diagnostics["stage1/active"], 0.0)
+        self.assertEqual(runtime.last_diagnostics["stage/id"], 0.0)
         self.assertIsNotNone(runtime.transition_aligner.pending)
 
     def test_global_warmup_skips_actor_until_action_boundary(self):
         runtime, pclient = training_runtime(
-            episode_burnin_steps=0,
             warmup_steps=2,
             normalizer_freeze_steps=1,
         )
@@ -1175,7 +1459,6 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
             action_scale=0.05,
             warmup_steps=2,
             terminate_on_warmup_complete=False,
-            episode_burnin_steps=0,
             normalizer_freeze_steps=2,
             device="cpu",
             seed=33,
@@ -1502,6 +1785,101 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
                 0.0,
             )
 
+    def test_resume_warmstart_discards_short_episode_then_trains(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime, pclient = training_runtime(
+                checkpoint_root=directory,
+                latest_checkpoint_interval=2,
+                periodic_checkpoint_interval=10_000,
+                warmup_steps=0,
+                normalizer_freeze_steps=1,
+            )
+            runtime.learner = ContextualTD7Learner(
+                runtime.replay_buffer,
+                network_config=ContextualNetworkConfig(),
+                config=ContextualLearnerConfig(
+                    action_scale=0.05,
+                    batch_size=16,
+                    minimum_replay_env_steps=1,
+                    minimum_action_enabled_env_steps=1,
+                    sale_enabled=False,
+                    lap_enabled=False,
+                ),
+                device="cpu",
+                seed=12,
+            )
+            runtime.encoder = runtime.learner.encoder
+            runtime.actor = runtime.learner.actor
+            runtime.Algorithm(pclient)
+            runtime.Algorithm(pclient)
+            latest = Path(directory) / "latest" / "checkpoint.pt"
+
+            resumed, resumed_client = training_runtime(
+                checkpoint_root=directory,
+                resume_checkpoint_path=str(latest),
+                resume_warmstart_steps=3,
+                latest_checkpoint_interval=10_000,
+                periodic_checkpoint_interval=10_000,
+                warmup_steps=0,
+                normalizer_freeze_steps=1,
+                minimum_replay_env_steps=1,
+                minimum_action_enabled_env_steps=1,
+            )
+            policy = np.full(CONTROLLED_COUNT, 0.25, np.float32)
+            resumed._actor_inference = lambda *args, **kwargs: (
+                policy.copy(),
+                {
+                    "runtime/tensor_conversion_ms": 0.0,
+                    "runtime/host_to_device_ms": 0.0,
+                    "runtime/encoder_actor_ms": 0.0,
+                    "runtime/device_to_host_ms": 0.0,
+                },
+            )
+            checkpoint_kinds = []
+            resumed._save_runtime_checkpoint = checkpoint_kinds.append
+            resumed_start_step = resumed.total_steps
+
+            self.assertTrue(resumed._resume_warmstart_episode_active)
+            for warmstart_step in range(3):
+                resumed.Algorithm(resumed_client)
+                self.assertEqual(resumed.replay_buffer.push_count, 0)
+                self.assertEqual(resumed.learner.learner_update_count, 0)
+                self.assertIsNone(resumed.transition_aligner.pending)
+                self.assertEqual(
+                    resumed.last_diagnostics["action/exploration_noise_std"],
+                    0.0,
+                )
+                self.assertEqual(
+                    resumed.last_diagnostics["resume_warmstart/active"],
+                    1.0,
+                )
+                self.assertEqual(
+                    resumed_client.sent_is_end[-1],
+                    int(warmstart_step == 2),
+                )
+
+            self.assertEqual(resumed.total_steps, resumed_start_step + 3)
+            self.assertEqual(
+                resumed.last_diagnostics["termination/by_resume_warmstart"],
+                1.0,
+            )
+            self.assertEqual(
+                resumed.last_diagnostics["env/termination_reason"], 5.0
+            )
+            self.assertEqual(checkpoint_kinds, ["latest"])
+
+            resumed.Reset(resumed_client)
+            self.assertFalse(resumed._resume_warmstart_episode_active)
+            resumed.Algorithm(resumed_client)
+            resumed.Algorithm(resumed_client)
+            self.assertEqual(resumed.replay_buffer.push_count, 1)
+            self.assertGreater(
+                resumed.last_diagnostics["action/exploration_noise_std"],
+                0.0,
+            )
+            resumed.Algorithm(resumed_client)
+            self.assertEqual(resumed.learner.learner_update_count, 1)
+
     def test_job_priority_uses_real_priority_field(self):
         runtime, pclient = training_runtime()
         pclient.JOB_DIC = {
@@ -1583,11 +1961,17 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
         self.assertEqual(set(WANDB_METRIC_KEYS), set(EXPORT_COLUMNS) - {"_step"})
         expected = {
             "env/step", "env/episode", "episode/step", "env/sim_time",
+            "stage/id", "stage/active_policy",
+            "stage1/active", "stage1/remaining_steps",
+            "stage1/applied_action_scale", "stage1/policy_frozen",
+            "stage2/active", "stage2/env_steps", "stage2/episode_step",
             "env/tat",
             "env/operation_rate", "env/queued", "env/waiting",
             "env/transferring", "env/completed", "oht/idle_count",
             "termination/done", "termination/by_queue",
             "termination/by_tat", "termination/by_warmup",
+            "termination/by_resume_warmstart",
+            "resume_warmstart/active", "resume_warmstart/remaining_steps",
             "warmup/episode_boundary_sent", "env/termination_reason",
             "action/policy_mean", "action/policy_std",
             "action/cross_rail_policy_std",
@@ -1765,6 +2149,19 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
         self.assertEqual(captured["config"]["EXP_META"], meta)
         self.assertEqual(captured["notes"], meta["description"])
         self.assertEqual(meta["version"], CONTEXTUAL_VERSION)
+        self.assertFalse(meta["use_attention"])
+        self.assertEqual(
+            meta["neighbor_aggregation"], "directional_flat_projection"
+        )
+        attention_meta = runtime_exp_meta(ContextualRuntimeConfig(
+            use_attention=True
+        ))
+        self.assertTrue(attention_meta["use_attention"])
+        self.assertEqual(
+            attention_meta["neighbor_aggregation"],
+            "directional_cross_attention",
+        )
+        self.assertNotEqual(meta["note"], attention_meta["note"])
         self.assertEqual(meta["reward_version"], "P")
         self.assertEqual(
             meta["tat_signal"],
@@ -1872,6 +2269,22 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
         )
         self.assertEqual(reused_meta["tat_termination_start_episode"], 1)
         self.assertIn("normreuse1", reused_meta["note"])
+        stage2_meta = runtime_exp_meta(ContextualRuntimeConfig(
+            mode="training",
+            action_enabled=True,
+            stage=2,
+            load_stage1_policy_path="stage1.pt",
+        ))
+        self.assertEqual(stage2_meta["stage"], 2)
+        self.assertEqual(stage2_meta["stage1_policy_prefix_steps"], 2_000)
+        self.assertEqual(
+            stage2_meta["stage2_contract"],
+            "per_episode_stage1_2000_then_stage2_to_45000",
+        )
+        self.assertEqual(
+            stage2_meta["stage2_checkpoint_clock"], "stage2_env_steps"
+        )
+        self.assertIn("stage2", stage2_meta["note"])
         full_refill_meta = runtime_exp_meta(ContextualRuntimeConfig(
             resume_checkpoint_path="checkpoint.pt",
             resume_inference_until_replay_full=True,
@@ -1896,6 +2309,14 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
             deterministic_meta["resume_deterministic_first_episode"]
         )
         self.assertIn("detfirst1", deterministic_meta["note"])
+        warmstart_meta = runtime_exp_meta(ContextualRuntimeConfig(
+            mode="training",
+            action_enabled=True,
+            resume_checkpoint_path="checkpoint.pt",
+            resume_warmstart_steps=100,
+        ))
+        self.assertEqual(warmstart_meta["resume_warmstart_steps"], 100)
+        self.assertIn("warmstart100", warmstart_meta["note"])
         logger.log({
             "env/step": 3.0,
             "lap/enabled": 1.0,

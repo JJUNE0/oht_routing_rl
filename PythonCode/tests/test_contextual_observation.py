@@ -748,7 +748,7 @@ class ContextualObservationTests(unittest.TestCase):
             second.critic_normalizer.count, first.critic_normalizer.count
         )
 
-    def test_v5_0_state_normalizer_remains_compatible_with_v5_1_runtime(self):
+    def test_v5_state_normalizer_remains_compatible_with_v6_runtime(self):
         first = self.builder(
             normalizer_config=ObservationNormalizerConfig(
                 freeze_after_env_steps=1

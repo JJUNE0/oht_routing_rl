@@ -388,8 +388,6 @@ class ContextualDispatchTests(unittest.TestCase):
         runtime.last_exploratory_action = object()
         runtime._last_sim_time = 1.0
         runtime._stale_sim_time_ticks = 1
-        runtime._burnin_last_applied_action = object()
-        runtime._burnin_previous_applied_action = object()
         runtime.transition_aligner = None
         runtime.reward_builder = None
         runtime.Reset(SimpleNamespace())

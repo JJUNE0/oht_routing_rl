@@ -370,7 +370,8 @@ class ContextualRewardBuilder(ContextualRailRewardMixin):
         # an unbounded linear penalty above it.
         tat_signal_available = cumulative_tat > 0.0
         tat_excess = (
-            max(0.0, cur_tat - TAT_PENALTY_START)
+            # max(0.0, cur_tat - TAT_PENALTY_START)
+            cur_tat - TAT_PENALTY_START
             if tat_signal_available else 0.0
         )
         tat_error = -tat_excess / cfg.tat_reference

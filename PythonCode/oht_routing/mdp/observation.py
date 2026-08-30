@@ -19,10 +19,24 @@ from oht_routing.mdp.topology import ContextualTopology, TOPOLOGY_VERSION
 from oht_routing.version import (
     CONTEXTUAL_VERSION,
     is_compatible_contextual_version,
+    parse_contextual_version,
 )
 
 
 OBSERVATION_VERSION = "v5"
+
+
+def _is_compatible_normalizer_version(saved_version: str) -> bool:
+    """Allow the unchanged V5 observation artifact across the V6 model break."""
+    if is_compatible_contextual_version(saved_version):
+        return True
+    try:
+        saved = parse_contextual_version(saved_version)
+        runtime = parse_contextual_version(CONTEXTUAL_VERSION)
+    except ValueError:
+        return False
+    return saved[0] == 5 and runtime[0] == 6
+
 
 LOCAL_PHYSICAL_FEATURE_NAMES = (
     "free_flow_time_s",
@@ -997,7 +1011,7 @@ class ContextualObservationBuilder:
         try:
             with np.load(source, allow_pickle=False) as saved:
                 saved_version = str(saved["version"].item())
-                if not is_compatible_contextual_version(saved_version):
+                if not _is_compatible_normalizer_version(saved_version):
                     raise ObservationContractError(
                         "saved state normalizer version mismatch: "
                         f"saved={saved_version!r}, current={CONTEXTUAL_VERSION!r}"

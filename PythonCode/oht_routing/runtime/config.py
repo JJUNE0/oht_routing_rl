@@ -43,18 +43,24 @@ RESUME_LAUNCH_CONTROL_FIELDS = {
     "reward_diagnostic_windows",
     "wandb_enabled",
     "console_log_interval",
+    "stage",
     "sim_end_time",
     "save_data_enabled",
     "dispatch_mode",
     "batch_size",
     "replay_capacity_env_steps",
+    "periodic_checkpoint_interval",
     "lap_enabled",
+    "use_attention",
     "resume_inference_until_replay_full",
     "resume_deterministic_first_episode",
+    "resume_warmstart_steps",
+    "load_stage1_policy_path",
 }
 _PATH_CONFIG_FIELDS = {
     "load_state_normalizer_path",
     "save_state_normalizer_path",
+    "load_stage1_policy_path",
 }
 
 
@@ -63,6 +69,7 @@ class ContextualRuntimeConfig:
     """Canonical runtime defaults; CLI values are explicit overrides only."""
 
     mode: str = "baseline_only"
+    stage: int | None = None
     action_enabled: bool = False
     reward_version: str = REWARD_VERSION
     action_mode: str = REGION_B_RL
@@ -75,7 +82,6 @@ class ContextualRuntimeConfig:
     curriculum_shape: str = "geometric"
     warmup_steps: int = 10_000
     terminate_on_warmup_complete: bool = True
-    episode_burnin_steps: int = 0
     normalizer_freeze_steps: int = 10_000
     load_state_normalizer_path: str | None = None
     save_state_normalizer_path: str | None = None
@@ -101,8 +107,10 @@ class ContextualRuntimeConfig:
     periodic_checkpoint_interval: int = 5_000
     checkpoint_root: str | None = None
     resume_checkpoint_path: str | None = None
+    load_stage1_policy_path: str | None = None
     resume_inference_until_replay_full: bool = False
     resume_deterministic_first_episode: bool = False
+    resume_warmstart_steps: int = 0
     rail_tat_diagnostic_path: str | None = None
     rail_tat_diagnostic_max_step: int = 1_000
     # None means the canonical mode-aware default: enabled for training and
@@ -115,6 +123,7 @@ class ContextualRuntimeConfig:
     save_data_enabled: bool = False
     sale_enabled: bool = True
     lap_enabled: bool = True
+    use_attention: bool = False
     critic_loss_mode: str = "auto"
     early_stop_queued_threshold: float = 500.0
     tat_termination_policy: str = TAT_TERMINATION_REWARD_PROFILE
@@ -135,6 +144,7 @@ class ContextualRuntimeConfig:
             0
             if self.state_normalizer_warmup_bypass
             or self.load_state_normalizer_path is not None
+            or self.load_stage1_policy_path is not None
             else int(self.warmup_steps)
         )
 

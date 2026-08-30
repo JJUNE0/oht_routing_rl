@@ -355,8 +355,10 @@ class ContextualNetworkTests(unittest.TestCase):
 
     def test_dropout_zero_forward_is_deterministic(self):
         inputs = make_inputs(4)
-        first = self.encoder(*inputs, return_attention=True)
-        second = self.encoder(*inputs, return_attention=True)
+        config = ContextualNetworkConfig(use_attention=True)
+        encoder = DirectionalContextEncoder(config)
+        first = encoder(*inputs, return_attention=True)
+        second = encoder(*inputs, return_attention=True)
         torch.testing.assert_close(first.state, second.state)
         torch.testing.assert_close(
             first.incoming_attention, second.incoming_attention

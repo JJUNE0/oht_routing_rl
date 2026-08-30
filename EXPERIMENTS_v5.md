@@ -172,3 +172,54 @@ This is a checkpoint-compatible MINOR release. It does not change the model,
 observation, action, reward, normalizer, replay, or checkpoint schema. V5.0
 artifacts remain compatible with the v5.1 runtime under the existing same-major
 and not-newer artifact rule.
+
+## v5.2.0 — Resume-controlled periodic checkpoint interval
+
+### Purpose
+
+Expose `--periodic-checkpoint-interval N` so a training launch can choose the
+immutable periodic checkpoint cadence without editing runtime defaults. An
+explicit value is launch-controlled during resume and is therefore not
+overwritten by the interval stored in the source checkpoint's runtime config.
+The startup summary prints the effective interval.
+
+The default remains 5,000 global environment steps. The separate rolling
+`latest/checkpoint.pt` cadence remains 1,000 steps and is unchanged. Resuming
+from an earlier step should use a new `--checkpoint-root` to avoid overwriting
+later periodic artifacts already present in the source run directory.
+
+### Compatibility
+
+This is a checkpoint-compatible MINOR release. It changes no model,
+observation, action, reward, normalizer, replay, optimizer, or checkpoint
+schema. V5.0 and V5.1 artifacts remain loadable under the same-major and
+not-newer artifact rule.
+
+## v5.3.0 — Short discarded resume warm-start episode
+
+### Purpose
+
+Add `--resume-warmstart-steps N` for checkpoint-resumed training. The restored
+deterministic actor controls the first short simulator episode with exploration,
+replay insertion, and learner updates disabled. On the Nth active tick the
+runtime requests episode termination. The following reset starts ordinary
+resume replay refill and training from clean episode-local temporal state.
+
+This targets simulator process-start transients without spending an entire
+2,000-tick Stage 1 episode or contaminating replay. It is distinct from
+`--episode-burnin-steps`, which applies to every episode and continues the same
+episode, and from `--resume-deterministic-first-episode`, which retains the
+whole first episode in replay. The two resume-first-episode controls are
+mutually exclusive. The default is zero, so existing launches are unchanged.
+
+The compact W&B/export schema adds `resume_warmstart/active`,
+`resume_warmstart/remaining_steps`, and
+`termination/by_resume_warmstart`; experiment metadata records the selected
+warm-start length.
+
+### Compatibility
+
+This is a checkpoint-compatible MINOR release. It changes no model,
+observation, action, reward, normalizer, replay, optimizer, or checkpoint
+schema. V5.0, V5.1, and V5.2 artifacts remain loadable under the same-major and
+not-newer artifact rule.

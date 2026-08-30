@@ -138,12 +138,24 @@ class DirectionalContextEncoder(nn.Module):
         self.neighbor_encoder = FeatureEncoder(
             cfg.neighbor_token_dim, cfg.d_model
         )
-        self.incoming_attention = DirectionalCrossAttention(
-            cfg.d_model, cfg.num_heads, cfg.dropout
-        )
-        self.outgoing_attention = DirectionalCrossAttention(
-            cfg.d_model, cfg.num_heads, cfg.dropout
-        )
+        if cfg.use_attention:
+            self.incoming_attention = DirectionalCrossAttention(
+                cfg.d_model, cfg.num_heads, cfg.dropout
+            )
+            self.outgoing_attention = DirectionalCrossAttention(
+                cfg.d_model, cfg.num_heads, cfg.dropout
+            )
+            self.incoming_flat_encoder = None
+            self.outgoing_flat_encoder = None
+        else:
+            self.incoming_attention = None
+            self.outgoing_attention = None
+            self.incoming_flat_encoder = FeatureEncoder(
+                cfg.flat_direction_input_dim, cfg.d_model
+            )
+            self.outgoing_flat_encoder = FeatureEncoder(
+                cfg.flat_direction_input_dim, cfg.d_model
+            )
         self.global_encoder = FeatureEncoder(
             cfg.global_dim, cfg.global_emb_dim
         )
@@ -241,16 +253,42 @@ class DirectionalContextEncoder(nn.Module):
         )
         incoming_neighbor_embedding = self.neighbor_encoder(incoming_tokens)
         outgoing_neighbor_embedding = self.neighbor_encoder(outgoing_tokens)
-        incoming_context, incoming_weights = self.incoming_attention(
-            center_embedding,
-            incoming_neighbor_embedding,
-            return_attention=return_attention,
-        )
-        outgoing_context, outgoing_weights = self.outgoing_attention(
-            center_embedding,
-            outgoing_neighbor_embedding,
-            return_attention=return_attention,
-        )
+        if cfg.use_attention:
+            if (
+                self.incoming_attention is None
+                or self.outgoing_attention is None
+            ):
+                raise ContextualNetworkError("attention modules are absent")
+            incoming_context, incoming_weights = self.incoming_attention(
+                center_embedding,
+                incoming_neighbor_embedding,
+                return_attention=return_attention,
+            )
+            outgoing_context, outgoing_weights = self.outgoing_attention(
+                center_embedding,
+                outgoing_neighbor_embedding,
+                return_attention=return_attention,
+            )
+        else:
+            if return_attention:
+                raise ValueError(
+                    "return_attention=True requires use_attention=True"
+                )
+            if (
+                self.incoming_flat_encoder is None
+                or self.outgoing_flat_encoder is None
+            ):
+                raise ContextualNetworkError(
+                    "flat directional encoders are absent"
+                )
+            incoming_context = self.incoming_flat_encoder(
+                incoming_neighbor_embedding.flatten(start_dim=1)
+            )
+            outgoing_context = self.outgoing_flat_encoder(
+                outgoing_neighbor_embedding.flatten(start_dim=1)
+            )
+            incoming_weights = None
+            outgoing_weights = None
         global_embedding = self.global_encoder(global_state)
         state = self.fusion(
             torch.cat(
@@ -272,7 +310,7 @@ class DirectionalContextEncoder(nn.Module):
         )
         for name, value in outputs:
             _require_finite(name, value)
-        if return_attention:
+        if cfg.use_attention and return_attention:
             if incoming_weights is None or outgoing_weights is None:
                 raise ContextualNetworkError("attention weights were requested but absent")
             _require_finite("incoming_attention", incoming_weights)

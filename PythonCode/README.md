@@ -1,4 +1,4 @@
-# Contextual TD7 v5 for OHT routing
+# Contextual TD7 v6 for OHT routing
 
 ## Checkpoint actor evaluation
 
@@ -61,10 +61,79 @@ python .\PythonCode\main.py `
   --stage 1
 ```
 
-`--stage 1`은 `sim_end_time=2000`만 설정하며 `--sim-end-time`과 함께 사용할
-수 없습니다. Resume에서도 명시한 `--stage 1`은 2,000을 유지합니다. 두 옵션을
-모두 생략하면 현재 runtime 기본값 45,000이 적용되며 checkpoint에 저장된 종료
-시간은 복원하지 않습니다.
+## V6 neighbor aggregation
+
+V6 keeps the learned rail embedding and the existing shared center, neighbor,
+and global feature encoders. By default, each direction's 15 encoded neighbor
+tokens are flattened in deterministic topology-rank order and projected to one
+64-dimensional context. No attention module is created or trained.
+
+```powershell
+# Default: rail embedding + directional flat projection, no attention
+python .\PythonCode\main.py `
+  --mode training `
+  --action-enabled `
+  --stage 1 `
+  --periodic-checkpoint-interval 2000 `
+  --checkpoint-root .\checkpoints\ctx_td7_v6_flat
+
+# Opt-in: the previous directional cross-attention aggregation
+python .\PythonCode\main.py `
+  --mode training `
+  --action-enabled `
+  --stage 1 `
+  --use-attention `
+  --periodic-checkpoint-interval 2000 `
+  --checkpoint-root .\checkpoints\ctx_td7_v6_attention
+```
+
+The encoder mode is part of the checkpoint network contract. Add
+`--use-attention` whenever loading a V6 attention checkpoint; omit it for a V6
+flat checkpoint. V5 model checkpoints cannot be resumed by V6. Frozen V5 state
+normalizer snapshots remain reusable when their exact observation, topology,
+mapping, and normalization contracts match.
+
+`--stage 1`은 `sim_end_time=2000`인 단기 학습 계약입니다. `--stage 2`는
+`sim_end_time=45000`으로 실행되며, 매 episode의 첫 2,000 tick에는 별도로
+불러온 frozen Stage 1 policy를 사용하고 2,001번째 tick부터 Stage 2 policy를
+사용합니다. `--stage`와 `--sim-end-time`은 함께 사용할 수 없습니다. 두 옵션을
+모두 생략하면 runtime 기본값 45,000이 적용되며 checkpoint에 저장된 종료 시간은
+복원하지 않습니다.
+
+## Stage 2 frozen-prefix 학습
+
+V6 flat Stage 1 checkpoint에서 새 Stage 2 learner를 시작하는 예시는 다음과
+같습니다.
+
+```powershell
+python .\PythonCode\main.py `
+  --mode training `
+  --action-enabled `
+  --stage 2 `
+  --load_stage1_policy ".\checkpoints\ctx_td7_v6_flat\periodic\step_34000.pt" `
+  --periodic-checkpoint-interval 2000 `
+  --checkpoint-root ".\checkpoints\ctx_td7_v6_stage2_from_s1_34000"
+```
+
+`--load_stage1_policy`와 `--load-stage1-policy`는 같은 옵션입니다. 이 로드는
+Stage 1 checkpoint의 online encoder, actor, frozen SALE state encoder,
+frozen observation normalizer, 저장 당시 applied-action scale만 복원합니다.
+Stage 1 critic, target network, optimizer, replay, update counter, reward state,
+Python/NumPy/Torch RNG는 Stage 2 learner에 복원하지 않습니다.
+
+각 episode에서 1~2,000번째 tick은 Stage 1 deterministic policy만 실행합니다.
+이 구간에는 exploration, transition staging/replay insertion, learner sampling,
+learner update가 모두 없습니다. 2,001번째 tick에서 reset 없이 Stage 2 policy로
+전환하고, 그 action의 첫 transition은 다음 observation이 들어오는 2,002번째
+tick에 replay에 저장됩니다. Stage 1 policy module은 `eval()` 상태이며 모든
+parameter가 `requires_grad=False`인 Stage 2 learner와 완전히 분리된 복사본입니다.
+
+Stage 2의 curriculum, exploration annealing, learner cadence, latest/periodic
+checkpoint cadence는 누적 Stage 2 tick을 0부터 세어 진행합니다. 따라서 위
+명령의 첫 periodic artifact는 Stage 2가 실제로 2,000 tick 진행된 뒤
+`periodic/step_02000.pt`로 저장됩니다. 전체 simulator tick은 checkpoint
+metadata의 `runtime_env_step`, Stage 2 tick은 `stage2_env_steps`에 각각
+기록됩니다.
 
 `--reward-version`은 체크포인트/실행 계약을 명시하기 위한 호환 옵션이며
 `P`만 허용합니다. simulator GUI에서 Python 연동을 활성화한 뒤 Run을
@@ -227,23 +296,70 @@ LAP 사용 계약으로 저장됐다면 호환성 검사에서 명시적으로 �
 
 ## Checkpoint와 resume
 
-통합 runtime/checkpoint 버전은 `v5.1.0`입니다. 같은 major의 이전
+통합 runtime/checkpoint 버전은 `v6.1.0`입니다. 같은 major의 이전
 버전 artifact만 현재 runtime보다 새 버전이 아닌 경우 호환될 수 있습니다.
 checkpoint 로드는
 통합 버전, topology/mapping hash, network config, action mode,
 SALE/LAP 사용 여부, Reward P만 호환성으로 검사합니다. replay payload는
 저장하지 않으므로 training resume 후에는 replay를 다시 채워야 합니다.
-V5는 compact asymmetric observation과 Reward P의 one-sided cumulative
-TotalTat penalty를 함께 도입한 breaking version입니다. 기존 v2/v3/v4
-checkpoint, replay, normalizer는 거부됩니다.
+V6는 neighbor aggregation의 기본값을 attention에서 flat projection으로
+바꾼 breaking version입니다. V5 model checkpoint는 V6에서 거부되지만,
+observation 계약이 동일한 standalone frozen V5 state normalizer는 모든
+feature/topology/mapping 검사를 통과하면 재사용할 수 있습니다.
 
 ```powershell
 python .\PythonCode\main.py `
   --mode training `
   --action-enabled `
-  --resume-checkpoint .\PythonCode\checkpoints\ctx_td7_reward_p\step_220000.pt `
+  --resume-checkpoint .\PythonCode\checkpoints\ctx_td7_v6_flat\step_220000.pt `
   --resume-deterministic-first-episode
 ```
+
+immutable periodic checkpoint의 기본 저장 주기는 5,000 global environment
+step입니다. Resume 실행에서 주기를 바꾸려면
+`--periodic-checkpoint-interval`을 명시합니다. 예를 들어 V6 flat
+40,000-step checkpoint에서 재학습하며 2,000 step마다 별도 저장하려면
+다음처럼 새 checkpoint root를 사용합니다.
+
+단, `--stage 2`에서는 frozen Stage 1 prefix를 제외한 누적
+`stage2_env_steps`가 latest/periodic 저장 주기와 periodic 파일명의 기준입니다.
+
+```powershell
+python .\PythonCode\main.py `
+  --mode training `
+  --action-enabled `
+  --stage 1 `
+  --resume-warmstart-steps 100 `
+  --periodic-checkpoint-interval 2000 `
+  --checkpoint-root .\checkpoints\ctx_td7_v6_flat_resume40k_warm100_p2000 `
+  --resume-checkpoint .\checkpoints\ctx_td7_v6_flat\periodic\step_40000.pt
+```
+
+Attention으로 저장한 V6 checkpoint를 resume할 때는 위 명령에
+`--use-attention`을 반드시 추가합니다. 기존 V5 `step_40000.pt`는 V6
+flat/attention 어느 쪽으로도 resume할 수 없습니다.
+
+이 경우 resume 직후 100 tick은 복원한 deterministic actor로
+시뮬레이터만 진행합니다. Exploration, replay insertion, learner
+update를 모두 끄고 100번째 tick에 episode 종료를 요청합니다.
+다음 reset episode부터 정상 resume 학습을 시작합니다. Global step은
+이 throwaway tick도 환경 step으로 계속 카운트하므로 periodic artifact는
+`step_42000.pt`, `step_44000.pt`, ...로
+저장됩니다. `latest/checkpoint.pt`는 기존대로 1,000 step마다 같은 파일을
+교체하며, 원본 실행 폴더를 `--checkpoint-root`로 재사용하면 이미 존재하는
+후속 periodic checkpoint를 덮어쓸 수 있으므로 별도 root를 권장합니다.
+
+Resume 시작 구간 제어의 차이는 다음과 같습니다.
+
+- `--resume-warmstart-steps N`: resume 직후 첫 짧은 episode를 N
+  tick에 종료하고 그 구간을 replay에서 완전히 제외합니다.
+- `--resume-deterministic-first-episode`: 첫 episode 전체의 exploration과
+  learner update를 끄지만 transition은 replay에 보존합니다.
+
+`--resume-warmstart-steps`와 `--resume-deterministic-first-episode`는 의미가
+겹치므로 동시에 사용할 수 없습니다.
+Stage 2의 매-episode frozen Stage 1 prefix와도 역할이 겹치므로
+`--resume-warmstart-steps`는 `--stage 2`와 함께 사용할 수 없습니다.
 
 `--resume-deterministic-first-episode`는 첫 resume episode에서 actor
 exploration과 learner update를 끄고 transition만 수집한 뒤, 다음
@@ -264,7 +380,7 @@ PyTorch가 memory-efficient attention backward의 비결정적 CUDA 경로를
 `wandb.init`은 runtime config와 `EXP_META`를 함께 기록하고
 `EXP_META["description"]`을 notes로 전달합니다.
 
-현재 v5 변경과 실험 결과는 루트의 `EXPERIMENTS_v5.md`에
+현재 v6 변경과 실험 결과는 루트의 `EXPERIMENTS_v6.md`에
 기록합니다. 모든 변경은 `oht_routing/version.py`의 단일
 `vMAJOR.MINOR.PATCH` 버전으로 분리하고 호환성 영향을 함께 기록합니다.
 MAJOR가 바뀌면 루트에 `EXPERIMENTS_v{new_major}.md`를 새로 만들고,

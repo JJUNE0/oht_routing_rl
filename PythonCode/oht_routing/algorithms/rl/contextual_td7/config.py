@@ -7,10 +7,10 @@ from .stacking import validate_stack_config
 
 def contextual_algorithm_variant(sale_enabled: bool, lap_enabled: bool) -> str:
     return {
-        (True, True): "contextual_td7_sale_lap_v5_compact_critic_tat",
-        (False, True): "contextual_td7_no_sale_lap_v5_compact_critic_tat",
-        (True, False): "contextual_td7_sale_uniform_v5_compact_critic_tat",
-        (False, False): "contextual_twin_delayed_uniform_v5_compact_critic_tat",
+        (True, True): "contextual_td7_sale_lap_v6_compact_critic_tat",
+        (False, True): "contextual_td7_no_sale_lap_v6_compact_critic_tat",
+        (True, False): "contextual_td7_sale_uniform_v6_compact_critic_tat",
+        (False, False): "contextual_twin_delayed_uniform_v6_compact_critic_tat",
     }[(bool(sale_enabled), bool(lap_enabled))]
 
 
@@ -26,6 +26,7 @@ class ContextualNetworkConfig:
     d_model: int = 64
     num_heads: int = 4
     attention_layers: int = 1
+    use_attention: bool = False
     global_emb_dim: int = 32
     context_dim: int = 128
     hidden_dim: int = 256
@@ -58,6 +59,8 @@ class ContextualNetworkConfig:
             raise ValueError("d_model must be divisible by num_heads")
         if self.attention_layers != 1:
             raise ValueError("contextual network v1 requires attention_layers=1")
+        if not isinstance(self.use_attention, bool):
+            raise TypeError("use_attention must be bool")
         if not 0.0 <= float(self.dropout) < 1.0:
             raise ValueError("dropout must be in [0, 1)")
         validate_stack_config(self.num_stacks, self.stack_interval)
@@ -73,6 +76,10 @@ class ContextualNetworkConfig:
     @property
     def fusion_input_dim(self) -> int:
         return self.d_model * 3 + self.global_emb_dim
+
+    @property
+    def flat_direction_input_dim(self) -> int:
+        return self.neighbor_count * self.d_model
 
     @property
     def stacked_context_dim(self) -> int:

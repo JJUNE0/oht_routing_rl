@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 
 
-DEFAULT_PORT = 9100
+DEFAULT_PORT = 9101
 
 
 def read_port(path="wpconfig.json"):

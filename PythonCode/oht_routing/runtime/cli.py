@@ -14,23 +14,21 @@ from oht_routing.algorithms.rl.contextual_td7 import (
     REPLAY_SAMPLING_RAIL,
     REPLAY_SAMPLING_SNAPSHOT,
 )
+from oht_routing.runtime.stages import VALID_STAGES
 
 
-STAGE_ONE_SIM_END_TIME = 2_000
-
-
-def _stage_to_sim_end_time(value: str) -> int:
+def _parse_stage(value: str) -> int:
     try:
         stage = int(value)
     except (TypeError, ValueError) as error:
         raise argparse.ArgumentTypeError(
-            "--stage must be the integer 1"
+            f"--stage must be one of {VALID_STAGES}"
         ) from error
-    if stage != 1:
+    if stage not in VALID_STAGES:
         raise argparse.ArgumentTypeError(
-            "only --stage 1 is supported"
+            f"--stage must be one of {VALID_STAGES}"
         )
-    return STAGE_ONE_SIM_END_TIME
+    return stage
 
 
 def parse_args():
@@ -109,7 +107,6 @@ def parse_args():
             "so policy control starts from a clean next episode."
         ),
     )
-    parser.add_argument("--episode-burnin-steps", type=int)
     parser.add_argument("--normalizer-freeze-steps", type=int)
     parser.add_argument(
         "--load-state-normalizer",
@@ -220,6 +217,14 @@ def parse_args():
         action=argparse.BooleanOptionalAction,
     )
     parser.add_argument(
+        "--use-attention",
+        action="store_true",
+        help=(
+            "Use directional cross-attention. The default encoder keeps rail "
+            "embeddings but flattens the 15 encoded neighbors per direction."
+        ),
+    )
+    parser.add_argument(
         "--critic-loss-mode", choices=("auto", "huber", "mse")
     )
     parser.add_argument("--wandb-log-interval", type=int)
@@ -228,7 +233,29 @@ def parse_args():
     parser.add_argument("--max-stale-sim-time-ticks", type=int)
     parser.add_argument("--checkpoint-root")
     parser.add_argument(
+        "--periodic-checkpoint-interval",
+        type=int,
+        help=(
+            "Save an immutable periodic checkpoint every N environment "
+            "steps. Stage 2 uses learner-active stage2_env_steps; other "
+            "runs use global environment steps. An explicit value remains "
+            "launch-controlled when resuming from a checkpoint."
+        ),
+    )
+    parser.add_argument(
         "--resume-checkpoint", dest="resume_checkpoint_path"
+    )
+    parser.add_argument(
+        "--load-stage1-policy",
+        "--load_stage1_policy",
+        dest="load_stage1_policy_path",
+        type=Path,
+        help=(
+            "Stage 2 only: load the frozen Stage 1 encoder, actor, SALE "
+            "state encoder, observation normalizers, and saved applied-action "
+            "scale without restoring its critic, optimizers, replay, counters, "
+            "reward state, or RNG state."
+        ),
     )
     parser.add_argument(
         "--resume-inference-until-replay-full",
@@ -252,6 +279,16 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--resume-warmstart-steps",
+        type=int,
+        help=(
+            "After checkpoint resume in training mode, run N deterministic "
+            "throwaway environment ticks with no replay insertion, "
+            "exploration, or learner updates, then request an episode reset. "
+            "Ordinary resumed training begins in the next episode."
+        ),
+    )
+    parser.add_argument(
         "--rail-tat-diagnostic",
         dest="rail_tat_diagnostic_path",
         help=(
@@ -269,13 +306,11 @@ def parse_args():
     episode_length = parser.add_mutually_exclusive_group()
     episode_length.add_argument(
         "--stage",
-        dest="sim_end_time",
-        type=_stage_to_sim_end_time,
-        metavar="1",
+        type=_parse_stage,
+        metavar="{1,2}",
         help=(
-            "Run the Stage 1 short-episode policy contract; equivalent to "
-            "--sim-end-time 2000. Normalizer and learning behavior are "
-            "otherwise unchanged."
+            "Select the fixed simulator contract: Stage 1 ends at 2000; "
+            "Stage 2 ends at 45000 and requires --load-stage1-policy."
         ),
     )
     episode_length.add_argument(

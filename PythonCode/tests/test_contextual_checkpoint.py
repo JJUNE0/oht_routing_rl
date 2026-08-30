@@ -1,3 +1,5 @@
+import copy
+import random
 import tempfile
 import unittest
 from dataclasses import replace
@@ -15,6 +17,7 @@ from oht_routing.algorithms.rl.contextual_td7 import (
 from oht_routing.algorithms.rl.contextual_td7.checkpoint import (
     PROMOTED_CHECKPOINTS,
     ContextualCheckpointError,
+    load_frozen_contextual_policy,
     load_contextual_checkpoint,
     read_contextual_runtime_config,
     save_contextual_checkpoint,
@@ -61,6 +64,7 @@ def components(
     lap=False,
     reward_version=REWARD_VERSION,
     batch_size=16,
+    use_attention=False,
 ):
     topology = make_topology()
     builder = CheckpointObservationBuilder(topology)
@@ -102,13 +106,243 @@ def components(
         sale_feature_dim=16,
     )
     learner = ContextualTD7Learner(
-        replay, network_config=SMALL_NETWORK, config=config,
+        replay,
+        network_config=replace(
+            SMALL_NETWORK, use_attention=bool(use_attention)
+        ),
+        config=config,
         device="cpu", seed=seed,
     )
     return learner, builder, reward_builder
 
 
 class ContextualCheckpointTests(unittest.TestCase):
+    def test_v6_0_stage1_policy_is_accepted_by_v6_1_runtime(self):
+        source, source_obs, reward = components(seed=17, sale=True)
+        source.set_applied_action_scale(1.0)
+        with tempfile.TemporaryDirectory() as directory:
+            path = save_contextual_checkpoint(
+                Path(directory) / "stage1_v6_0.pt",
+                source,
+                observation_builder=source_obs,
+                reward_builder=reward,
+            )
+            payload = torch.load(path, weights_only=False)
+            payload["version"] = "v6.0.0"
+            torch.save(payload, path)
+
+            stage2, stage2_obs, _ = components(seed=99, sale=True)
+            frozen = load_frozen_contextual_policy(
+                path,
+                stage2,
+                observation_builder=stage2_obs,
+                expected_reward_version=REWARD_VERSION,
+            )
+            self.assertEqual(frozen.applied_action_scale, 1.0)
+            for key, expected in source.actor.state_dict().items():
+                torch.testing.assert_close(
+                    frozen.actor.state_dict()[key], expected, rtol=0, atol=0
+                )
+
+    def test_stage1_policy_only_load_is_frozen_and_does_not_mutate_stage2(self):
+        source, source_obs, reward = components(seed=17, sale=True)
+        source.set_applied_action_scale(0.73)
+        source_obs.local_normalizer = RunningFeatureNormalizer(
+            LOCAL_PHYSICAL_DIM
+        )
+        source_obs.global_normalizer = RunningFeatureNormalizer(GLOBAL_DIM)
+        source_obs.critic_normalizer = RunningFeatureNormalizer(
+            CRITIC_EXTRA_DIM
+        )
+        source_obs.local_normalizer.update(
+            np.full((3, LOCAL_PHYSICAL_DIM), 2.0), name="stage1_local"
+        )
+        source_obs.global_normalizer.update(
+            np.full((3, GLOBAL_DIM), 3.0), name="stage1_global"
+        )
+        source_obs.critic_normalizer.update(
+            np.full((3, CRITIC_EXTRA_DIM), 4.0), name="stage1_critic"
+        )
+        for normalizer in (
+            source_obs.local_normalizer,
+            source_obs.global_normalizer,
+            source_obs.critic_normalizer,
+        ):
+            normalizer.freeze()
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = save_contextual_checkpoint(
+                Path(directory) / "stage1.pt",
+                source,
+                observation_builder=source_obs,
+                reward_builder=reward,
+                runtime_metadata={"runtime_env_step": 34_000},
+            )
+            stage2, stage2_obs, _ = components(seed=99, sale=True)
+            stage2_modules_before = {
+                name: {
+                    key: value.detach().clone()
+                    for key, value in module.state_dict().items()
+                }
+                for name, module in (
+                    ("encoder", stage2.encoder),
+                    ("actor", stage2.actor),
+                    ("critic", stage2.critic),
+                )
+            }
+            optimizer_before = {
+                "encoder": copy.deepcopy(stage2.encoder_optimizer.state_dict()),
+                "actor": copy.deepcopy(stage2.actor_optimizer.state_dict()),
+                "critic": copy.deepcopy(stage2.critic_optimizer.state_dict()),
+            }
+            replay_rng_before = copy.deepcopy(
+                stage2.replay.rng.bit_generator.state
+            )
+            python_rng_before = random.getstate()
+            numpy_rng_before = np.random.get_state()
+            torch_rng_before = torch.get_rng_state().clone()
+
+            frozen = load_frozen_contextual_policy(
+                path,
+                stage2,
+                observation_builder=stage2_obs,
+                expected_reward_version=REWARD_VERSION,
+            )
+
+            self.assertEqual(frozen.applied_action_scale, 0.73)
+            self.assertEqual(frozen.runtime_metadata["runtime_env_step"], 34_000)
+            self.assertFalse(frozen.encoder.training)
+            self.assertFalse(frozen.actor.training)
+            self.assertFalse(frozen.sale_fixed.training)
+            self.assertTrue(all(
+                not parameter.requires_grad
+                for module in (
+                    frozen.encoder, frozen.actor, frozen.sale_fixed
+                )
+                for parameter in module.parameters()
+            ))
+            for frozen_module, source_module in (
+                (frozen.encoder, source.encoder),
+                (frozen.actor, source.actor),
+                (frozen.sale_fixed, source.sale_fixed),
+            ):
+                for key, expected in source_module.state_dict().items():
+                    torch.testing.assert_close(
+                        frozen_module.state_dict()[key], expected,
+                        rtol=0, atol=0,
+                    )
+
+            frozen_ids = {
+                id(parameter)
+                for module in (
+                    frozen.encoder, frozen.actor, frozen.sale_fixed
+                )
+                for parameter in module.parameters()
+            }
+            stage2_ids = {
+                id(parameter)
+                for module in (
+                    stage2.encoder, stage2.actor, stage2.sale_fixed
+                )
+                for parameter in module.parameters()
+            }
+            self.assertFalse(frozen_ids & stage2_ids)
+            for name, module in (
+                ("encoder", stage2.encoder),
+                ("actor", stage2.actor),
+                ("critic", stage2.critic),
+            ):
+                for key, expected in stage2_modules_before[name].items():
+                    torch.testing.assert_close(
+                        module.state_dict()[key], expected, rtol=0, atol=0
+                    )
+            self.assertEqual(
+                stage2.encoder_optimizer.state_dict(), optimizer_before["encoder"]
+            )
+            self.assertEqual(
+                stage2.actor_optimizer.state_dict(), optimizer_before["actor"]
+            )
+            self.assertEqual(
+                stage2.critic_optimizer.state_dict(), optimizer_before["critic"]
+            )
+            self.assertEqual(
+                stage2.replay.rng.bit_generator.state, replay_rng_before
+            )
+            self.assertEqual(random.getstate(), python_rng_before)
+            numpy_rng_after = np.random.get_state()
+            self.assertEqual(numpy_rng_after[0], numpy_rng_before[0])
+            np.testing.assert_array_equal(
+                numpy_rng_after[1], numpy_rng_before[1]
+            )
+            self.assertEqual(numpy_rng_after[2:], numpy_rng_before[2:])
+            torch.testing.assert_close(
+                torch.get_rng_state(), torch_rng_before, rtol=0, atol=0
+            )
+            np.testing.assert_array_equal(
+                stage2_obs.local_normalizer.mean,
+                source_obs.local_normalizer.mean,
+            )
+            np.testing.assert_array_equal(
+                stage2_obs.global_normalizer.mean,
+                source_obs.global_normalizer.mean,
+            )
+            np.testing.assert_array_equal(
+                stage2_obs.critic_normalizer.mean,
+                source_obs.critic_normalizer.mean,
+            )
+
+    def test_stage1_policy_only_load_rejects_crash_and_unfrozen_normalizer(self):
+        source, source_obs, reward = components(seed=17, sale=True)
+        with tempfile.TemporaryDirectory() as directory:
+            path = save_contextual_checkpoint(
+                Path(directory) / "stage1.pt",
+                source,
+                observation_builder=source_obs,
+                reward_builder=reward,
+            )
+            target, target_obs, _ = components(seed=99, sale=True)
+            payload = torch.load(path, weights_only=False)
+            payload["runtime_metadata"] = {"checkpoint_kind": "crash"}
+            crash = Path(directory) / "crash.pt"
+            torch.save(payload, crash)
+            with self.assertRaisesRegex(
+                ContextualCheckpointError, "Crash checkpoint"
+            ):
+                load_frozen_contextual_policy(
+                    crash,
+                    target,
+                    observation_builder=target_obs,
+                    expected_reward_version=REWARD_VERSION,
+                )
+
+            payload["runtime_metadata"] = {}
+            payload["observation_local_normalizer"]["frozen"] = False
+            unfrozen = Path(directory) / "unfrozen.pt"
+            torch.save(payload, unfrozen)
+            with self.assertRaisesRegex(
+                ContextualCheckpointError, "local normalizer must be frozen"
+            ):
+                load_frozen_contextual_policy(
+                    unfrozen,
+                    target,
+                    observation_builder=target_obs,
+                    expected_reward_version=REWARD_VERSION,
+                )
+
+            payload["observation_local_normalizer"]["frozen"] = True
+            payload["applied_action_scale"] = 0.0
+            zero_scale = Path(directory) / "zero_scale.pt"
+            torch.save(payload, zero_scale)
+            with self.assertRaisesRegex(
+                ContextualCheckpointError, r"finite and in \(0, 1\]"
+            ):
+                load_frozen_contextual_policy(
+                    zero_scale,
+                    target,
+                    observation_builder=target_obs,
+                    expected_reward_version=REWARD_VERSION,
+                )
+
     def test_critic_total_tat_normalizer_round_trips(self):
         learner, obs, reward = components()
         obs.critic_normalizer = RunningFeatureNormalizer(CRITIC_EXTRA_DIM)
@@ -169,9 +403,9 @@ class ContextualCheckpointTests(unittest.TestCase):
             )
             self.assertEqual(target_reward.reward_steps, 12_345)
 
-    def test_v5_0_checkpoint_remains_compatible_with_v5_1_runtime(self):
+    def test_v5_checkpoint_is_rejected_by_v6_encoder_contract(self):
         learner, obs, reward = components()
-        self.assertEqual(CONTEXTUAL_VERSION, "v5.1.0")
+        self.assertEqual(CONTEXTUAL_VERSION, "v6.1.0")
         with tempfile.TemporaryDirectory() as directory:
             path = save_contextual_checkpoint(
                 Path(directory) / "v5_0.pt",
@@ -185,16 +419,19 @@ class ContextualCheckpointTests(unittest.TestCase):
             torch.save(payload, path)
 
             target, target_obs, target_reward = components(seed=99)
-            load_contextual_checkpoint(
-                path,
-                target,
-                observation_builder=target_obs,
-                reward_builder=target_reward,
-            )
+            with self.assertRaisesRegex(
+                ContextualCheckpointError, "checkpoint version mismatch"
+            ):
+                load_contextual_checkpoint(
+                    path,
+                    target,
+                    observation_builder=target_obs,
+                    reward_builder=target_reward,
+                )
 
-    def test_same_v5_reward_o_checkpoint_is_rejected_before_restore(self):
+    def test_same_v6_reward_o_checkpoint_is_rejected_before_restore(self):
         learner, obs, reward = components()
-        self.assertEqual(CONTEXTUAL_VERSION, "v5.1.0")
+        self.assertEqual(CONTEXTUAL_VERSION, "v6.1.0")
         with tempfile.TemporaryDirectory() as directory:
             path = save_contextual_checkpoint(
                 Path(directory) / "reward_p.pt",
@@ -591,6 +828,28 @@ class ContextualCheckpointTests(unittest.TestCase):
                         bad, target, observation_builder=target_obs,
                         reward_builder=target_reward,
                     )
+
+    def test_checkpoint_rejects_attention_mode_mismatch(self):
+        learner, obs, reward = components(use_attention=False)
+        with tempfile.TemporaryDirectory() as directory:
+            path = save_contextual_checkpoint(
+                Path(directory) / "flat.pt",
+                learner,
+                observation_builder=obs,
+                reward_builder=reward,
+            )
+            target, target_obs, target_reward = components(
+                use_attention=True
+            )
+            with self.assertRaisesRegex(
+                ContextualCheckpointError, "network_config mismatch"
+            ):
+                load_contextual_checkpoint(
+                    path,
+                    target,
+                    observation_builder=target_obs,
+                    reward_builder=target_reward,
+                )
 
     def test_checkpoint_explicitly_excludes_replay_payload(self):
         learner, obs, reward = components()

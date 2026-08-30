@@ -23,6 +23,11 @@ from oht_routing.mdp.termination import (
     TAT_TERMINATION_REWARD_PROFILE,
     tat_termination_profile,
 )
+from oht_routing.runtime.stages import (
+    STAGE_TWO,
+    VALID_STAGES,
+    sim_end_time_for_stage,
+)
 from oht_routing.utils.reward_diagnostic import parse_diagnostic_windows
 
 if TYPE_CHECKING:
@@ -81,6 +86,16 @@ def _resolve_reward_and_termination(config: ContextualRuntimeConfig) -> None:
 
 
 def _validate_runtime_modes(config: ContextualRuntimeConfig) -> None:
+    if config.stage is not None:
+        if isinstance(config.stage, bool) or not isinstance(
+            config.stage, Integral
+        ):
+            raise ValueError("stage must be an integer")
+        if int(config.stage) not in VALID_STAGES:
+            raise ValueError(f"stage must be one of {VALID_STAGES}")
+        object.__setattr__(
+            config, "sim_end_time", sim_end_time_for_stage(config.stage)
+        )
     if config.mode not in {"baseline_only", "actor_inference", "training"}:
         raise ValueError(
             "mode must be baseline_only, actor_inference, or training"
@@ -89,6 +104,8 @@ def _validate_runtime_modes(config: ContextualRuntimeConfig) -> None:
         raise ValueError("training mode requires explicit action_enabled")
     if config.save_data_enabled and config.mode != "actor_inference":
         raise ValueError("save_data is only supported in actor_inference mode")
+    if not isinstance(config.use_attention, bool):
+        raise ValueError("use_attention must be bool")
     for name in (
         "num_stacks",
         "stack_interval",
@@ -123,23 +140,23 @@ def _validate_runtime_modes(config: ContextualRuntimeConfig) -> None:
         or config.action_scale > 1.0
     ):
         raise ValueError("action_scale must be finite and in [0, 1]")
-    if (
-        isinstance(config.episode_burnin_steps, bool)
-        or not isinstance(config.episode_burnin_steps, Integral)
-    ):
-        raise ValueError("episode_burnin_steps must be an integer")
+    for name in ("resume_warmstart_steps",):
+        value = getattr(config, name)
+        if isinstance(value, bool) or not isinstance(value, Integral):
+            raise ValueError(f"{name} must be an integer")
     if (
         config.warmup_steps < 0
-        or config.episode_burnin_steps < 0
+        or config.resume_warmstart_steps < 0
         or config.normalizer_freeze_steps < 0
     ):
-        raise ValueError("warmup/burn-in/freeze steps must be non-negative")
+        raise ValueError("warmup/warm-start/freeze steps must be non-negative")
 
 
 def _resolve_and_validate_resume(config: ContextualRuntimeConfig) -> None:
     for name in (
         "load_state_normalizer_path",
         "save_state_normalizer_path",
+        "load_stage1_policy_path",
     ):
         value = getattr(config, name)
         if value is not None and (
@@ -156,6 +173,26 @@ def _resolve_and_validate_resume(config: ContextualRuntimeConfig) -> None:
         raise ValueError("resume_deterministic_first_episode must be bool")
     if config.load_state_normalizer_path is not None:
         object.__setattr__(config, "state_normalizer_warmup_bypass", True)
+    if config.load_stage1_policy_path is not None:
+        object.__setattr__(config, "state_normalizer_warmup_bypass", True)
+    if config.stage == STAGE_TWO:
+        if config.mode != "training":
+            raise ValueError("stage 2 requires training mode")
+        if not config.action_enabled:
+            raise ValueError("stage 2 requires explicit action_enabled")
+        if config.load_stage1_policy_path is None:
+            raise ValueError("stage 2 requires --load-stage1-policy")
+    elif config.load_stage1_policy_path is not None:
+        raise ValueError("load_stage1_policy_path requires stage 2")
+    if (
+        config.load_stage1_policy_path is not None
+        and config.load_state_normalizer_path is not None
+    ):
+        raise ValueError(
+            "standalone state-normalizer load and --load-stage1-policy are "
+            "mutually exclusive; the Stage 1 checkpoint already restores "
+            "the frozen state normalizers"
+        )
     if config.resume_checkpoint_path is not None and (
         config.load_state_normalizer_path is not None
     ):
@@ -168,6 +205,7 @@ def _resolve_and_validate_resume(config: ContextualRuntimeConfig) -> None:
         config.state_normalizer_warmup_bypass
         and config.load_state_normalizer_path is None
         and config.resume_checkpoint_path is None
+        and config.load_stage1_policy_path is None
     ):
         raise ValueError(
             "state_normalizer_warmup_bypass requires a standalone "
@@ -186,6 +224,25 @@ def _resolve_and_validate_resume(config: ContextualRuntimeConfig) -> None:
     ):
         raise ValueError(
             "resume_deterministic_first_episode requires checkpoint resume"
+        )
+    if (
+        config.resume_warmstart_steps > 0
+        and config.resume_checkpoint_path is None
+    ):
+        raise ValueError("resume_warmstart_steps requires checkpoint resume")
+    if config.resume_warmstart_steps > 0 and config.mode != "training":
+        raise ValueError("resume_warmstart_steps requires training mode")
+    if (
+        config.resume_warmstart_steps > 0
+        and config.resume_deterministic_first_episode
+    ):
+        raise ValueError(
+            "resume_warmstart_steps and "
+            "resume_deterministic_first_episode are mutually exclusive"
+        )
+    if config.resume_warmstart_steps > 0 and config.stage == STAGE_TWO:
+        raise ValueError(
+            "resume_warmstart_steps and stage 2 are mutually exclusive"
         )
 
 

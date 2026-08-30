@@ -53,7 +53,7 @@ FLOAT_INPUT_INDICES = (0, 1, 2, 6, 7, 8)
 class ContextualAttentionTests(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(17)
-        self.config = ContextualNetworkConfig()
+        self.config = ContextualNetworkConfig(use_attention=True)
         self.encoder = DirectionalContextEncoder(self.config).eval()
 
     def test_shapes_for_one_and_arbitrary_batch(self):
@@ -233,6 +233,68 @@ class ContextualAttentionTests(unittest.TestCase):
         self.assertEqual(first_neighbor_linear.in_features, 24)
         self.assertEqual(first_global_linear.in_features, 5)
         self.assertIsNot(first_neighbor_linear, first_global_linear)
+
+
+class ContextualFlatEncoderTests(unittest.TestCase):
+    def setUp(self):
+        torch.manual_seed(19)
+        self.config = ContextualNetworkConfig()
+        self.encoder = DirectionalContextEncoder(self.config).eval()
+
+    def test_flat_projection_is_the_default_and_keeps_output_shapes(self):
+        self.assertFalse(self.config.use_attention)
+        self.assertIsNone(self.encoder.incoming_attention)
+        self.assertIsNone(self.encoder.outgoing_attention)
+        self.assertIsNotNone(self.encoder.incoming_flat_encoder)
+        self.assertIsNotNone(self.encoder.outgoing_flat_encoder)
+        self.assertEqual(
+            self.encoder.incoming_flat_encoder.network[0].in_features,
+            15 * 64,
+        )
+        output = self.encoder(*make_inputs(7))
+        self.assertEqual(output.state.shape, (7, 128))
+        self.assertEqual(output.incoming_context.shape, (7, 64))
+        self.assertEqual(output.outgoing_context.shape, (7, 64))
+        self.assertIsNone(output.incoming_attention)
+        self.assertIsNone(output.outgoing_attention)
+
+    def test_flat_projection_supports_production_rail_batch(self):
+        with torch.inference_mode():
+            output = self.encoder(*make_inputs(4996))
+        self.assertEqual(output.state.shape, (4996, 128))
+
+    def test_flat_projection_is_sensitive_to_paired_slot_permutation(self):
+        inputs = list(make_inputs(4))
+        base = self.encoder(*inputs)
+        permutation = torch.tensor(
+            [12, 2, 14, 1, 5, 0, 8, 11, 6, 3, 13, 4, 10, 9, 7]
+        )
+        permuted = list(inputs)
+        permuted[1] = permuted[1][:, permutation]
+        permuted[4] = permuted[4][:, permutation]
+        permuted[6] = permuted[6][:, permutation]
+        result = self.encoder(*permuted)
+        self.assertFalse(
+            torch.allclose(base.incoming_context, result.incoming_context)
+        )
+
+    def test_flat_projection_rejects_attention_diagnostics_request(self):
+        with self.assertRaisesRegex(ValueError, "requires use_attention=True"):
+            self.encoder(*make_inputs(2), return_attention=True)
+
+    def test_flat_projection_and_rail_embedding_receive_gradients(self):
+        inputs = make_inputs(3, requires_grad=True)
+        self.encoder(*inputs).state.square().mean().backward()
+        for module in (
+            self.encoder.incoming_flat_encoder,
+            self.encoder.outgoing_flat_encoder,
+        ):
+            grads = [parameter.grad for parameter in module.parameters()]
+            self.assertTrue(all(gradient is not None for gradient in grads))
+            self.assertTrue(all(torch.isfinite(gradient).all() for gradient in grads))
+        embedding_grad = self.encoder.rail_embedding.weight.grad
+        self.assertIsNotNone(embedding_grad)
+        self.assertGreater(float(embedding_grad.abs().sum()), 0.0)
 
 
 if __name__ == "__main__":

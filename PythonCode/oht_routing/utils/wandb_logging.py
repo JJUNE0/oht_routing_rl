@@ -22,6 +22,10 @@ from oht_routing.mdp.reward.config import (
     REWARD_VERSION,
     reward_contract,
 )
+from oht_routing.runtime.stages import (
+    STAGE_TWO,
+    STAGE_TWO_STAGE1_POLICY_STEPS,
+)
 from oht_routing.version import CONTEXTUAL_VERSION
 
 _EXP_REWARD_VERSION = REWARD_VERSION
@@ -36,6 +40,8 @@ EXP_META = {
     "observation": "compact_local14_actor_global5_critic_only_tat_v5",
     "local_physical_dim": LOCAL_PHYSICAL_DIM,
     "rail_embedding_dim": 8,
+    "use_attention": False,
+    "neighbor_aggregation": "directional_flat_projection",
     "actor_global_dim": ACTOR_GLOBAL_DIM,
     "global_dim": ACTOR_GLOBAL_DIM,
     "critic_extra_dim": CRITIC_EXTRA_DIM,
@@ -61,7 +67,7 @@ EXP_META = {
     "stack_interval": 1,
     "reward_version": _EXP_REWARD_VERSION,
     "tat_signal": _EXP_REWARD_CONTRACT.tat_signal_description,
-    "calibration_status": "v5_compact_obs_reward_p_one_sided_total_tat",
+    "calibration_status": "v6_1_stage2_flat_default_compact_obs_reward_p",
     "reward_global_alpha": 0.5,
     "reward_local_alpha": 0.5,
     "tat_reference": 165.0,
@@ -141,16 +147,26 @@ EXP_META = {
     "early_stop_tat_threshold": 200.0,
     "tat_above_threshold_patience": 300,
     "terminal_tat_penalty": -20.0,
-    "note": "v5_compact_obs_reward_p_total_tat",
+    "stage2_contract": "per_episode_stage1_2000_then_stage2_to_45000",
+    "stage1_policy_load": "policy_only_frozen_with_saved_normalizers_and_scale",
+    "stage2_checkpoint_clock": "stage2_env_steps",
+    "note": "v6_1_stage2_flat_default_reward_p_total_tat",
     "description": (
-        "V5 combines the compact asymmetric observation with Reward P. "
+        "V6 keeps the V5 compact asymmetric observation and Reward P, "
+        "while making directional attention opt-in. The default keeps rail "
+        "embeddings and shared token encoders, then applies a positional "
+        "flat projection to each 15-neighbor direction. "
         "Reward P uses simulator cumulative pclient.TotalTat directly in "
         "the one-sided "
         "penalty -4.3 * max(TotalTat - 160, 0) / 165. TotalTat == 0 "
         "is an unavailable/reset sentinel, 0 < TotalTat <= 160 contributes "
         "zero, and negative values are invalid. OP remains disabled with "
-        "op_weight=0.0 and use_op=False. V4 checkpoints, replay, and "
-        "normalizers are incompatible with this combined major release."
+        "op_weight=0.0 and use_op=False. Frozen V5 state normalizers remain "
+        "compatible after exact contract validation, but V5 model "
+        "checkpoints are incompatible with the V6 encoder schema. V6.1 adds "
+        "an optional Stage 2 training contract: a frozen policy-only Stage 1 "
+        "prefix runs for the first 2,000 ticks of every episode, then an "
+        "isolated Stage 2 learner collects and trains through tick 45,000."
     ),
 }
 
@@ -168,10 +184,14 @@ WANDB_METRIC_KEYS = (
     "env/step", "env/episode", "env/sim_time", "env/tat", "env/operation_rate",
     "env/queued", "env/waiting", "env/transferring", "env/completed",
     "env/termination_reason", "episode/step",
-    "burnin/active", "burnin/remaining_steps",
-    "burnin/has_trained_policy", "burnin/action_source",
+    "stage/id", "stage/active_policy",
+    "stage1/active", "stage1/remaining_steps",
+    "stage1/applied_action_scale", "stage1/policy_frozen",
+    "stage2/active", "stage2/env_steps", "stage2/episode_step",
     "termination/done", "termination/by_queue", "termination/by_tat",
-    "termination/by_warmup", "warmup/episode_boundary_sent",
+    "termination/by_warmup", "termination/by_resume_warmstart",
+    "resume_warmstart/active", "resume_warmstart/remaining_steps",
+    "warmup/episode_boundary_sent",
     "protocol/stale_sim_time_ticks",
     "action/policy_mean", "action/policy_std", "action/policy_min",
     "action/policy_max", "action/policy_saturation_ratio",
@@ -479,6 +499,15 @@ WANDB_METRIC_KEYS = (
     "env/step",
     "env/episode",
     "episode/step",
+    "stage/id",
+    "stage/active_policy",
+    "stage1/active",
+    "stage1/remaining_steps",
+    "stage1/applied_action_scale",
+    "stage1/policy_frozen",
+    "stage2/active",
+    "stage2/env_steps",
+    "stage2/episode_step",
     "env/sim_time",
     "env/tat",
     "env/recent_completed_tat_300s_mean",
@@ -500,6 +529,9 @@ WANDB_METRIC_KEYS = (
     "termination/by_queue",
     "termination/by_tat",
     "termination/by_warmup",
+    "termination/by_resume_warmstart",
+    "resume_warmstart/active",
+    "resume_warmstart/remaining_steps",
     "warmup/episode_boundary_sent",
     "env/termination_reason",
     # Actor / applied control.
@@ -724,6 +756,12 @@ def runtime_exp_meta(config) -> dict:
     lap = bool(config.lap_enabled)
     action_mode = str(config.action_mode)
     meta["algorithm_variant"] = contextual_algorithm_variant(sale, lap)
+    meta["use_attention"] = bool(config.use_attention)
+    meta["neighbor_aggregation"] = (
+        "directional_cross_attention"
+        if config.use_attention
+        else "directional_flat_projection"
+    )
     meta["action_mode"] = action_mode
     meta["dispatch_mode"] = str(config.dispatch_mode)
     meta["note"] = (
@@ -733,7 +771,10 @@ def runtime_exp_meta(config) -> dict:
         f"{int(config.state_normalizer_warmup_bypass)}_b"
         f"{int(config.batch_size)}_"
         f"fullrefill{int(config.resume_inference_until_replay_full)}_"
-        f"detfirst{int(config.resume_deterministic_first_episode)}"
+        f"detfirst{int(config.resume_deterministic_first_episode)}_"
+        f"warmstart{int(config.resume_warmstart_steps)}_"
+        f"stage{int(config.stage or 0)}_"
+        f"attn{int(config.use_attention)}"
     )
     meta["sale"] = sale
     meta["lap"] = lap
@@ -856,6 +897,7 @@ def runtime_exp_meta(config) -> dict:
     meta["resume_deterministic_first_episode"] = bool(
         config.resume_deterministic_first_episode
     )
+    meta["resume_warmstart_steps"] = int(config.resume_warmstart_steps)
     meta["seed"] = int(config.seed)
     meta["replay_capacity_env_steps"] = int(
         config.replay_capacity_env_steps
@@ -882,7 +924,12 @@ def runtime_exp_meta(config) -> dict:
     meta["exploration_noise_anneal_steps"] = int(
         config.exploration_noise_anneal_steps
     )
-    meta["episode_burnin_steps"] = int(config.episode_burnin_steps)
+    meta["stage"] = config.stage
+    meta["stage1_policy_prefix_steps"] = (
+        STAGE_TWO_STAGE1_POLICY_STEPS
+        if config.stage == STAGE_TWO else 0
+    )
+    meta["load_stage1_policy_path"] = config.load_stage1_policy_path
     meta["exploration_noise_anneal_start_step"] = int(
         config.effective_warmup_steps
     )
@@ -902,6 +949,7 @@ def runtime_exp_meta(config) -> dict:
         f"stack={int(config.num_stacks)}x{int(config.stack_interval)}, "
         f"action_mode={action_mode}, dispatch_mode={config.dispatch_mode}, "
         f"critic_loss={config.critic_loss_mode}, "
+        f"neighbor_aggregation={meta['neighbor_aggregation']}, "
         "independently initialized Q1/Q2 heads, "
         f"reward {contract.version} (global/local="
         f"{reward_config.global_alpha:g}/{reward_config.local_alpha:g}), "
@@ -916,19 +964,22 @@ def runtime_exp_meta(config) -> dict:
         f"{int(config.effective_tat_termination_start_episode)} at "
         f"{float(config.early_stop_tat_threshold):g}, "
         f"exploration={float(config.exploration_noise_std):g}->"
-        f"{meta['exploration_noise_final_std']:g} over global steps "
+        f"{meta['exploration_noise_final_std']:g} over policy schedule steps "
         f"{int(config.effective_warmup_steps)}.."
         f"{int(config.effective_warmup_steps + config.exploration_noise_anneal_steps)}, "
         "state_normalizer="
         f"{'reused' if config.state_normalizer_warmup_bypass else 'collected'}, "
         "warmup_episode_boundary="
         f"{bool(config.terminate_on_warmup_complete)}, "
-        f"episode_burnin_steps={int(config.episode_burnin_steps)}, "
+        f"stage={config.stage}, "
+        "stage1_policy_prefix_steps="
+        f"{STAGE_TWO_STAGE1_POLICY_STEPS if config.stage == STAGE_TWO else 0}, "
         "resume_refill="
         f"{'full_capacity' if config.resume_inference_until_replay_full else 'minimum'}_"
         f"{int(config.resume_refill_target_env_steps)}, "
         "resume_deterministic_first_episode="
         f"{bool(config.resume_deterministic_first_episode)}, "
+        f"resume_warmstart_steps={int(config.resume_warmstart_steps)}, "
         "control-space smoothing, "
         "single-field simulator end-time handshake, and fail-closed SimTime "
         "progress validation."

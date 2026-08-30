@@ -79,6 +79,9 @@ REWARD_P_EXPORT_COLUMNS = {
 }
 WARMUP_BOUNDARY_EXPORT_COLUMNS = {
     "termination/by_warmup",
+    "termination/by_resume_warmstart",
+    "resume_warmstart/active",
+    "resume_warmstart/remaining_steps",
     "warmup/episode_boundary_sent",
 }
 RUNTIME_SAFETY_EXPORT_COLUMNS = {
