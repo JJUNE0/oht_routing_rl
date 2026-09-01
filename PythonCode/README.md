@@ -9,7 +9,7 @@ learner updates, or checkpoint writes:
 python .\PythonCode\main.py `
   --mode actor_inference `
   --action-enabled `
-  --resume-checkpoint ".\checkpoints\ctx_td7_reward_p\periodic\step_400000.pt"
+  --resume-checkpoint ".\checkpoints\ctx_td7_v6_actor_tat\periodic\step_40000.pt"
 ```
 
 병목 분석용 원본 환경 snapshot도 함께 저장하려면 `--save_data`를 추가합니다.
@@ -21,7 +21,7 @@ python .\PythonCode\main.py `
   --mode actor_inference `
   --action-enabled `
   --save_data `
-  --resume-checkpoint ".\checkpoints\ctx_td7_reward_p\periodic\step_400000.pt"
+  --resume-checkpoint ".\checkpoints\ctx_td7_v6_actor_tat\periodic\step_40000.pt"
 ```
 
 The checkpoint is loaded after simulator topology initialization. Confirm the
@@ -29,7 +29,7 @@ The checkpoint is loaded after simulator topology initialization. Confirm the
 scale, and restored normalizers before using evaluation results.
 
 반도체 FAB OHT의 rail cost를 학습해 혼잡 구간을 우회시키는 contextual TD7
-구현입니다. v5 runtime은 Reward P만 실행하며, 이전 Reward
+구현입니다. v6.2 runtime은 Reward P만 실행하며, 이전 Reward
 E~U 구현과 실험 기록은 `contextual-region-brl-v1` 브랜치와 루트의
 `EXPERIMENTS.md`에 보존합니다.
 
@@ -48,7 +48,7 @@ python .\PythonCode\main.py `
   --mode training `
   --action-enabled `
   --no-lap `
-  --save-state-normalizer .\PythonCode\normalizers\contextual_v5_seed0.npz `
+  --save-state-normalizer .\PythonCode\normalizers\contextual_v6_actor_tat_seed0.npz `
   --checkpoint-root .\PythonCode\checkpoints\ctx_td7_reward_p
 ```
 
@@ -89,9 +89,9 @@ python .\PythonCode\main.py `
 
 The encoder mode is part of the checkpoint network contract. Add
 `--use-attention` whenever loading a V6 attention checkpoint; omit it for a V6
-flat checkpoint. V5 model checkpoints cannot be resumed by V6. Frozen V5 state
-normalizer snapshots remain reusable when their exact observation, topology,
-mapping, and normalization contracts match.
+flat checkpoint. V5 및 V6.0/V6.1 model checkpoint와 state-normalizer는
+6-feature actor-global 계약과 호환되지 않습니다. V6.2 Stage 1 policy와
+normalizer를 새로 생성해야 합니다.
 
 `--stage 1`은 `sim_end_time=2000`인 단기 학습 계약입니다. `--stage 2`는
 `sim_end_time=45000`으로 실행되며, 매 episode의 첫 2,000 tick에는 별도로
@@ -102,7 +102,8 @@ mapping, and normalization contracts match.
 
 ## Stage 2 frozen-prefix 학습
 
-V6 flat Stage 1 checkpoint에서 새 Stage 2 learner를 시작하는 예시는 다음과
+V6.2 actor-TAT flat Stage 1 checkpoint에서 새 Stage 2 learner를
+시작하는 예시는 다음과
 같습니다.
 
 ```powershell
@@ -110,16 +111,26 @@ python .\PythonCode\main.py `
   --mode training `
   --action-enabled `
   --stage 2 `
-  --load_stage1_policy ".\checkpoints\ctx_td7_v6_flat\periodic\step_34000.pt" `
+  --load_stage1_policy ".\checkpoints\ctx_td7_v6_actor_tat_stage1\periodic\step_34000.pt" `
+  --exploration-noise-std 0.05 `
+  --exploration-noise-final-std 0.05 `
   --periodic-checkpoint-interval 2000 `
-  --checkpoint-root ".\checkpoints\ctx_td7_v6_stage2_from_s1_34000"
+  --checkpoint-root ".\checkpoints\ctx_td7_v6_4_actor_tat_stage2_from_s1_34000_noise005"
 ```
 
 `--load_stage1_policy`와 `--load-stage1-policy`는 같은 옵션입니다. 이 로드는
 Stage 1 checkpoint의 online encoder, actor, frozen SALE state encoder,
-frozen observation normalizer, 저장 당시 applied-action scale만 복원합니다.
-Stage 1 critic, target network, optimizer, replay, update counter, reward state,
-Python/NumPy/Torch RNG는 Stage 2 learner에 복원하지 않습니다.
+frozen observation normalizer, 저장 당시 applied-action scale을 prefix용으로
+복원합니다. Fresh Stage 2에서는 encoder, actor, policy target, SALE 경로를
+이 값으로 한 번만 초기화하며 episode reset이나 Stage 2 checkpoint resume
+시에는 다시 덮어쓰지 않습니다. Stage 1 critic, optimizer, replay, update
+counter, reward state, Python/NumPy/Torch RNG는 Stage 2 learner에 복원하지
+않습니다.
+
+Fresh Stage 2 CLI 실행에서 noise 두 옵션을 모두 생략해도 기본값은
+`0.05 -> 0.05`로 해석됩니다. 위처럼 두 값을 명시하면 실행 명령 자체에도
+실험 조건이 남습니다. 한쪽이라도 명시한 경우에는 일반 explicit override
+규칙을 따르며, Stage 2 checkpoint resume은 저장된 noise 설정을 복원합니다.
 
 각 episode에서 1~2,000번째 tick은 Stage 1 deterministic policy만 실행합니다.
 이 구간에는 exploration, transition staging/replay insertion, learner sampling,
@@ -180,8 +191,9 @@ unavailable/reset sentinel and its reward contribution is `0`; a negative or
 non-finite value is invalid. `0 < TotalTat <= 160` also contributes `0`, and
 only values above 160 seconds receive the unbounded one-sided penalty above.
 The recent-300-second completion TAT remains diagnostic-only and does not
-affect Reward P. `TotalTat` is also the early-termination signal and is exposed
-only to the critic through a separately normalized scalar.
+affect Reward P. `TotalTat` is also the early-termination signal, the actor's
+first normalized global feature, and the critic's separately normalized direct
+scalar.
 Reward 계산은 이 normalized critic 입력이 아니라 simulator raw 값을 직접
 사용합니다.
 The rail-local StopTime sum is deliberately unclipped, so worsening congestion
@@ -201,10 +213,11 @@ TAT 종료 조건은 10,000 environment-step grace 이후
 `REWARD_P_PROFILE`입니다. Reward O 정의는 과거 계약 확인용으로만
 보존됩니다.
 
-## V5 observation 계약
+## V6.2 observation 계약
 
-V5는 actor-visible 입력을 compact schema로 줄이고, cumulative
-`total_tat_s`를 critic에만 추가하는 asymmetric actor-critic 구조입니다.
+V6.2는 compact schema를 유지하면서 normalized cumulative
+`total_tat_s`를 actor-global 입력의 첫 feature로 복원합니다. Critic에는
+기존의 direct TotalTat scalar도 계속 전달합니다.
 
 ```text
 center_local            [N, 14]
@@ -212,24 +225,26 @@ incoming_local          [N, 15, 14]
 outgoing_local          [N, 15, 14]
 incoming_relation       [N, 15, 2]
 outgoing_relation       [N, 15, 2]
-actor_global_state      [5]
+actor_global_state      [6]
 previous_applied_action [N, 1]
-critic_total_tat        [1]  # critic only
+critic_total_tat        [1]  # direct critic copy
 ```
 
 local feature는 `free_flow_time_s`, `port_count`, `incoming_degree`,
 `outgoing_degree`, `predicted_oht_count`, `reservation_port_count`, 6개 OHT
 state count, `stop_time_sum`, `stopped_oht_count` 순서입니다.
 `oht_density`와 `next_10_route_oht_count`는 RL 입력에서 제거됐습니다.
-actor global feature는 `operation_rate`, `queued_ratio`, `waiting_ratio`,
-`transferring_ratio`, `mean_reassign` 순서입니다. rail identity embedding(8),
+actor global feature는 `total_tat_s`, `operation_rate`, `queued_ratio`,
+`waiting_ratio`, `transferring_ratio`, `mean_reassign` 순서입니다.
+rail identity embedding(8),
 15-in/15-out topology, relation feature 2개, previous applied action은
 유지합니다.
 
-Actor와 actor-side SALE/target actor에는 어떤 형태의 TotalTat도 전달하지
-않습니다. Replay는 현재·다음 state의 critic-only TotalTat를 함께 보존하며,
-target critic에는 반드시 다음 state 값을 전달합니다. OP는 actor state로는
-남지만 Reward P의 `op_weight=0.0`, `use_op=False` 계약은 유지됩니다.
+Actor와 actor-side SALE/target actor는 normalized actor-global TotalTat를
+사용합니다. Replay는 현재·다음 state의 actor-global TotalTat와 direct-critic
+TotalTat를 함께 보존하며, target actor와 target critic에는 각각 다음 state
+값을 전달합니다. OP는 actor state로 남지만 Reward P의 `op_weight=0.0`,
+`use_op=False` 계약은 유지됩니다.
 
 ## 코드 구조
 
@@ -270,12 +285,12 @@ python .\PythonCode\main.py `
   --save-state-normalizer .\PythonCode\normalizers\contextual_state_n_seed0.npz
 ```
 
-새 learner로 시작하면서 같은 V5 artifact 계약의 관측 통계만 재사용하려면
+새 learner로 시작하면서 같은 V6.2 artifact 계약의 관측 통계만 재사용하려면
 `--load-state-normalizer <path>`를 사용합니다. 유효한 snapshot을
 불러오면 effective warm-up은 0이 됩니다. actor, critic, replay, reward
-상태는 복원하지 않습니다. actor-visible feature와 critic-only TotalTat는
-분리된 normalizer state를 사용합니다. V4 이하 이전 major의 normalizer는
-호환되지 않습니다.
+상태는 복원하지 않습니다. actor-global feature와 direct-critic TotalTat는
+분리된 normalizer state를 사용합니다. V5 및 V6.0/V6.1 normalizer는
+actor-global 차원이 다르므로 호환되지 않습니다.
 
 ## Replay 메모리
 
@@ -284,8 +299,8 @@ python .\PythonCode\main.py `
 count를 `uint8`/`uint16`으로 lossless packing합니다. policy/applied/previous
 action은 Q15 `int16`으로
 저장하며 최대 절대 복원 오차는 약 `1.53e-5`입니다. reward는 `float32`, LAP
-priority는 `float16`을 사용합니다. current/next critic-only TotalTat도 replay
-transition에 포함됩니다.
+priority는 `float16`을 사용합니다. current/next actor-global 및 direct-critic
+TotalTat도 replay transition에 포함됩니다.
 
 실제 설정에 따른 예상치는 시작 요약의 `estimated full replay RAM`과 W&B
 `replay/storage_bytes`에서 확인할 수 있습니다.
@@ -296,16 +311,16 @@ LAP 사용 계약으로 저장됐다면 호환성 검사에서 명시적으로 �
 
 ## Checkpoint와 resume
 
-통합 runtime/checkpoint 버전은 `v6.1.0`입니다. 같은 major의 이전
-버전 artifact만 현재 runtime보다 새 버전이 아닌 경우 호환될 수 있습니다.
+통합 runtime/checkpoint 버전은 `v6.4.0`입니다. 같은 major라도 저장된
+network/observation 계약이 정확히 일치해야 호환될 수 있습니다.
 checkpoint 로드는
 통합 버전, topology/mapping hash, network config, action mode,
 SALE/LAP 사용 여부, Reward P만 호환성으로 검사합니다. replay payload는
 저장하지 않으므로 training resume 후에는 replay를 다시 채워야 합니다.
 V6는 neighbor aggregation의 기본값을 attention에서 flat projection으로
-바꾼 breaking version입니다. V5 model checkpoint는 V6에서 거부되지만,
-observation 계약이 동일한 standalone frozen V5 state normalizer는 모든
-feature/topology/mapping 검사를 통과하면 재사용할 수 있습니다.
+바꾼 계열입니다. V6.2에서 actor-global dimension이 5에서 6으로 바뀌었으므로
+V5 및 V6.0/V6.1 model checkpoint, Stage 1 policy, state normalizer는 모두
+거부됩니다.
 
 ```powershell
 python .\PythonCode\main.py `
@@ -395,6 +410,44 @@ $env:PYTHONPATH="$PWD;$PWD\PythonCode;$PWD\PythonCode\tests"
 & 'C:\Users\bjy66\miniconda3\envs\aicc\python.exe' `
   -m unittest discover -s .\PythonCode\tests -p 'test_contextual*.py'
 ```
+
+## V6.3 multi-simulator Stage 2
+
+The distributed path keeps the packed replay in central RAM and gives CUDA,
+the online learner, the frozen Stage 1 policy, checkpoints, and W&B to one
+central owner. Each simulator connection retains independent observation,
+reward, transition, episode, previous-action, dispatcher, and exploration-RNG
+state.
+
+```powershell
+python .\PythonCode\main.py `
+  --mode training `
+  --action-enabled `
+  --stage 2 `
+  --reward-version P `
+  --no-lap `
+  --seed 0 `
+  --load-stage1-policy ".\PythonCode\checkpoints\ctx_td7_v6_2_actor_tat_stage1_seed0\periodic\step_60000.pt" `
+  --exploration-noise-std 0.05 `
+  --exploration-noise-final-std 0.05 `
+  --num-sim 4 `
+  --port 9100 9101 9102 9103 `
+  --batch-size 512 `
+  --periodic-checkpoint-interval 2000 `
+  --checkpoint-root ".\PythonCode\checkpoints\ctx_td7_v6_4_dist4_stage2_from_s1_60000_noise005_seed0"
+```
+
+`--num-sim` is the number of simulator connections expected by the Python
+runtime; it does not start simulator executables. Configure one simulator
+instance for each port. The port count must equal `--num-sim`, ports must be
+unique, and every listener is bound before collection starts. Omitting both
+options preserves the existing single-port `wpconfig.json` behavior.
+
+Every worker runs its own 2,000-tick frozen Stage 1 prefix. Stage 2 curriculum
+and checkpoint clocks count aggregate learner-active worker ticks. V6.3 does
+not support distributed full-state resume because a central artifact does not
+contain every collector's live episode/reward/RNG state; start a fresh
+distributed learner from the frozen V6.2 Stage 1 policy.
 
 Reward P 식의 고정값 검증은
 `tests/test_contextual_reward_n_contract.py`에 있습니다.

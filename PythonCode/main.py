@@ -35,9 +35,15 @@ def main():
     args = parse_args()
     config = runtime_config_from_args(args)
     seed_everything(config.seed)
+    if config.num_sim > 1:
+        from oht_routing.runtime.distributed.server import serve_distributed
+
+        serve_distributed(config)
+        return
     client = ClientAlgorithm(config)
     print_runtime_summary(client)
-    serve_contextual(client)
+    port = config.sim_ports[0] if config.sim_ports is not None else None
+    serve_contextual(client, port=port)
 
 
 if __name__ == "__main__":

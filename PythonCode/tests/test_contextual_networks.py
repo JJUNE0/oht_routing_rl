@@ -137,22 +137,30 @@ class ContextualNetworkTests(unittest.TestCase):
             self.config.critic_input_dim,
         )
 
-    def test_total_tat_is_critic_only_and_changes_twin_q(self):
+    def test_total_tat_changes_actor_context_and_twin_q(self):
         batch = 7
+        low_inputs = list(make_inputs(batch))
+        high_inputs = [value.detach().clone() for value in low_inputs]
+        low_inputs[-1][:, 0] = -1.25
+        high_inputs[-1][:, 0] = 2.5
+        self.encoder.eval()
+        self.actor.eval()
+        with torch.inference_mode():
+            low_state = self.encoder(*low_inputs).state
+            high_state = self.encoder(*high_inputs).state
+            actor_before = self.actor(low_state).action
+            actor_after = self.actor(high_state).action
+        self.assertGreater(
+            float((low_state - high_state).abs().sum()), 0.0
+        )
+        self.assertGreater(
+            float((actor_before - actor_after).abs().sum()), 0.0
+        )
+
         state = torch.randn(batch, self.config.stacked_context_dim)
         previous_action = torch.randn(
             batch, self.config.stacked_action_dim
         ).tanh()
-        self.actor.eval()
-        with torch.inference_mode():
-            actor_before = self.actor(
-                state, previous_action=previous_action
-            ).action
-            actor_after = self.actor(
-                state, previous_action=previous_action
-            ).action
-        torch.testing.assert_close(actor_before, actor_after, rtol=0, atol=0)
-
         low_tat = make_critic_total_tat(
             batch, self.config, value=-1.25
         )
@@ -209,6 +217,7 @@ class ContextualNetworkTests(unittest.TestCase):
             self.assertIsNotNone(value.grad)
             self.assertTrue(torch.isfinite(value.grad).all())
             self.assertGreater(float(value.grad.abs().sum()), 0.0)
+        self.assertGreater(float(inputs[-1].grad[:, 0].abs().sum()), 0.0)
         embedding_grad = self.encoder.rail_embedding.weight.grad
         self.assertIsNotNone(embedding_grad)
         self.assertTrue(torch.isfinite(embedding_grad).all())

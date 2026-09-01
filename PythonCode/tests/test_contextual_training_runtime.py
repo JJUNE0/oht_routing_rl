@@ -102,6 +102,13 @@ class TrainingObservationBuilder:
         critic_total_tat_raw = np.asarray(
             [float(getattr(pclient, "TotalTat", 0.0))], dtype=np.float32
         )
+        global_raw[0] = critic_total_tat_raw[0]
+        global_state = self.global_normalizer.normalize(
+            global_raw, name="training_actor_global"
+        ).reshape(GLOBAL_DIM)
+        critic_total_tat = self.critic_normalizer.normalize(
+            critic_total_tat_raw, name="training_critic_total_tat"
+        ).reshape(CRITIC_EXTRA_DIM)
         if not self.local_normalizer.frozen:
             self.local_normalizer.update(physical)
             self.global_normalizer.update(global_raw)
@@ -138,10 +145,8 @@ class TrainingObservationBuilder:
             outgoing_rail_indices=self.outgoing_rail_indices,
             incoming_relation=self._incoming_relation,
             outgoing_relation=self._outgoing_relation,
-            global_state=np.zeros(GLOBAL_DIM, np.float32),
-            critic_total_tat=self.critic_normalizer.normalize(
-                critic_total_tat_raw, name="training_critic_total_tat"
-            ).reshape(CRITIC_EXTRA_DIM),
+            global_state=np.ascontiguousarray(global_state),
+            critic_total_tat=np.ascontiguousarray(critic_total_tat),
             previous_applied_action=np.ascontiguousarray(
                 np.zeros((CONTROLLED_COUNT, 1), np.float32)
                 if previous_applied_action is None
@@ -730,6 +735,7 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
             return dict(metadata)
 
         def load_stage1(*args, observation_builder, **kwargs):
+            self.assertFalse(kwargs["initialize_fresh_learner_policy"])
             if shift_stage1_normalizer:
                 state = observation_builder.local_normalizer.state_dict()
                 state["mean"] = state["mean"] + 1.0
@@ -776,7 +782,78 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
             "stage1_policy_prefix_steps": 2_000,
             "stage1_policy_sha256": "stage1-sha256",
             "stage1_applied_action_scale": 1.0,
+            "stage2_policy_warm_started_from_stage1": True,
         }
+
+    def test_fresh_stage2_requests_policy_warm_start_exactly_once(self):
+        config = ContextualRuntimeConfig(
+            mode="training",
+            action_enabled=True,
+            stage=2,
+            load_stage1_policy_path="stage1.pt",
+            device="cpu",
+            replay_capacity_env_steps=64,
+            batch_size=16,
+            minimum_replay_env_steps=1,
+            minimum_action_enabled_env_steps=1,
+            wandb_enabled=False,
+            sale_enabled=False,
+            lap_enabled=False,
+        )
+        runtime = ClientAlgorithm(config)
+        runtime.topology = make_topology()
+        runtime.observation_builder = TrainingObservationBuilder(
+            runtime.topology, freeze_steps=1
+        )
+        warm_start_flags = []
+
+        def load_stage1(*args, observation_builder, **kwargs):
+            warm_start_flags.append(
+                kwargs["initialize_fresh_learner_policy"]
+            )
+            for normalizer, dim in (
+                (observation_builder.local_normalizer, LOCAL_PHYSICAL_DIM),
+                (observation_builder.global_normalizer, GLOBAL_DIM),
+                (observation_builder.critic_normalizer, CRITIC_EXTRA_DIM),
+            ):
+                normalizer.update(np.ones((1, dim)), name="stage1")
+                normalizer.freeze()
+            return SimpleNamespace(
+                encoder=torch.nn.Linear(1, 1),
+                actor=torch.nn.Linear(1, 1),
+                sale_fixed=None,
+                applied_action_scale=1.0,
+                action_mode=runtime.config.action_mode,
+                checkpoint_path=Path("stage1.pt"),
+                checkpoint_sha256="stage1-sha256",
+            )
+
+        learner = SimpleNamespace(
+            encoder=torch.nn.Linear(1, 1),
+            actor=torch.nn.Linear(1, 1),
+        )
+        pclient = make_runtime_pclient()
+        with (
+            patch(
+                "oht_routing.runtime.client.ContextualTD7Learner",
+                return_value=learner,
+            ),
+            patch(
+                "oht_routing.runtime.client.load_frozen_contextual_policy",
+                side_effect=load_stage1,
+            ),
+        ):
+            runtime._ensure_initialized(pclient)
+            runtime.Reset(pclient)
+            runtime._ensure_initialized(pclient)
+
+        self.assertEqual(warm_start_flags, [True])
+        self.assertTrue(runtime.stage2_policy_warm_started_from_stage1)
+        self.assertTrue(
+            runtime._runtime_checkpoint_metadata()[
+                "stage2_policy_warm_started_from_stage1"
+            ]
+        )
 
     def test_stage2_boundary_excludes_stage1_replay_and_uses_saved_scale(self):
         runtime, pclient = training_runtime(
@@ -832,7 +909,7 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
             self.assertEqual(runtime.last_diagnostics["stage2/episode_step"], 0.0)
             self.assertEqual(runtime.last_diagnostics["stage2/env_steps"], 1.0)
             self.assertEqual(
-                runtime.last_diagnostics["curriculum/action_scale"], 0.05
+                runtime.last_diagnostics["curriculum/action_scale"], 1.0
             )
             self.assertEqual(pclient.sent_is_end, [0, 0, 0, 0])
             self.assertEqual(runtime.replay_buffer.push_count, 0)
@@ -870,6 +947,7 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
         runtime = self._initialize_mock_stage2_resume(metadata)
         self.assertEqual(runtime.total_steps, 4_000)
         self.assertEqual(runtime.stage2_env_steps, 2_000)
+        self.assertTrue(runtime.stage2_policy_warm_started_from_stage1)
 
         bad_cases = (
             ({**metadata, "stage": 1}, {}, "requires a Stage 2 checkpoint"),
@@ -1213,6 +1291,18 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
         deterministic.total_steps = 100_000
         self.assertEqual(deterministic._exploration_noise_std(), 0.0)
 
+    def test_equal_exploration_endpoints_hold_constant_stage2_noise(self):
+        runtime, _ = training_runtime(
+            warmup_steps=0,
+            exploration_noise_std=0.05,
+            exploration_noise_final_std=0.05,
+            exploration_noise_anneal_steps=100_000,
+        )
+        self._enable_test_stage2(runtime)
+        for step in (0, 1, 20_000, 100_000, 250_000):
+            runtime.stage2_env_steps = step
+            self.assertEqual(runtime._exploration_noise_std(), 0.05)
+
     def test_policy_and_exploratory_temporal_deltas_are_separate(self):
         runtime, pclient = training_runtime(
             warmup_steps=0,
@@ -1312,7 +1402,7 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
             diagnostics["action/noise_suppressed_by_clip_mean"], 0.0
         )
         self.assertAlmostEqual(
-            diagnostics["action/applied_std"], 0.05 * postclip.std(),
+            diagnostics["action/applied_std"], postclip.std(),
             places=7,
         )
 
@@ -1977,7 +2067,12 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
             "action/cross_rail_policy_std",
             "action/policy_saturation_ratio", "action/clipped_fraction",
             "action/exploration_noise_std", "action/applied_mean",
-            "action/applied_std", "curriculum/action_scale", "b_rl/mean",
+            "action/applied_std",
+            "rl/action_mean", "rl/action_std", "rl/action_abs_mean",
+            "rail_cost/t_ff_mean", "rail_cost/congestion_mean",
+            "rail_cost/residual_mean", "rail_cost/residual_abs_mean",
+            "rail_cost/final_cost_mean",
+            "curriculum/action_scale", "b_rl/mean",
             "b_rl/std", "cost/all_baseline_abs_error_max",
             "observation/predicted_route10_pearson",
             "observation/predicted_route10_mae",
@@ -2033,6 +2128,8 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
             "runtime/encoder_actor_ms",
             "runtime/actor_inference_ms",
             "runtime/device_to_host_ms",
+            "runtime/inference_queue_ms",
+            "runtime/inference_microbatch_size",
             "runtime/cost_apply_ms",
             "runtime/replay_push_ms",
             "runtime/replay_sample_ms",
@@ -2149,6 +2246,16 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
         self.assertEqual(captured["config"]["EXP_META"], meta)
         self.assertEqual(captured["notes"], meta["description"])
         self.assertEqual(meta["version"], CONTEXTUAL_VERSION)
+        self.assertEqual(meta["cost_structure"], "residual")
+        self.assertEqual(meta["action_range"], "0.5-1.5")
+        self.assertEqual(meta["residual_action_scale"], 1.0)
+        self.assertEqual(meta["rl_cost_lambda"], 0.5)
+        self.assertEqual(meta["action_scale"], 1.0)
+        self.assertFalse(meta["curriculum_enabled"])
+        lambda_override_meta = runtime_exp_meta(
+            ContextualRuntimeConfig(rl_cost_lambda=0.25)
+        )
+        self.assertEqual(lambda_override_meta["action_range"], "0.75-1.25")
         self.assertFalse(meta["use_attention"])
         self.assertEqual(
             meta["neighbor_aggregation"], "directional_flat_projection"
@@ -2198,9 +2305,9 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
         self.assertIn("dispatch_first_match", meta["note"])
         self.assertEqual(meta["num_stacks"], 1)
         self.assertEqual(meta["stack_interval"], 1)
-        self.assertEqual(meta["observation_version"], "v5")
+        self.assertEqual(meta["observation_version"], "v6")
         self.assertEqual(meta["local_physical_dim"], 14)
-        self.assertEqual(meta["actor_global_dim"], 5)
+        self.assertEqual(meta["actor_global_dim"], 6)
         self.assertEqual(meta["critic_extra_dim"], 1)
         self.assertEqual(meta["relation_dim"], 2)
         self.assertEqual(
@@ -2219,14 +2326,14 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
                 )
             },
             {
-                "obs/version": "v5",
+                "obs/version": "v6",
                 "obs/local_dim": 14,
                 "obs/incoming_neighbors": 15,
                 "obs/outgoing_neighbors": 15,
                 "obs/relation_dim": 2,
-                "obs/actor_global_dim": 5,
+                "obs/actor_global_dim": 6,
                 "obs/critic_extra_dim": 1,
-                "obs/actor_has_total_tat": 0,
+                "obs/actor_has_total_tat": 1,
                 "obs/critic_has_total_tat": 1,
             },
         )
@@ -2274,6 +2381,8 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
             action_enabled=True,
             stage=2,
             load_stage1_policy_path="stage1.pt",
+            exploration_noise_std=0.05,
+            exploration_noise_final_std=0.05,
         ))
         self.assertEqual(stage2_meta["stage"], 2)
         self.assertEqual(stage2_meta["stage1_policy_prefix_steps"], 2_000)
@@ -2284,6 +2393,16 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
         self.assertEqual(
             stage2_meta["stage2_checkpoint_clock"], "stage2_env_steps"
         )
+        self.assertTrue(
+            stage2_meta["stage2_policy_warm_start_on_fresh_run"]
+        )
+        self.assertEqual(
+            stage2_meta["stage2_policy_initialization"],
+            "stage1_encoder_actor_sale_fixed_once_targets_synchronized",
+        )
+        self.assertEqual(stage2_meta["exploration_noise_std"], 0.05)
+        self.assertEqual(stage2_meta["exploration_noise_final_std"], 0.05)
+        self.assertEqual(stage2_meta["exploration_schedule"], "constant")
         self.assertIn("stage2", stage2_meta["note"])
         full_refill_meta = runtime_exp_meta(ContextualRuntimeConfig(
             resume_checkpoint_path="checkpoint.pt",

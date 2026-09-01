@@ -19,7 +19,7 @@ from oht_routing.runtime.client import (
     ContextualRuntimeConfig,
 )
 from oht_dispatching.config import DISPATCH_COST
-from oht_routing.mdp.action import EXP_RESIDUAL
+from oht_routing.mdp.action import EXP_RESIDUAL, FREE_FLOW_RESIDUAL
 from oht_routing.mdp.observation import (
     CRITIC_EXTRA_DIM,
     GLOBAL_DIM,
@@ -370,26 +370,41 @@ class ContextualRuntimeTests(unittest.TestCase):
         self.assertTrue(captured["attention_absent"])
         self.assertFalse(hasattr(runtime, "critic"))
 
-    def test_actor_action_is_invariant_to_critic_only_total_tat(self):
+    def test_actor_uses_global_total_tat_not_direct_critic_copy(self):
         runtime = self.runtime(mode="actor_inference", action_enabled=True)
         actor_observation = runtime.observation_builder.batch
-        low_tat = replace(
+        low_global = actor_observation.global_state.copy()
+        high_global = actor_observation.global_state.copy()
+        low_global[0] = -3.0
+        high_global[0] = 7.0
+        low_actor_tat = replace(
             actor_observation,
+            global_state=np.ascontiguousarray(low_global),
             critic_total_tat=np.asarray([-3.0], dtype=np.float32),
             critic_total_tat_raw=np.asarray([100.0], dtype=np.float32),
         )
-        high_tat = replace(
+        high_actor_tat = replace(
             actor_observation,
+            global_state=np.ascontiguousarray(high_global),
             critic_total_tat=np.asarray([7.0], dtype=np.float32),
             critic_total_tat_raw=np.asarray([900.0], dtype=np.float32),
         )
 
-        self.assertFalse(np.array_equal(
-            low_tat.critic_total_tat, high_tat.critic_total_tat
-        ))
-        low_action, _ = runtime._actor_inference(low_tat)
-        high_action, _ = runtime._actor_inference(high_tat)
-        np.testing.assert_array_equal(low_action, high_action)
+        low_action, _ = runtime._actor_inference(low_actor_tat)
+        high_action, _ = runtime._actor_inference(high_actor_tat)
+        self.assertGreater(float(np.abs(low_action - high_action).sum()), 0.0)
+
+        direct_low = replace(
+            actor_observation,
+            critic_total_tat=np.asarray([-3.0], dtype=np.float32),
+        )
+        direct_high = replace(
+            actor_observation,
+            critic_total_tat=np.asarray([7.0], dtype=np.float32),
+        )
+        direct_low_action, _ = runtime._actor_inference(direct_low)
+        direct_high_action, _ = runtime._actor_inference(direct_high)
+        np.testing.assert_array_equal(direct_low_action, direct_high_action)
 
     def test_sale_runtime_expands_global_state_for_every_controlled_rail(self):
         runtime = self.runtime(mode="actor_inference", action_enabled=True)
@@ -491,6 +506,36 @@ class ContextualRuntimeTests(unittest.TestCase):
             )
         self.assertEqual(runtime.observation_builder.calls, 100)
 
+    def test_normalized_actor_action_reaches_free_flow_cost_without_scale(self):
+        runtime = self.runtime(
+            mode="actor_inference",
+            action_enabled=True,
+            action_mode=FREE_FLOW_RESIDUAL,
+            action_scale=0.1,
+            rl_cost_lambda=0.5,
+        )
+        pclient = make_runtime_pclient()
+        action = np.zeros(CONTROLLED_COUNT, dtype=np.float32)
+        action[:3] = (-1.0, 0.0, 1.0)
+        with patch.object(
+            runtime, "_actor_inference", return_value=(action, {})
+        ):
+            result = runtime.Algorithm(pclient)
+
+        rows = runtime.topology.controlled_row_to_physical_index
+        t_ff = np.asarray([
+            pclient.RAILLINE_DIC[int(runtime.topology.all_rail_ids[row])]
+            .DistancePerVelocity
+            for row in rows[:3]
+        ])
+        np.testing.assert_allclose(
+            result.final_cost[rows[:3]], t_ff * (0.5, 1.0, 1.5)
+        )
+        np.testing.assert_array_equal(
+            result.applied_controlled_action, action
+        )
+        self.assertEqual(runtime._action_scale(), 1.0)
+
     def test_same_state_and_seed_produce_deterministic_actions(self):
         first = self.runtime(mode="actor_inference")
         second = self.runtime(mode="actor_inference")
@@ -505,7 +550,10 @@ class ContextualRuntimeTests(unittest.TestCase):
             mode="actor_inference", action_enabled=False, action_scale=1.0
         )
         zero = self.runtime(
-            mode="actor_inference", action_enabled=True, action_scale=0.0
+            mode="actor_inference",
+            action_enabled=True,
+            action_mode=EXP_RESIDUAL,
+            action_scale=0.0,
         )
         disabled_client = make_runtime_pclient()
         zero_client = make_runtime_pclient()

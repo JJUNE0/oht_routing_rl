@@ -81,21 +81,23 @@ def make_snapshot(topology, step, episode=0, done=False):
     physical = make_physical_local_state(topology, step)
     next_physical = make_physical_local_state(topology, step + 1)
     rows = np.arange(CONTROLLED_COUNT, dtype=np.float32)
+    total_tat = np.float32(1_000.0 + 10.0 * step)
+    next_total_tat = np.float32(1_000.0 + 10.0 * (step + 1))
+    global_state = np.arange(GLOBAL_DIM, dtype=np.float32) + step
+    next_global_state = np.arange(GLOBAL_DIM, dtype=np.float32) + step + 1.0
+    global_state[0] = total_tat
+    next_global_state[0] = next_total_tat
     return ContextualStepSnapshot(
         physical_local_state=physical,
-        global_state=np.arange(GLOBAL_DIM, dtype=np.float32) + step,
-        critic_total_tat=np.asarray(
-            [1_000.0 + 10.0 * step], dtype=np.float32
-        ),
+        global_state=np.ascontiguousarray(global_state),
+        critic_total_tat=np.asarray([total_tat], dtype=np.float32),
         previous_applied_action=(rows / CONTROLLED_COUNT * 0.25)[:, None],
         policy_action=(rows / CONTROLLED_COUNT)[:, None],
         applied_action=(rows / CONTROLLED_COUNT * 0.25)[:, None],
         reward=rows + step * 10,
         next_physical_local_state=next_physical,
-        next_global_state=np.arange(GLOBAL_DIM, dtype=np.float32) + step + 1.0,
-        next_critic_total_tat=np.asarray(
-            [1_000.0 + 10.0 * (step + 1)], dtype=np.float32
-        ),
+        next_global_state=np.ascontiguousarray(next_global_state),
+        next_critic_total_tat=np.asarray([next_total_tat], dtype=np.float32),
         next_previous_applied_action=(
             rows / CONTROLLED_COUNT * 0.25
         )[:, None],
@@ -128,7 +130,7 @@ class ContextualReplayTests(unittest.TestCase):
         )
         batch = replay.sample(16)
         self.assertEqual(LOCAL_PHYSICAL_DIM, 14)
-        self.assertEqual(GLOBAL_DIM, 5)
+        self.assertEqual(GLOBAL_DIM, 6)
         self.assertEqual(CRITIC_EXTRA_DIM, 1)
         self.assertEqual(self.topology.incoming_neighbor_ids.shape[1], 15)
         self.assertEqual(self.topology.outgoing_neighbor_ids.shape[1], 15)
@@ -141,7 +143,7 @@ class ContextualReplayTests(unittest.TestCase):
             "outgoing_rail_indices": (16, 15),
             "incoming_relation": (16, 15, 2),
             "outgoing_relation": (16, 15, 2),
-            "global_state": (16, 5),
+            "global_state": (16, 6),
             "critic_total_tat": (16, 1),
             "previous_applied_action": (16, 1),
             "policy_action": (16, 1),
@@ -150,7 +152,7 @@ class ContextualReplayTests(unittest.TestCase):
             "next_center_local": (16, 14),
             "next_incoming_local": (16, 15, 14),
             "next_outgoing_local": (16, 15, 14),
-            "next_global_state": (16, 5),
+            "next_global_state": (16, 6),
             "next_critic_total_tat": (16, 1),
             "next_previous_applied_action": (16, 1),
             "done": (16, 1),
@@ -376,6 +378,14 @@ class ContextualReplayTests(unittest.TestCase):
                             **{field: np.asarray([np.nan], np.float32)},
                         )
                     )
+
+        mismatched_global = base.global_state.copy()
+        mismatched_global[0] += 1.0
+        with self.assertRaisesRegex(
+            ContextualReplayError,
+            "actor-global TotalTat must equal direct critic TotalTat",
+        ):
+            replay.push(replace(base, global_state=mismatched_global))
 
     def test_packed_integer_features_reject_fractional_and_overflow(self):
         base = make_snapshot(self.topology, 0)

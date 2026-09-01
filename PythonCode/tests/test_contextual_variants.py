@@ -11,6 +11,7 @@ from oht_routing.runtime.config import (
     runtime_config_from_args,
 )
 from oht_routing.runtime.config_validation import make_reward_config
+from oht_routing.mdp.action import FREE_FLOW_RESIDUAL
 from oht_routing.mdp.reward.config import (
     RAIL_REWARD_FREE_FLOW_NEUTRAL_2,
     REWARD_VERSION,
@@ -30,10 +31,12 @@ from test_contextual_sale import sale_replay
 
 
 EXPECTED = {
-    (True, True): "contextual_td7_sale_lap_v6_compact_critic_tat",
-    (False, True): "contextual_td7_no_sale_lap_v6_compact_critic_tat",
-    (True, False): "contextual_td7_sale_uniform_v6_compact_critic_tat",
-    (False, False): "contextual_twin_delayed_uniform_v6_compact_critic_tat",
+    (True, True): "contextual_td7_sale_lap_v6_compact_actor_critic_tat",
+    (False, True): "contextual_td7_no_sale_lap_v6_compact_actor_critic_tat",
+    (True, False): "contextual_td7_sale_uniform_v6_compact_actor_critic_tat",
+    (False, False): (
+        "contextual_twin_delayed_uniform_v6_compact_actor_critic_tat"
+    ),
 }
 
 
@@ -45,7 +48,7 @@ class ContextualVariantTests(unittest.TestCase):
             return parse_args()
 
     def test_cli_and_runtime_are_locked_to_reward_p(self):
-        self.assertEqual(CONTEXTUAL_VERSION, "v6.1.0")
+        self.assertEqual(CONTEXTUAL_VERSION, "v7.0.0")
         parsed = self.parse()
         self.assertNotIn("reward_version", vars(parsed))
         self.assertEqual(
@@ -65,6 +68,8 @@ class ContextualVariantTests(unittest.TestCase):
 
         config = ContextualRuntimeConfig()
         self.assertEqual(config.reward_version, "P")
+        self.assertEqual(config.action_mode, FREE_FLOW_RESIDUAL)
+        self.assertEqual(config.rl_cost_lambda, 0.5)
         self.assertEqual(config.early_stop_tat_threshold, 200.0)
         self.assertEqual(config.tat_termination_grace_steps, 10_000)
         self.assertEqual(config.tat_above_threshold_patience, 300)
@@ -109,11 +114,26 @@ class ContextualVariantTests(unittest.TestCase):
         self.assertFalse(config.use_attention)
         self.assertFalse(config.wandb_enabled)
         self.assertEqual(config.console_log_interval, 100)
+        self.assertEqual(config.num_sim, 1)
+        self.assertIsNone(config.sim_ports)
         self.assertIsNone(config.stage)
         self.assertEqual(config.sim_end_time, 45_000)
         self.assertIsNone(config.load_stage1_policy_path)
         self.assertEqual(config.periodic_checkpoint_interval, 5_000)
         self.assertEqual(config.resume_warmstart_steps, 0)
+        self.assertEqual(config.exploration_noise_std, 0.10)
+        self.assertEqual(config.exploration_noise_final_std, 0.02)
+        self.assertEqual(config.action_mode, FREE_FLOW_RESIDUAL)
+        self.assertEqual(config.rl_cost_lambda, 0.5)
+
+        override = runtime_config_from_args(
+            self.parse("--rl-cost-lambda", "0.25")
+        )
+        self.assertEqual(override.rl_cost_lambda, 0.25)
+        for invalid in (-0.1, 1.1, float("nan")):
+            with self.subTest(rl_cost_lambda=invalid):
+                with self.assertRaisesRegex(ValueError, "rl_cost_lambda"):
+                    ContextualRuntimeConfig(rl_cost_lambda=invalid)
 
     def test_stage_one_preserves_identity_and_resolves_end_time(self):
         parsed = self.parse("--stage", "1")
@@ -135,6 +155,8 @@ class ContextualVariantTests(unittest.TestCase):
                 self.assertEqual(config.load_stage1_policy_path, "stage1.pt")
                 self.assertEqual(config.effective_warmup_steps, 0)
                 self.assertTrue(config.state_normalizer_warmup_bypass)
+                self.assertEqual(config.exploration_noise_std, 0.05)
+                self.assertEqual(config.exploration_noise_final_std, 0.05)
 
         with self.assertRaisesRegex(
             ValueError, "stage 2 requires --load-stage1-policy"
@@ -147,6 +169,15 @@ class ContextualVariantTests(unittest.TestCase):
                 "--mode", "training", "--action-enabled",
                 "--load_stage1_policy", "stage1.pt",
             ))
+
+        explicit = runtime_config_from_args(self.parse(
+            "--mode", "training", "--action-enabled",
+            "--stage", "2", "--load-stage1-policy", "stage1.pt",
+            "--exploration-noise-std", "0.08",
+            "--exploration-noise-final-std", "0.03",
+        ))
+        self.assertEqual(explicit.exploration_noise_std, 0.08)
+        self.assertEqual(explicit.exploration_noise_final_std, 0.03)
 
     def test_stage_rejects_unknown_values_and_explicit_end_time(self):
         for arguments in (
@@ -203,6 +234,8 @@ class ContextualVariantTests(unittest.TestCase):
         self.assertIn("lap_enabled", RESUME_LAUNCH_CONTROL_FIELDS)
         self.assertIn("reward_version", RESUME_LAUNCH_CONTROL_FIELDS)
         self.assertIn("console_log_interval", RESUME_LAUNCH_CONTROL_FIELDS)
+        self.assertIn("num_sim", RESUME_LAUNCH_CONTROL_FIELDS)
+        self.assertIn("sim_ports", RESUME_LAUNCH_CONTROL_FIELDS)
         self.assertIn("sim_end_time", RESUME_LAUNCH_CONTROL_FIELDS)
         self.assertIn("stage", RESUME_LAUNCH_CONTROL_FIELDS)
         self.assertIn("load_stage1_policy_path", RESUME_LAUNCH_CONTROL_FIELDS)
@@ -211,6 +244,86 @@ class ContextualVariantTests(unittest.TestCase):
         )
         self.assertIn("resume_warmstart_steps", RESUME_LAUNCH_CONTROL_FIELDS)
         self.assertIn("use_attention", RESUME_LAUNCH_CONTROL_FIELDS)
+
+    def test_cli_accepts_single_and_multiple_simulator_ports(self):
+        single = self.parse("--port", "9100")
+        self.assertEqual(
+            vars(single), {"sim_ports": [9_100]}
+        )
+        single_config = runtime_config_from_args(single)
+        self.assertEqual(single_config.num_sim, 1)
+        self.assertEqual(single_config.sim_ports, (9_100,))
+
+        for option in ("--port", "--ports"):
+            with self.subTest(option=option):
+                parsed = self.parse(
+                    "--mode", "training",
+                    "--action-enabled",
+                    "--stage", "2",
+                    "--load-stage1-policy", "stage1.pt",
+                    "--num-sim", "4", option,
+                    "9100", "9101", "9102", "9103",
+                )
+                self.assertEqual(parsed.num_sim, 4)
+                self.assertEqual(
+                    parsed.sim_ports, [9_100, 9_101, 9_102, 9_103]
+                )
+                config = runtime_config_from_args(parsed)
+                self.assertEqual(config.num_sim, 4)
+                self.assertEqual(
+                    config.sim_ports, (9_100, 9_101, 9_102, 9_103)
+                )
+
+    def test_multi_simulator_runtime_is_stage2_policy_bootstrap_only(self):
+        endpoints = {
+            "num_sim": 2,
+            "sim_ports": (9_100, 9_101),
+        }
+        with self.assertRaisesRegex(
+            ValueError, "requires Stage 2 training"
+        ):
+            ContextualRuntimeConfig(**endpoints)
+        with self.assertRaisesRegex(
+            ValueError, "distributed full-state checkpoint resume"
+        ):
+            ContextualRuntimeConfig(
+                **endpoints,
+                mode="training",
+                action_enabled=True,
+                stage=2,
+                load_stage1_policy_path="stage1.pt",
+                resume_checkpoint_path="stage2.pt",
+            )
+
+    def test_runtime_rejects_invalid_multi_simulator_ports(self):
+        cases = (
+            ({"num_sim": 0}, "num_sim must be a positive integer"),
+            ({"num_sim": True}, "num_sim must be a positive integer"),
+            (
+                {"num_sim": 2},
+                "num_sim > 1 requires explicit sim_ports",
+            ),
+            (
+                {"num_sim": 2, "sim_ports": (9_100,)},
+                "sim_ports count must equal num_sim",
+            ),
+            (
+                {"num_sim": 2, "sim_ports": (9_100, 9_100)},
+                "sim_ports must contain unique ports",
+            ),
+            (
+                {"num_sim": 2, "sim_ports": (0, 9_101)},
+                "sim_ports values must be integers",
+            ),
+            (
+                {"num_sim": 2, "sim_ports": (9_100, 65_536)},
+                "sim_ports values must be integers",
+            ),
+        )
+        for kwargs, message in cases:
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaisesRegex(ValueError, message):
+                    ContextualRuntimeConfig(**kwargs)
 
     def test_periodic_checkpoint_interval_must_be_positive(self):
         with self.assertRaisesRegex(
@@ -321,6 +434,28 @@ class ContextualVariantTests(unittest.TestCase):
         self.assertEqual(config.periodic_checkpoint_interval, 2_000)
         self.assertEqual(config.sim_end_time, 55_000)
         self.assertTrue(config.state_normalizer_warmup_bypass)
+        read_config.assert_called_once_with(
+            "checkpoint.pt", expected_reward_version="P"
+        )
+
+    @patch("oht_routing.runtime.config.read_contextual_runtime_config")
+    def test_resume_keeps_current_simulator_launch_controls(self, read_config):
+        read_config.return_value = (
+            {
+                "reward_version": "P",
+                "num_sim": 8,
+                "sim_ports": tuple(range(9_200, 9_208)),
+            },
+            True,
+        )
+        config = runtime_config_from_args(self.parse(
+            "--resume-checkpoint", "checkpoint.pt",
+            "--num-sim", "1",
+            "--ports", "9100",
+        ))
+
+        self.assertEqual(config.num_sim, 1)
+        self.assertEqual(config.sim_ports, (9_100,))
         read_config.assert_called_once_with(
             "checkpoint.pt", expected_reward_version="P"
         )

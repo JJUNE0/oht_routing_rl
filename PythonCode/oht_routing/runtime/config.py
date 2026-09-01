@@ -14,7 +14,7 @@ from oht_routing.algorithms.rl.contextual_td7 import (
     REPLAY_SAMPLING_RAIL,
     read_contextual_runtime_config,
 )
-from oht_routing.mdp.action import REGION_B_RL
+from oht_routing.mdp.action import FREE_FLOW_RESIDUAL
 from oht_routing.mdp.reward.config import REWARD_VERSION
 from oht_routing.mdp.termination import TAT_TERMINATION_REWARD_PROFILE
 from oht_routing.runtime.console import (
@@ -23,6 +23,7 @@ from oht_routing.runtime.console import (
     print_wrapped_items,
 )
 from oht_routing.runtime.config_validation import validate_runtime_config
+from oht_routing.runtime.stages import STAGE_TWO
 from oht_routing.version import CONTEXTUAL_VERSION
 
 
@@ -43,6 +44,8 @@ RESUME_LAUNCH_CONTROL_FIELDS = {
     "reward_diagnostic_windows",
     "wandb_enabled",
     "console_log_interval",
+    "num_sim",
+    "sim_ports",
     "stage",
     "sim_end_time",
     "save_data_enabled",
@@ -72,8 +75,9 @@ class ContextualRuntimeConfig:
     stage: int | None = None
     action_enabled: bool = False
     reward_version: str = REWARD_VERSION
-    action_mode: str = REGION_B_RL
+    action_mode: str = FREE_FLOW_RESIDUAL
     action_scale: float = 0.05
+    rl_cost_lambda: float = 0.5
     num_stacks: int = 1
     stack_interval: int = 1
     curriculum_end_step: int = 20_000
@@ -90,6 +94,8 @@ class ContextualRuntimeConfig:
     reward_diagnostic_windows: str = "0:1000,10000:11000,20000:21000"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     seed: int = 0
+    num_sim: int = 1
+    sim_ports: tuple[int, ...] | None = None
     topology_cache_path: str | None = None
     topology_audit_path: str | None = None
     exploration_noise_std: float = 0.10
@@ -243,6 +249,18 @@ def runtime_config_from_args(args) -> ContextualRuntimeConfig:
         if name in _PATH_CONFIG_FIELDS and value is not None:
             value = str(value)
         config_kwargs[name] = value
+
+    # V6.4 fresh Stage 2 experiment preset. Keep the canonical defaults for
+    # Stage 1/general runs, preserve any explicit noise endpoint, and let a
+    # resumed checkpoint restore the schedule it was trained with.
+    if (
+        config_kwargs.get("stage") == STAGE_TWO
+        and not config_kwargs.get("resume_checkpoint_path")
+        and "exploration_noise_std" not in config_kwargs
+        and "exploration_noise_final_std" not in config_kwargs
+    ):
+        config_kwargs["exploration_noise_std"] = 0.05
+        config_kwargs["exploration_noise_final_std"] = 0.05
 
     config = ContextualRuntimeConfig(**config_kwargs)
     if config.resume_checkpoint_path:

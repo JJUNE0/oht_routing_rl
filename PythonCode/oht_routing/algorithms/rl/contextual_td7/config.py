@@ -1,16 +1,18 @@
 from dataclasses import dataclass
 
-from oht_routing.mdp.action import ACTION_MODES, REGION_B_RL
+from oht_routing.mdp.action import ACTION_MODES, FREE_FLOW_RESIDUAL
 
 from .stacking import validate_stack_config
 
 
 def contextual_algorithm_variant(sale_enabled: bool, lap_enabled: bool) -> str:
     return {
-        (True, True): "contextual_td7_sale_lap_v6_compact_critic_tat",
-        (False, True): "contextual_td7_no_sale_lap_v6_compact_critic_tat",
-        (True, False): "contextual_td7_sale_uniform_v6_compact_critic_tat",
-        (False, False): "contextual_twin_delayed_uniform_v6_compact_critic_tat",
+        (True, True): "contextual_td7_sale_lap_v6_compact_actor_critic_tat",
+        (False, True): "contextual_td7_no_sale_lap_v6_compact_actor_critic_tat",
+        (True, False): "contextual_td7_sale_uniform_v6_compact_actor_critic_tat",
+        (False, False): (
+            "contextual_twin_delayed_uniform_v6_compact_actor_critic_tat"
+        ),
     }[(bool(sale_enabled), bool(lap_enabled))]
 
 
@@ -20,7 +22,7 @@ class ContextualNetworkConfig:
     rail_embedding_dim: int = 8
     num_rails: int = 4_999
     relation_dim: int = 2
-    global_dim: int = 5
+    global_dim: int = 6
     critic_extra_dim: int = 1
     neighbor_count: int = 15
     d_model: int = 64
@@ -109,7 +111,7 @@ class ContextualNetworkConfig:
 @dataclass(frozen=True)
 class ContextualLearnerConfig:
     gamma: float = 0.99
-    action_mode: str = REGION_B_RL
+    action_mode: str = FREE_FLOW_RESIDUAL
     action_scale: float = 0.1
     actor_lr: float = 3e-4
     critic_lr: float = 3e-4

@@ -146,10 +146,10 @@ def evaluate(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     default_results = os.path.join(
-        PROJECT_ROOT, "results", "contextual_td7", "0806"
+        PROJECT_ROOT, "results", "contextual_td7", "0820"
     )
     parser.add_argument('--save_dir', type=str, default=default_results, help="결과 DB가 들어있는 폴더")
-    parser.add_argument('--db_filename', type=str, default='ep_3.db', help="평가할 결과 DB 파일명")
+    parser.add_argument('--db_filename', type=str, default='ep_1.db', help="평가할 결과 DB 파일명")
     args = parser.parse_args()
     
 

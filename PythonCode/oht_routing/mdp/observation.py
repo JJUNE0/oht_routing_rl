@@ -19,23 +19,15 @@ from oht_routing.mdp.topology import ContextualTopology, TOPOLOGY_VERSION
 from oht_routing.version import (
     CONTEXTUAL_VERSION,
     is_compatible_contextual_version,
-    parse_contextual_version,
 )
 
 
-OBSERVATION_VERSION = "v5"
+OBSERVATION_VERSION = "v6"
 
 
 def _is_compatible_normalizer_version(saved_version: str) -> bool:
-    """Allow the unchanged V5 observation artifact across the V6 model break."""
-    if is_compatible_contextual_version(saved_version):
-        return True
-    try:
-        saved = parse_contextual_version(saved_version)
-        runtime = parse_contextual_version(CONTEXTUAL_VERSION)
-    except ValueError:
-        return False
-    return saved[0] == 5 and runtime[0] == 6
+    """Accept only current-major artifacts for the V6 actor observation."""
+    return is_compatible_contextual_version(saved_version)
 
 
 LOCAL_PHYSICAL_FEATURE_NAMES = (
@@ -55,6 +47,7 @@ LOCAL_PHYSICAL_FEATURE_NAMES = (
     "stopped_oht_count",
 )
 ACTOR_GLOBAL_FEATURE_NAMES = (
+    "total_tat_s",
     "operation_rate",
     "queued_ratio",
     "waiting_ratio",
@@ -665,6 +658,10 @@ class ContextualObservationBuilder:
         )
         actor_global_raw = np.asarray(
             (
+                self._finite_nonnegative(
+                    getattr(pclient, "TotalTat", 0.0),
+                    name="actor cumulative TotalTat",
+                ),
                 operation_rate,
                 queued / denominator,
                 waiting / denominator,
@@ -734,14 +731,11 @@ class ContextualObservationBuilder:
                 recent_completed_tat_available
             ),
         )
-        critic_total_tat_raw = np.asarray(
-            (
-                self._finite_nonnegative(
-                    getattr(pclient, "TotalTat", 0.0),
-                    name="cumulative TotalTat",
-                ),
-            ),
-            dtype=np.float64,
+        # The actor-global and direct-critic paths intentionally share the
+        # exact same simulator sample. Keep separate normalizers, but never
+        # read the mutable simulator field twice for one observation.
+        critic_total_tat_raw = np.ascontiguousarray(
+            global_raw[:CRITIC_EXTRA_DIM]
         )
 
         # Contractual order: normalize the whole physical snapshot using the
@@ -1147,7 +1141,7 @@ class ContextualObservationBuilder:
         ):
             raise ObservationContractError(
                 "warm-up bypass requires populated, frozen local, global, "
-                "and critic-only "
+                "and direct critic TotalTat "
                 "state normalizers"
             )
 

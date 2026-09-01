@@ -63,6 +63,41 @@ class PClient:
            oht.CmdCompleteTat[int(cmd_id)] = command_time
 
        def __init__(self, socket, sim_end_time=45000):
+           # These fields predate multi-simulator execution and are declared
+           # on the class. Shadow every mutable/session value before the
+           # initialization handshake so concurrent PClient instances never
+           # share simulator dictionaries or counters.
+           self.RAILINE_COUNT = 0
+           self.OHT_COUNT = 0
+           self.LAST_V = -1
+           self.TOTAL_BYTES_READ = 0
+           self.communcation_type = -1
+           self.RAILLINECOST_DIC = {}
+           self.RAILINE_SIM_ID_DIC = {}
+           self.RAILLINE_DIC = {}
+           self.CompletedCommandCount = 0
+           self.TransferrCommandCount = 0
+           self.WaitingCommandCount = 0
+           self.QueuedCommandCount = 0
+           self.ReRoueDic = {}
+           self.OHT_DIC = {}
+           self.JOB_DIC = {}
+           self.IsFaillMessage = False
+           self.FILE_NAME = ''
+           self.SimStartTimeSec = 0
+           self.SimEndTimeSec = 0
+           self.IsSendOnly = False
+           self.TotalTat = 0
+           self.TotalOhtOperationRate = 0
+           self.SimTime = 0
+           self.secData = {}
+           self.episode_index = 0
+           session_tag = (
+               datetime.now().strftime('%Y%m%d%H%M%S_%f')
+               + '_' + format(id(self), 'x')
+           )
+           self.file_path = session_tag + '_data' + self.file_extension
+           self.file_path_TCP = session_tag + '_tcp' + self.file_extension
            self.client_socket = socket
            self.requested_end_time = int(sim_end_time)
            if self.requested_end_time <= 0:
@@ -80,8 +115,6 @@ class PClient:
            # This raw fixed-width field must occur exactly once here.
            self.SendEndTime(self.requested_end_time);
            self.RecieveSetPara();
-           self.file_path = datetime.now().strftime('%Y%m%d%H%M%S')  + self.file_path;
-           self.file_path_TCP = datetime.now().strftime('%Y%m%d%H%M%S')  + self.file_path_TCP;
 
        def RecieveSimulationStandardData(self):
          isEnd = self.RecieveEndSim();

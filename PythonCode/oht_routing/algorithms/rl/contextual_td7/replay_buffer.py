@@ -402,12 +402,20 @@ class ContextualStepReplayBuffer:
             raise ContextualReplayError("next_env_step must equal env_step + 1")
         _copy_array("physical_local_state", snapshot.physical_local_state,
                     (self.physical_count, LOCAL_PHYSICAL_DIM))
-        _copy_array("global_state", snapshot.global_state, (GLOBAL_DIM,))
-        _copy_array(
+        global_state = _copy_array(
+            "global_state", snapshot.global_state, (GLOBAL_DIM,)
+        )
+        critic_total_tat = _copy_array(
             "critic_total_tat",
             snapshot.critic_total_tat,
             (CRITIC_EXTRA_DIM,),
         )
+        if not np.array_equal(
+            global_state[:CRITIC_EXTRA_DIM], critic_total_tat
+        ):
+            raise ContextualReplayError(
+                "actor-global TotalTat must equal direct critic TotalTat"
+            )
         _quantize_action(
             "previous_applied_action",
             snapshot.previous_applied_action,
@@ -427,13 +435,20 @@ class ContextualStepReplayBuffer:
         _copy_array("next_physical_local_state",
                     snapshot.next_physical_local_state,
                     (self.physical_count, LOCAL_PHYSICAL_DIM))
-        _copy_array("next_global_state", snapshot.next_global_state,
-                    (GLOBAL_DIM,))
-        _copy_array(
+        next_global_state = _copy_array(
+            "next_global_state", snapshot.next_global_state, (GLOBAL_DIM,)
+        )
+        next_critic_total_tat = _copy_array(
             "next_critic_total_tat",
             snapshot.next_critic_total_tat,
             (CRITIC_EXTRA_DIM,),
         )
+        if not np.array_equal(
+            next_global_state[:CRITIC_EXTRA_DIM], next_critic_total_tat
+        ):
+            raise ContextualReplayError(
+                "next actor-global TotalTat must equal direct critic TotalTat"
+            )
         _copy_array("next_previous_applied_action",
                     snapshot.next_previous_applied_action,
                     (self.controlled_count, 1))

@@ -13,6 +13,23 @@ HOST = "127.0.0.1"
 EXPECTED_SIMULATION_STATES = {0, 1, 2, 3, 4, 5, 6}
 
 
+def _configure_listener_socket(server):
+    """Make listener ownership exclusive on Windows and reusable elsewhere.
+
+    Windows gives ``SO_REUSEADDR`` different semantics from POSIX and may let
+    two live processes bind the same address. That is unsafe for an explicit
+    simulator-to-worker port mapping, so prefer exclusive ownership whenever
+    the platform exposes it.
+    """
+
+    if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+        server.setsockopt(
+            socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1
+        )
+    else:
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+
 def _run_session(connection, address, port, client):
     print(
         "[contextual-runtime] TCP accepted; "
@@ -73,11 +90,11 @@ def _accept_sessions(server, port, client):
                 print("[contextual-runtime] session failed; waiting for reconnect")
 
 
-def serve_contextual(client):
+def serve_contextual(client, port=None):
     """Serve simulator sessions until interrupted or training fails."""
-    port = read_port()
+    port = read_port() if port is None else int(port)
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    _configure_listener_socket(server)
     server.bind((HOST, port))
     server.listen(1)
     capture_status = "stopped"

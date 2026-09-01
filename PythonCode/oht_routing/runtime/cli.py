@@ -66,6 +66,14 @@ def parse_args():
         help="Fixed applied-action scale for exp_residual mode only.",
     )
     parser.add_argument(
+        "--rl-cost-lambda",
+        type=float,
+        help=(
+            "Free-flow residual coefficient; the default is 0.5 and "
+            "action_scale is not applied to it."
+        ),
+    )
+    parser.add_argument(
         "--num-stacks",
         type=int,
         help="Total observation frames including the current frame.",
@@ -85,12 +93,19 @@ def parse_args():
     parser.add_argument(
         "--exploration-noise-std",
         type=float,
-        help="Exploration noise std at global environment step 0.",
+        help=(
+            "Exploration noise std at global environment step 0. Fresh "
+            "Stage 2 defaults both noise endpoints to 0.05 when neither "
+            "endpoint is supplied."
+        ),
     )
     parser.add_argument(
         "--exploration-noise-final-std",
         type=float,
-        help="Final exploration noise std after annealing.",
+        help=(
+            "Final exploration noise std after annealing. Fresh Stage 2 "
+            "defaults both endpoints to 0.05 when neither is supplied."
+        ),
     )
     parser.add_argument(
         "--exploration-noise-anneal-steps",
@@ -139,6 +154,26 @@ def parse_args():
     )
     parser.add_argument("--device")
     parser.add_argument("--seed", type=int)
+    parser.add_argument(
+        "--num-sim",
+        type=int,
+        help=(
+            "Number of simulator connections managed by this launch. "
+            "Values greater than one require an explicit port list."
+        ),
+    )
+    parser.add_argument(
+        "--port",
+        "--ports",
+        dest="sim_ports",
+        type=int,
+        nargs="+",
+        metavar="PORT",
+        help=(
+            "One simulator listen port per configured simulator. The single-"
+            "sim default continues to use wpconfig.json when omitted."
+        ),
+    )
     parser.add_argument(
         "--replay-capacity-env-steps",
         type=int,
@@ -253,8 +288,10 @@ def parse_args():
         help=(
             "Stage 2 only: load the frozen Stage 1 encoder, actor, SALE "
             "state encoder, observation normalizers, and saved applied-action "
-            "scale without restoring its critic, optimizers, replay, counters, "
-            "reward state, or RNG state."
+            "scale. A fresh Stage 2 learner is initialized once from that "
+            "policy path; checkpoint resume never overwrites the resumed "
+            "policy. The critic, optimizers, replay, counters, reward state, "
+            "applied-action scale, and RNG state remain Stage 2-owned."
         ),
     )
     parser.add_argument(

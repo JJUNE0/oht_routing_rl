@@ -80,12 +80,12 @@ class ContextualReplayMemoryTests(unittest.TestCase):
         )
         estimate_100k_gib = estimate_100k / (1024.0 ** 3)
         self.assertLess(estimate_100k_gib, 20.0)
-        self.assertAlmostEqual(estimate_100k_gib, 16.772020, places=5)
+        self.assertAlmostEqual(estimate_100k_gib, 16.772765, places=5)
         estimate_100k_no_lap_gib = replay.estimate_capacity_bytes(
             100_000, lap_enabled=False
         ) / (1024.0 ** 3)
         self.assertAlmostEqual(
-            estimate_100k_no_lap_gib, 15.839580, places=5
+            estimate_100k_no_lap_gib, 15.840325, places=5
         )
 
     def test_packed_storage_dtypes_match_capacity_estimate_contract(self):

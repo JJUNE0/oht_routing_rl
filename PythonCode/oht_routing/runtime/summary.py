@@ -1,7 +1,7 @@
 """Human-readable startup diagnostics for the contextual runtime."""
 
 from oht_routing.algorithms.rl.contextual_td7 import ContextualStepReplayBuffer
-from oht_routing.mdp.action import REGION_B_RL
+from oht_routing.mdp.action import FREE_FLOW_RESIDUAL, REGION_B_RL
 from oht_routing.mdp.observation import (
     ACTOR_GLOBAL_DIM,
     CRITIC_EXTRA_DIM,
@@ -51,10 +51,14 @@ def print_runtime_summary(client):
         )
     )
     action_scale = (
-        f"{config.curriculum_scale_start} -> {config.curriculum_scale_end} "
-        f"by global step {config.curriculum_end_step}"
-        if config.action_mode == REGION_B_RL
-        else f"fixed {config.action_scale}"
+        "normalized action direct (no action_scale)"
+        if config.action_mode == FREE_FLOW_RESIDUAL
+        else (
+            f"{config.curriculum_scale_start} -> {config.curriculum_scale_end} "
+            f"by global step {config.curriculum_end_step}"
+            if config.action_mode == REGION_B_RL
+            else f"fixed {config.action_scale}"
+        )
     )
     checkpoint_status = (
         "deferred until simulator topology"
@@ -79,6 +83,11 @@ def print_runtime_summary(client):
             ("action enabled", config.action_enabled),
             ("device", client.device),
             ("seed", config.seed),
+            ("simulators", config.num_sim),
+            (
+                "explicit ports",
+                config.sim_ports if config.sim_ports is not None else "wpconfig.json",
+            ),
             ("dispatch mode", config.dispatch_mode),
             ("stage", config.stage),
             ("sim end time", config.sim_end_time),
@@ -90,6 +99,7 @@ def print_runtime_summary(client):
         (
             ("action mode", config.action_mode),
             ("action scale schedule", action_scale),
+            ("RL cost lambda", config.rl_cost_lambda),
             ("observation version", OBSERVATION_VERSION),
             ("local physical features", LOCAL_PHYSICAL_DIM),
             ("rail embedding dimensions", network.rail_embedding_dim),
@@ -102,10 +112,10 @@ def print_runtime_summary(client):
             ("relation features", RELATION_DIM),
             ("actor global features", ACTOR_GLOBAL_DIM),
             (
-                "critic-only features",
-                f"{CRITIC_EXTRA_DIM} (normalized total_tat_s)",
+                "direct critic features",
+                f"{CRITIC_EXTRA_DIM} (normalized total_tat_s copy)",
             ),
-            ("actor has TotalTat", False),
+            ("actor has TotalTat", True),
             ("critic has TotalTat", True),
             (
                 "context rails",

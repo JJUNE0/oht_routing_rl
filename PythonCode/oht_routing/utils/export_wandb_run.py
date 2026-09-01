@@ -93,6 +93,8 @@ RUNTIME_SAFETY_EXPORT_COLUMNS = {
     "runtime/encoder_actor_ms",
     "runtime/actor_inference_ms",
     "runtime/device_to_host_ms",
+    "runtime/inference_queue_ms",
+    "runtime/inference_microbatch_size",
     "runtime/cost_apply_ms",
     "runtime/checkpoint_ms",
     "runtime/send_cost_ms",
@@ -112,6 +114,16 @@ OBSERVATION_EXPORT_COLUMNS = {
     "observation/predicted_route10_union_nonzero_pearson_available",
     "observation/predicted_route10_union_nonzero_ratio",
 }
+RL_RAIL_COST_EXPORT_COLUMNS = {
+    "rl/action_mean",
+    "rl/action_std",
+    "rl/action_abs_mean",
+    "rail_cost/t_ff_mean",
+    "rail_cost/congestion_mean",
+    "rail_cost/residual_mean",
+    "rail_cost/residual_abs_mean",
+    "rail_cost/final_cost_mean",
+}
 
 
 if len(WANDB_METRIC_KEYS) != len(set(WANDB_METRIC_KEYS)):
@@ -126,6 +138,8 @@ if not RUNTIME_SAFETY_EXPORT_COLUMNS <= set(WANDB_METRIC_KEYS):
     raise RuntimeError("runtime safety diagnostics are missing from W&B export schema")
 if not OBSERVATION_EXPORT_COLUMNS <= set(WANDB_METRIC_KEYS):
     raise RuntimeError("observation diagnostics are missing from W&B export schema")
+if not RL_RAIL_COST_EXPORT_COLUMNS <= set(WANDB_METRIC_KEYS):
+    raise RuntimeError("RL rail-cost diagnostics are missing from W&B export schema")
 
 EXPORT_COLUMNS = ("_step",) + WANDB_METRIC_KEYS
 EXPORT_SCHEMA_VERSION = EXP_META["version"]

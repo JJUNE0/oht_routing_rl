@@ -108,6 +108,8 @@ class EnvironmentCaptureTests(unittest.TestCase):
                 "env/episode": 8.0,
                 "episode/step": 1.0,
                 "reward/total_mean": -0.25,
+                "rl/action_mean": 0.4,
+                "rail_cost/residual_mean": 0.2,
                 "critic/q1_mean": 100.0,
             },
             total_steps=400_001,
@@ -159,6 +161,10 @@ class EnvironmentCaptureTests(unittest.TestCase):
             self.assertEqual(records[0]["rails"][0]["policy_action"], 0.4)
             self.assertEqual(records[0]["jobs"][0]["job_id"], 501)
             self.assertIn("reward/total_mean", records[0]["diagnostics"])
+            self.assertIn("rl/action_mean", records[0]["diagnostics"])
+            self.assertIn(
+                "rail_cost/residual_mean", records[0]["diagnostics"]
+            )
             self.assertNotIn("critic/q1_mean", records[0]["diagnostics"])
 
 

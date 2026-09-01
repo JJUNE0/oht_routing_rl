@@ -33,6 +33,7 @@ from oht_routing.algorithms.rl.contextual_td7 import (
 )
 from oht_routing.mdp.action import (
     EXP_RESIDUAL,
+    FREE_FLOW_RESIDUAL,
     REGION_B_RL,
     apply_controlled_action,
 )
@@ -179,6 +180,7 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
         self.replay_buffer = None
         self.learner = None
         self.stage1_policy = None
+        self.stage2_policy_warm_started_from_stage1 = False
         self.action_enabled_env_steps = 0
         self.stage2_env_steps = 0
         self.state_normalizer_loaded = False
@@ -252,6 +254,11 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
     @property
     def checkpoint_variant(self):
         """Short, collision-resistant directory name for Windows paths."""
+        action_mode_tag = (
+            "ffres"
+            if self.config.action_mode == FREE_FLOW_RESIDUAL
+            else self.config.action_mode
+        )
         return (
             f"ctx_td7_{CONTEXTUAL_VERSION}_s{int(self.config.sale_enabled)}_"
             f"l{int(self.config.lap_enabled)}_"
@@ -259,7 +266,7 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
             f"g{self.config.stage or 0}_"
             f"k{self.config.num_stacks}_i{self.config.stack_interval}_"
             f"r{self.config.reward_version}_"
-            f"{self.config.action_mode}_"
+            f"{action_mode_tag}_"
             f"{self.config.replay_sampling_mode}_"
             f"c{self.config.curriculum_scale_start:g}-"
             f"{self.config.curriculum_scale_end:g}-"
@@ -437,6 +444,9 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
                 reward_builder=self.reward_builder,
                 exploration_rng=self.exploration_rng,
                 exploration_seed=self.config.seed,
+                reject_distributed_full_resume=(
+                    self.config.mode == "training"
+                ),
             )
             self.total_steps = int(
                 resumed_runtime_metadata.get(
@@ -489,6 +499,11 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
                 )
             self.transition_aligner.episode_id = self.episode_id
             self.checkpoint_loaded = True
+            self.stage2_policy_warm_started_from_stage1 = bool(
+                resumed_runtime_metadata.get(
+                    "stage2_policy_warm_started_from_stage1", False
+                )
+            )
             self.warmup_episode_boundary_sent = bool(
                 resumed_runtime_metadata.get(
                     "warmup_episode_boundary_sent",
@@ -542,7 +557,12 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
                 self.learner,
                 observation_builder=self.observation_builder,
                 expected_reward_version=self.config.reward_version,
+                initialize_fresh_learner_policy=(
+                    self.config.resume_checkpoint_path is None
+                ),
             )
+            if self.config.resume_checkpoint_path is None:
+                self.stage2_policy_warm_started_from_stage1 = True
             resumed_stage1_sha256 = resumed_runtime_metadata.get(
                 "stage1_policy_sha256"
             )
@@ -613,6 +633,10 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
                     ("sha256", self.stage1_policy.checkpoint_sha256),
                     ("frozen", True),
                     ("prefix steps", STAGE_TWO_STAGE1_POLICY_STEPS),
+                    (
+                        "Stage 2 policy initialized from Stage 1",
+                        self.stage2_policy_warm_started_from_stage1,
+                    ),
                     (
                         "applied action scale",
                         self.stage1_policy.applied_action_scale,
@@ -760,6 +784,9 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
             "stage1_applied_action_scale": (
                 self.stage1_policy.applied_action_scale
                 if self.stage1_policy is not None else None
+            ),
+            "stage2_policy_warm_started_from_stage1": bool(
+                self.stage2_policy_warm_started_from_stage1
             ),
             "action_enabled_env_steps": self.action_enabled_env_steps,
             "normalizers_frozen": self._normalizers_frozen(),
@@ -962,6 +989,7 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
             action_mode=self.config.action_mode,
             base_cost=base_cost,
             congestion_cost=congestion_cost,
+            rl_cost_lambda=self.config.rl_cost_lambda,
         )
 
     def Reset(self, pclient):
@@ -1119,6 +1147,8 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
         return self._stage2_schedule_step()
 
     def _action_scale(self) -> float:
+        if self.config.action_mode == FREE_FLOW_RESIDUAL:
+            return 1.0
         if self.config.action_mode == EXP_RESIDUAL:
             return float(self.config.action_scale)
         start = int(self.config.effective_warmup_steps)
@@ -1723,6 +1753,7 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
             action_mode=current_action_mode,
             base_cost=base_cost,
             congestion_cost=congestion_cost,
+            rl_cost_lambda=self.config.rl_cost_lambda,
         )
         applied_action = action_result.applied_controlled_action
         self.last_applied_action = applied_action.copy()

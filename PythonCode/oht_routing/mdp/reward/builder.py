@@ -15,7 +15,11 @@ from oht_routing.mdp.reward.rail_cycle import (
     OHTCycleTracker,
     RailPassTemporalTracker,
 )
-from oht_routing.mdp.action import ACTION_MODES, REGION_B_RL
+from oht_routing.mdp.action import (
+    ACTION_MODES,
+    FREE_FLOW_RESIDUAL,
+    REGION_B_RL,
+)
 from oht_routing.utils.reward_diagnostic import RewardDiagnosticWriter
 from oht_routing.mdp.topology import ContextualTopology
 from oht_routing.mdp.reward.config import (
@@ -557,7 +561,7 @@ class ContextualRewardBuilder(ContextualRailRewardMixin):
             rail_reward_weighted_preclip,
             rail_reward_postclip,
         ) = self._scale_rail_reward(rail_reward_raw)
-        if self.config.action_mode == REGION_B_RL:
+        if self.config.action_mode in {FREE_FLOW_RESIDUAL, REGION_B_RL}:
             control_delta = np.abs(
                 (0.5 + 0.5 * action) - (0.5 + 0.5 * previous)
             )

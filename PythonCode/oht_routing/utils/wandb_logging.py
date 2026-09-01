@@ -8,6 +8,7 @@ from oht_routing.algorithms.rl.contextual_td7 import (
     contextual_algorithm_variant,
 )
 from oht_routing.mdp.action import (
+    FREE_FLOW_RESIDUAL,
     REGION_B_RL,
 )
 from oht_routing.mdp.observation import (
@@ -33,11 +34,11 @@ _EXP_REWARD_CONTRACT = reward_contract(_EXP_REWARD_VERSION)
 
 EXP_META = {
     "version": CONTEXTUAL_VERSION,
-    "cost_structure": "b_rl",
-    "action_range": "b_rl_0.0-1.0_resume_curriculum_0.05-1",
+    "cost_structure": "residual",
+    "action_range": "0.5-1.5",
     "topology": "directed_15in_15out_controlled_centers_v3",
     "observation_version": OBSERVATION_VERSION,
-    "observation": "compact_local14_actor_global5_critic_only_tat_v5",
+    "observation": "compact_local14_actor_global6_shared_tat_v6",
     "local_physical_dim": LOCAL_PHYSICAL_DIM,
     "rail_embedding_dim": 8,
     "use_attention": False,
@@ -47,9 +48,10 @@ EXP_META = {
     "critic_extra_dim": CRITIC_EXTRA_DIM,
     "relation_dim": RELATION_DIM,
     "neighbor_count_per_direction": 15,
-    "actor_has_total_tat": False,
+    "actor_has_total_tat": True,
     "critic_has_total_tat": True,
-    "critic_only_feature": "normalized_total_tat_s",
+    "shared_total_tat_feature": "normalized_total_tat_s",
+    "critic_direct_total_tat_feature": "normalized_total_tat_s",
     "obs/version": OBSERVATION_VERSION,
     "obs/local_dim": LOCAL_PHYSICAL_DIM,
     "obs/incoming_neighbors": 15,
@@ -57,7 +59,7 @@ EXP_META = {
     "obs/relation_dim": RELATION_DIM,
     "obs/actor_global_dim": ACTOR_GLOBAL_DIM,
     "obs/critic_extra_dim": CRITIC_EXTRA_DIM,
-    "obs/actor_has_total_tat": 0,
+    "obs/actor_has_total_tat": 1,
     "obs/critic_has_total_tat": 1,
     "previous_action_input": (
         "actor_and_critic_previous_applied_action_separate_from_encoder"
@@ -67,7 +69,9 @@ EXP_META = {
     "stack_interval": 1,
     "reward_version": _EXP_REWARD_VERSION,
     "tat_signal": _EXP_REWARD_CONTRACT.tat_signal_description,
-    "calibration_status": "v6_1_stage2_flat_default_compact_obs_reward_p",
+    "calibration_status": (
+        "v7_free_flow_additive_residual_reward_p"
+    ),
     "reward_global_alpha": 0.5,
     "reward_local_alpha": 0.5,
     "tat_reference": 165.0,
@@ -114,7 +118,8 @@ EXP_META = {
         "rail_outcome": 0.20,
         "smooth": 0.0316,
     },
-    "action_scale": 0.05,
+    "action_scale": 1.0,
+    "rl_cost_lambda": 0.5,
     "curriculum_scale_start": 0.05,
     "curriculum_scale_end": 1.0,
     "curriculum_shape": "geometric",
@@ -122,8 +127,8 @@ EXP_META = {
     "state_normalizer_reuse": (
         "exact_contract_load_sets_effective_warmup_to_zero"
     ),
-    "exploration_noise_std": 0.10,
-    "exploration_noise_final_std": 0.02,
+    "exploration_noise_std": 0.05,
+    "exploration_noise_final_std": 0.05,
     "exploration_noise_anneal_steps": 100_000,
     "arrival_tracking_source": "PClient.JOB_DIC.Job.ID_command_id",
     "arrival_tracking_reuse_fail_safe": True,
@@ -148,25 +153,23 @@ EXP_META = {
     "tat_above_threshold_patience": 300,
     "terminal_tat_penalty": -20.0,
     "stage2_contract": "per_episode_stage1_2000_then_stage2_to_45000",
-    "stage1_policy_load": "policy_only_frozen_with_saved_normalizers_and_scale",
+    "stage1_policy_load": (
+        "frozen_prefix_plus_fresh_stage2_policy_pipeline_warm_start"
+    ),
+    "stage2_policy_initialization": (
+        "stage1_encoder_actor_sale_fixed_once_targets_synchronized"
+    ),
     "stage2_checkpoint_clock": "stage2_env_steps",
-    "note": "v6_1_stage2_flat_default_reward_p_total_tat",
+    "distributed_runtime": "central_gpu_owner_with_independent_collectors",
+    "distributed_live_replay": "central_packed_ram",
+    "distributed_inference": "deadline_bounded_dynamic_microbatch",
+    "note": "residual",
     "description": (
-        "V6 keeps the V5 compact asymmetric observation and Reward P, "
-        "while making directional attention opt-in. The default keeps rail "
-        "embeddings and shared token encoders, then applies a positional "
-        "flat projection to each 15-neighbor direction. "
-        "Reward P uses simulator cumulative pclient.TotalTat directly in "
-        "the one-sided "
-        "penalty -4.3 * max(TotalTat - 160, 0) / 165. TotalTat == 0 "
-        "is an unavailable/reset sentinel, 0 < TotalTat <= 160 contributes "
-        "zero, and negative values are invalid. OP remains disabled with "
-        "op_weight=0.0 and use_op=False. Frozen V5 state normalizers remain "
-        "compatible after exact contract validation, but V5 model "
-        "checkpoints are incompatible with the V6 encoder schema. V6.1 adds "
-        "an optional Stage 2 training contract: a frozen policy-only Stage 1 "
-        "prefix runs for the first 2,000 ticks of every episode, then an "
-        "isolated Stage 2 learner collects and trains through tick 45,000."
+        "Apply normalized actor actions directly as additive free-flow-time "
+        "residuals with lambda 0.5; action_scale and b_rl are not part of the "
+        "new rail-cost formula. Observation, Reward P, networks, replay, "
+        "noise, congestion inputs, routing, and simulator transport remain "
+        "unchanged."
     ),
 }
 
@@ -543,6 +546,14 @@ WANDB_METRIC_KEYS = (
     "action/exploration_noise_std",
     "action/applied_mean",
     "action/applied_std",
+    "rl/action_mean",
+    "rl/action_std",
+    "rl/action_abs_mean",
+    "rail_cost/t_ff_mean",
+    "rail_cost/congestion_mean",
+    "rail_cost/residual_mean",
+    "rail_cost/residual_abs_mean",
+    "rail_cost/final_cost_mean",
     "curriculum/action_scale",
     "b_rl/mean",
     "b_rl/std",
@@ -658,6 +669,8 @@ WANDB_METRIC_KEYS = (
     "runtime/encoder_actor_ms",
     "runtime/actor_inference_ms",
     "runtime/device_to_host_ms",
+    "runtime/inference_queue_ms",
+    "runtime/inference_microbatch_size",
     "runtime/cost_apply_ms",
     "runtime/replay_push_ms",
     "runtime/replay_sample_ms",
@@ -764,6 +777,11 @@ def runtime_exp_meta(config) -> dict:
     )
     meta["action_mode"] = action_mode
     meta["dispatch_mode"] = str(config.dispatch_mode)
+    meta["num_sim"] = int(config.num_sim)
+    meta["sim_ports"] = (
+        list(config.sim_ports) if config.sim_ports is not None else None
+    )
+    meta["distributed_enabled"] = bool(config.num_sim > 1)
     meta["note"] = (
         f"{meta['note']}_r{contract.version}_s{int(config.num_stacks)}i"
         f"{int(config.stack_interval)}_dispatch_"
@@ -774,7 +792,7 @@ def runtime_exp_meta(config) -> dict:
         f"detfirst{int(config.resume_deterministic_first_episode)}_"
         f"warmstart{int(config.resume_warmstart_steps)}_"
         f"stage{int(config.stage or 0)}_"
-        f"attn{int(config.use_attention)}"
+        f"attn{int(config.use_attention)}_nsim{int(config.num_sim)}"
     )
     meta["sale"] = sale
     meta["lap"] = lap
@@ -782,19 +800,24 @@ def runtime_exp_meta(config) -> dict:
     meta["num_stacks"] = int(config.num_stacks)
     meta["stack_interval"] = int(config.stack_interval)
     meta["critic_loss_mode"] = config.critic_loss_mode
-    meta["residual_action_scale"] = float(config.action_scale)
-    meta["action_scale"] = float(
-        config.curriculum_scale_start
-        if action_mode == REGION_B_RL else config.action_scale
+    meta["residual_action_scale"] = (
+        1.0
+        if action_mode == FREE_FLOW_RESIDUAL
+        else float(config.action_scale)
     )
-    meta["effective_action_scale_start"] = float(
-        config.curriculum_scale_start
-        if action_mode == REGION_B_RL else config.action_scale
-    )
-    meta["effective_action_scale_end"] = float(
-        config.curriculum_scale_end
-        if action_mode == REGION_B_RL else config.action_scale
-    )
+    meta["rl_cost_lambda"] = float(config.rl_cost_lambda)
+    if action_mode == FREE_FLOW_RESIDUAL:
+        effective_scale_start = effective_scale_end = 1.0
+    elif action_mode == REGION_B_RL:
+        effective_scale_start = float(config.curriculum_scale_start)
+        effective_scale_end = float(config.curriculum_scale_end)
+    else:
+        effective_scale_start = effective_scale_end = float(
+            config.action_scale
+        )
+    meta["action_scale"] = effective_scale_start
+    meta["effective_action_scale_start"] = effective_scale_start
+    meta["effective_action_scale_end"] = effective_scale_end
     meta["reward_global_alpha"] = float(reward_config.global_alpha)
     meta["reward_local_alpha"] = float(reward_config.local_alpha)
     meta["local_reward_scale"] = float(reward_config.local_reward_scale)
@@ -870,7 +893,8 @@ def runtime_exp_meta(config) -> dict:
     meta["curriculum_scale_end"] = float(config.curriculum_scale_end)
     meta["curriculum_shape"] = str(config.curriculum_shape)
     meta["curriculum_enabled"] = bool(
-        config.curriculum_scale_start != config.curriculum_scale_end
+        action_mode == REGION_B_RL
+        and config.curriculum_scale_start != config.curriculum_scale_end
     )
     meta["configured_warmup_steps"] = int(config.warmup_steps)
     meta["warmup_steps"] = int(config.effective_warmup_steps)
@@ -898,6 +922,18 @@ def runtime_exp_meta(config) -> dict:
         config.resume_deterministic_first_episode
     )
     meta["resume_warmstart_steps"] = int(config.resume_warmstart_steps)
+    meta["stage2_policy_warm_start_on_fresh_run"] = bool(
+        config.stage == STAGE_TWO
+        and config.load_stage1_policy_path
+        and not config.resume_checkpoint_path
+    )
+    meta["stage2_policy_initialization"] = (
+        "stage1_encoder_actor_sale_fixed_once_targets_synchronized"
+        if meta["stage2_policy_warm_start_on_fresh_run"]
+        else "stage2_checkpoint_resume"
+        if config.stage == STAGE_TWO and config.resume_checkpoint_path
+        else "native_initialization"
+    )
     meta["seed"] = int(config.seed)
     meta["replay_capacity_env_steps"] = int(
         config.replay_capacity_env_steps
@@ -907,7 +943,13 @@ def runtime_exp_meta(config) -> dict:
         if config.lap_enabled
         else "packed_v5_local_u8_u16_critic_tat_f32_action_q15_no_lap"
     )
-    if action_mode == REGION_B_RL:
+    if action_mode == FREE_FLOW_RESIDUAL:
+        meta["cost_structure"] = "residual"
+        meta["action_range"] = (
+            f"{1.0 - float(config.rl_cost_lambda):g}-"
+            f"{1.0 + float(config.rl_cost_lambda):g}"
+        )
+    elif action_mode == REGION_B_RL:
         meta["cost_structure"] = "b_rl"
         meta["action_range"] = (
             "b_rl_0.0-1.0_"
@@ -923,6 +965,12 @@ def runtime_exp_meta(config) -> dict:
     )
     meta["exploration_noise_anneal_steps"] = int(
         config.exploration_noise_anneal_steps
+    )
+    meta["exploration_schedule"] = (
+        "constant"
+        if meta["exploration_noise_std"]
+        == meta["exploration_noise_final_std"]
+        else "linear_anneal"
     )
     meta["stage"] = config.stage
     meta["stage1_policy_prefix_steps"] = (
@@ -956,9 +1004,9 @@ def runtime_exp_meta(config) -> dict:
         f"tat_signal={contract.tat_signal_description}, "
         f"local_fixed_scale={reward_config.local_reward_scale:g}, "
         f"replay_capacity={int(config.replay_capacity_env_steps)}, "
-        "action_scale="
-        f"{float(config.curriculum_scale_start):g}->"
-        f"{float(config.curriculum_scale_end):g}, "
+        f"effective_action_scale={effective_scale_start:g}->"
+        f"{effective_scale_end:g}, "
+        f"rl_cost_lambda={float(config.rl_cost_lambda):g}, "
         "tat_termination="
         f"{config.tat_termination_policy} from episode "
         f"{int(config.effective_tat_termination_start_episode)} at "
@@ -971,7 +1019,7 @@ def runtime_exp_meta(config) -> dict:
         f"{'reused' if config.state_normalizer_warmup_bypass else 'collected'}, "
         "warmup_episode_boundary="
         f"{bool(config.terminate_on_warmup_complete)}, "
-        f"stage={config.stage}, "
+        f"stage={config.stage}, num_sim={int(config.num_sim)}, "
         "stage1_policy_prefix_steps="
         f"{STAGE_TWO_STAGE1_POLICY_STEPS if config.stage == STAGE_TWO else 0}, "
         "resume_refill="
@@ -999,8 +1047,11 @@ class ContextualWandbLogger:
 
         meta = runtime_exp_meta(config)
         expected_action_scale = (
-            config.curriculum_scale_start
-            if config.action_mode == REGION_B_RL else config.action_scale
+            1.0
+            if config.action_mode == FREE_FLOW_RESIDUAL
+            else config.curriculum_scale_start
+            if config.action_mode == REGION_B_RL
+            else config.action_scale
         )
         assert meta["action_scale"] == float(expected_action_scale)
         assert meta["exploration_noise_std"] == float(

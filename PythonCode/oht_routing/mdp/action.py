@@ -11,8 +11,9 @@ from oht_routing.mdp.topology import ContextualTopology
 
 MAX_SIMULATOR_COST = 16_777_215.99
 REGION_B_RL = "region_b_rl"
+FREE_FLOW_RESIDUAL = "free_flow_residual"
 EXP_RESIDUAL = "exp_residual"
-ACTION_MODES = (REGION_B_RL, EXP_RESIDUAL)
+ACTION_MODES = (FREE_FLOW_RESIDUAL, REGION_B_RL, EXP_RESIDUAL)
 
 
 class ContextualActionError(FloatingPointError):
@@ -102,12 +103,13 @@ def apply_controlled_action(
     *,
     action_enabled: bool,
     action_scale: float,
-    action_mode: str = REGION_B_RL,
+    action_mode: str = FREE_FLOW_RESIDUAL,
     base_cost=None,
     congestion_cost=None,
+    rl_cost_lambda: float = 0.5,
     max_cost: float = MAX_SIMULATOR_COST,
 ) -> ContextualActionResult:
-    """Scale raw action into applied space and map it to controlled rail costs."""
+    """Map normalized actor actions to controlled rail costs."""
     validate_topology_partition(topology)
     physical_count = len(topology.all_rail_ids)
     baseline = _finite_vector("baseline_cost", baseline_cost, physical_count)
@@ -122,6 +124,9 @@ def apply_controlled_action(
         raise ContextualActionError(
             f"action_mode must be one of {ACTION_MODES}, got {action_mode!r}"
         )
+    residual_lambda = float(rl_cost_lambda)
+    if not np.isfinite(residual_lambda) or not 0.0 <= residual_lambda <= 1.0:
+        raise ContextualActionError("rl_cost_lambda must be finite and in [0, 1]")
     controlled = _finite_vector(
         "controlled_action",
         np.asarray(controlled_action).reshape(-1),
@@ -129,11 +134,22 @@ def apply_controlled_action(
     )
     if (np.abs(controlled) > 1.0 + 1e-6).any():
         raise ContextualActionError("controlled_action must be in [-1, 1]")
-    applied = (
-        np.clip(scale * controlled, -1.0, 1.0)
-        if action_enabled and scale > 0.0
-        else np.zeros_like(controlled)
-    )
+    if action_mode == FREE_FLOW_RESIDUAL:
+        # The cost-driving action is the actor's normalized action itself.
+        # action_scale and the legacy b_rl representation are intentionally
+        # absent from this mode.
+        applied = (
+            controlled.copy()
+            if action_enabled else np.zeros_like(controlled)
+        )
+        effective_scale = 1.0
+    else:
+        applied = (
+            np.clip(scale * controlled, -1.0, 1.0)
+            if action_enabled and scale > 0.0
+            else np.zeros_like(controlled)
+        )
+        effective_scale = scale
     full_action = assemble_full_action(topology, applied)
     final_cost = baseline.copy()
     controlled_rows = topology.controlled_row_to_physical_index
@@ -141,7 +157,8 @@ def apply_controlled_action(
         np.asarray(topology.physical_index_to_controlled_row) == -1
     )
     b_rl = None
-    if action_mode == REGION_B_RL:
+    rail_cost_diagnostics = None
+    if action_mode in {FREE_FLOW_RESIDUAL, REGION_B_RL}:
         base = _finite_vector("base_cost", base_cost, physical_count)
         congestion = _finite_vector(
             "congestion_cost", congestion_cost, physical_count
@@ -149,8 +166,26 @@ def apply_controlled_action(
         neutral = base + 0.5 * congestion
         if not np.allclose(neutral, baseline, rtol=1e-10, atol=1e-10):
             raise ContextualActionError(
-                "region_b_rl neutral cost does not match baseline"
+                "neutral rail-cost components do not match baseline"
             )
+    if action_mode == FREE_FLOW_RESIDUAL:
+        residual = residual_lambda * base[controlled_rows] * applied
+        final_cost[controlled_rows] = baseline[controlled_rows] + residual
+        rail_cost_diagnostics = {
+            "rl/action_mean": float(applied.mean()),
+            "rl/action_std": float(applied.std()),
+            "rl/action_abs_mean": float(np.abs(applied).mean()),
+            "rail_cost/t_ff_mean": float(base[controlled_rows].mean()),
+            "rail_cost/congestion_mean": float(
+                (0.5 * congestion[controlled_rows]).mean()
+            ),
+            "rail_cost/residual_mean": float(residual.mean()),
+            "rail_cost/residual_abs_mean": float(np.abs(residual).mean()),
+            "rail_cost/final_cost_mean": float(
+                final_cost[controlled_rows].mean()
+            ),
+        }
+    elif action_mode == REGION_B_RL:
         b_rl = 0.5 + 0.5 * applied
         final_cost[controlled_rows] = (
             base[controlled_rows]
@@ -187,7 +222,7 @@ def apply_controlled_action(
         "action/applied_controlled_std": float(applied.std()),
         "action/applied_controlled_min": float(applied.min()),
         "action/applied_controlled_max": float(applied.max()),
-        "action/applied_scale": scale,
+        "action/applied_scale": effective_scale,
         "boundary/action_abs_max": float(
             np.abs(full_action[boundary_rows]).max(initial=0.0)
         ),
@@ -204,6 +239,9 @@ def apply_controlled_action(
         "cost/controlled_ratio_mean": float(ratios.mean()),
         "cost/controlled_ratio_std": float(ratios.std()),
         "action/mode_region_b_rl": float(action_mode == REGION_B_RL),
+        "action/mode_free_flow_residual": float(
+            action_mode == FREE_FLOW_RESIDUAL
+        ),
     }
     if b_rl is not None:
         diagnostics.update({
@@ -212,6 +250,8 @@ def apply_controlled_action(
             "b_rl/min": float(b_rl.min()),
             "b_rl/max": float(b_rl.max()),
         })
+    if rail_cost_diagnostics is not None:
+        diagnostics.update(rail_cost_diagnostics)
     return ContextualActionResult(
         full_action=full_action,
         applied_controlled_action=np.ascontiguousarray(

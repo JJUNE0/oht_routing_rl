@@ -203,19 +203,97 @@ def _validate_frozen_normalizer_state(name: str, state: object) -> None:
         )
 
 
+def _initialize_fresh_learner_policy(
+    learner,
+    *,
+    frozen_encoder: torch.nn.Module,
+    frozen_actor: torch.nn.Module,
+    frozen_sale: torch.nn.Module | None,
+) -> None:
+    """Warm-start a pristine learner's policy path without resuming training.
+
+    Stage 2 keeps a fresh critic, optimizer state, replay, counters, Q bounds,
+    and RNG streams.  Loading state into the existing module objects also
+    preserves the parameter references already owned by the fresh optimizers.
+    """
+    counters = {
+        name: int(getattr(learner, name, 0))
+        for name in (
+            "learner_update_count",
+            "actor_update_count",
+            "target_update_count",
+            "sale_update_count",
+            "sale_fixed_generation",
+        )
+    }
+    replay_size = int(getattr(learner.replay, "size_env_steps", 0))
+    optimizers = tuple(
+        optimizer
+        for optimizer in (
+            getattr(learner, "encoder_optimizer", None),
+            getattr(learner, "actor_optimizer", None),
+            getattr(learner, "critic_optimizer", None),
+            getattr(learner, "sale_optimizer", None),
+        )
+        if optimizer is not None
+    )
+    if (
+        bool(getattr(learner, "_stage1_policy_warm_started", False))
+        or replay_size != 0
+        or any(value != 0 for value in counters.values())
+        or any(bool(optimizer.state) for optimizer in optimizers)
+    ):
+        raise ContextualCheckpointError(
+            "Stage 2 policy warm-start requires a pristine learner with an "
+            "empty replay, zero update counters, and fresh optimizers"
+        )
+
+    learner.encoder.load_state_dict(frozen_encoder.state_dict(), strict=True)
+    learner.actor.load_state_dict(frozen_actor.state_dict(), strict=True)
+    # A new Stage 2 clock must not inherit the lagged Stage 1 target clock.
+    # Start its policy targets exactly at the behaviorally active online copy.
+    learner.target_encoder.load_state_dict(
+        frozen_encoder.state_dict(), strict=True
+    )
+    learner.target_actor.load_state_dict(frozen_actor.state_dict(), strict=True)
+
+    if learner.config.sale_enabled:
+        if frozen_sale is None:
+            raise ContextualCheckpointError(
+                "SALE-enabled Stage 2 policy warm-start requires sale_fixed"
+            )
+        sale_state = frozen_sale.state_dict()
+        # The saved actor consumed sale_fixed.  Use that same basis for every
+        # fresh Stage 2 SALE role so the first target update cannot replace it
+        # with a random online representation.
+        learner.sale_online.load_state_dict(sale_state, strict=True)
+        learner.sale_fixed.load_state_dict(sale_state, strict=True)
+        learner.sale_target_fixed.load_state_dict(sale_state, strict=True)
+    elif frozen_sale is not None:
+        raise ContextualCheckpointError(
+            "SALE-disabled Stage 2 policy received an unexpected SALE module"
+        )
+    learner._stage1_policy_warm_started = True
+
+
 def load_frozen_contextual_policy(
     path,
     learner,
     *,
     observation_builder,
     expected_reward_version: str,
+    initialize_fresh_learner_policy: bool = False,
 ) -> FrozenContextualPolicy:
-    """Load only the policy-side Stage 1 contract for a Stage 2 prefix.
+    """Load the policy-side Stage 1 contract for a Stage 2 prefix.
 
-    Unlike :func:`load_contextual_checkpoint`, this function intentionally
-    leaves the Stage 2 critic, target networks, optimizers, counters, replay,
-    reward state, and every process RNG untouched.
+    By default this only creates the isolated frozen prefix policy.  A fresh
+    Stage 2 run may additionally initialize its online/target policy path from
+    that behavior via ``initialize_fresh_learner_policy=True``.  This never
+    restores the Stage 1 critic, optimizer state, replay, counters, reward
+    state, Q bounds, applied-action scale, or process RNG streams.
     """
+    if not isinstance(initialize_fresh_learner_policy, bool):
+        raise TypeError("initialize_fresh_learner_policy must be bool")
     target = Path(path)
     checkpoint_sha256 = _checkpoint_sha256(target)
     payload = torch.load(target, map_location="cpu", weights_only=False)
@@ -227,6 +305,11 @@ def load_frozen_contextual_policy(
         raise ContextualCheckpointError(
             "Crash checkpoint Stage 1 policy load refused. "
             "Crash checkpoints are diagnostic artifacts only."
+        )
+    if runtime_metadata.get("stage") != 1:
+        raise ContextualCheckpointError(
+            "Stage 2 prefix policy load requires a Stage 1 checkpoint: "
+            f"saved_stage={runtime_metadata.get('stage')!r}"
         )
     _validate_checkpoint_reward_identity(
         payload,
@@ -357,6 +440,13 @@ def load_frozen_contextual_policy(
         raise ContextualCheckpointError(
             "Stage 1 checkpoint changed while it was being loaded"
         )
+    if initialize_fresh_learner_policy:
+        _initialize_fresh_learner_policy(
+            learner,
+            frozen_encoder=frozen_encoder,
+            frozen_actor=frozen_actor,
+            frozen_sale=frozen_sale,
+        )
     return FrozenContextualPolicy(
         encoder=frozen_encoder,
         actor=frozen_actor,
@@ -485,6 +575,7 @@ def load_contextual_checkpoint(
     reward_builder,
     exploration_rng=None,
     exploration_seed=0,
+    reject_distributed_full_resume=False,
 ) -> dict:
     target = Path(path)
     payload = torch.load(target, map_location=learner.device, weights_only=False)
@@ -496,6 +587,18 @@ def load_contextual_checkpoint(
         raise ContextualCheckpointError(
             "Crash checkpoint resume refused. "
             "Crash checkpoints are diagnostic artifacts only."
+        )
+    if (
+        reject_distributed_full_resume
+        and runtime_metadata.get("distributed") is True
+        and runtime_metadata.get(
+            "distributed_full_resume_supported"
+        ) is not True
+    ):
+        raise ContextualCheckpointError(
+            "distributed checkpoint full-state training resume is not "
+            "supported; start a fresh distributed Stage 2 run from "
+            "--load-stage1-policy"
         )
     _validate_checkpoint_reward_identity(
         payload,

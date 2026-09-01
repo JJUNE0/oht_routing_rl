@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from numbers import Integral
 from typing import TYPE_CHECKING
 
@@ -32,6 +33,46 @@ from oht_routing.utils.reward_diagnostic import parse_diagnostic_windows
 
 if TYPE_CHECKING:
     from oht_routing.runtime.config import ContextualRuntimeConfig
+
+
+def _validate_simulator_endpoints(config: ContextualRuntimeConfig) -> None:
+    if isinstance(config.num_sim, bool) or not isinstance(
+        config.num_sim, Integral
+    ) or int(config.num_sim) <= 0:
+        raise ValueError("num_sim must be a positive integer")
+    object.__setattr__(config, "num_sim", int(config.num_sim))
+
+    ports = config.sim_ports
+    if ports is None:
+        if config.num_sim > 1:
+            raise ValueError(
+                "num_sim > 1 requires explicit sim_ports"
+            )
+        return
+    if isinstance(ports, (str, bytes)) or not isinstance(ports, Sequence):
+        raise ValueError("sim_ports must be a sequence of integer ports")
+
+    normalized = []
+    for port in ports:
+        if (
+            isinstance(port, bool)
+            or not isinstance(port, Integral)
+            or int(port) < 1
+            or int(port) > 65_535
+        ):
+            raise ValueError(
+                "sim_ports values must be integers in [1, 65535]"
+            )
+        normalized.append(int(port))
+    normalized = tuple(normalized)
+    if len(normalized) != config.num_sim:
+        raise ValueError(
+            "sim_ports count must equal num_sim: "
+            f"ports={len(normalized)}, num_sim={config.num_sim}"
+        )
+    if len(set(normalized)) != len(normalized):
+        raise ValueError("sim_ports must contain unique ports")
+    object.__setattr__(config, "sim_ports", normalized)
 
 
 def _resolve_reward_and_termination(config: ContextualRuntimeConfig) -> None:
@@ -140,6 +181,12 @@ def _validate_runtime_modes(config: ContextualRuntimeConfig) -> None:
         or config.action_scale > 1.0
     ):
         raise ValueError("action_scale must be finite and in [0, 1]")
+    if (
+        not np.isfinite(config.rl_cost_lambda)
+        or config.rl_cost_lambda < 0.0
+        or config.rl_cost_lambda > 1.0
+    ):
+        raise ValueError("rl_cost_lambda must be finite and in [0, 1]")
     for name in ("resume_warmstart_steps",):
         value = getattr(config, name)
         if isinstance(value, bool) or not isinstance(value, Integral):
@@ -246,6 +293,32 @@ def _resolve_and_validate_resume(config: ContextualRuntimeConfig) -> None:
         )
 
 
+def _validate_distributed_runtime(config: ContextualRuntimeConfig) -> None:
+    """Keep the first multi-simulator contract narrow and restart-safe."""
+
+    if config.num_sim == 1:
+        return
+    if config.mode != "training" or config.stage != STAGE_TWO:
+        raise ValueError(
+            "num_sim > 1 currently requires Stage 2 training"
+        )
+    if config.load_stage1_policy_path is None:
+        raise ValueError(
+            "distributed Stage 2 requires --load-stage1-policy"
+        )
+    if config.resume_checkpoint_path is not None:
+        raise ValueError(
+            "distributed full-state checkpoint resume is not supported; "
+            "start a fresh distributed Stage 2 learner from "
+            "--load-stage1-policy"
+        )
+    if config.save_state_normalizer_path is not None:
+        raise ValueError(
+            "distributed Stage 2 uses the frozen normalizers embedded in "
+            "the Stage 1 checkpoint"
+        )
+
+
 def _validate_training_controls(config: ContextualRuntimeConfig) -> None:
     if config.mode == "training" and config.action_scale <= 0:
         raise ValueError("training mode requires positive action_scale")
@@ -318,8 +391,10 @@ def _validate_training_controls(config: ContextualRuntimeConfig) -> None:
 def validate_runtime_config(config: ContextualRuntimeConfig) -> None:
     """Resolve defaults and reject incompatible runtime settings."""
     _resolve_reward_and_termination(config)
+    _validate_simulator_endpoints(config)
     _validate_runtime_modes(config)
     _resolve_and_validate_resume(config)
+    _validate_distributed_runtime(config)
     _validate_training_controls(config)
     make_reward_config(config)
 

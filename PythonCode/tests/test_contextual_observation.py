@@ -207,9 +207,9 @@ class ContextualObservationTests(unittest.TestCase):
         )
         return builder, pclient, batch
 
-    def test_v5_feature_contract_names_order_and_dimensions(self):
+    def test_v6_feature_contract_names_order_and_dimensions(self):
         self.assertEqual(LOCAL_PHYSICAL_DIM, 14)
-        self.assertEqual(ACTOR_GLOBAL_DIM, 5)
+        self.assertEqual(ACTOR_GLOBAL_DIM, 6)
         self.assertEqual(GLOBAL_DIM, ACTOR_GLOBAL_DIM)
         self.assertEqual(CRITIC_EXTRA_DIM, 1)
         self.assertEqual(RELATION_DIM, 2)
@@ -235,6 +235,7 @@ class ContextualObservationTests(unittest.TestCase):
         self.assertEqual(
             ACTOR_GLOBAL_FEATURE_NAMES,
             (
+                "total_tat_s",
                 "operation_rate",
                 "queued_ratio",
                 "waiting_ratio",
@@ -326,6 +327,7 @@ class ContextualObservationTests(unittest.TestCase):
         )
         expected = np.asarray(
             (
+                120.0,
                 0.75,
                 3.0 / 6.0,
                 2.0 / 6.0,
@@ -361,7 +363,7 @@ class ContextualObservationTests(unittest.TestCase):
             0.0,
         )
 
-    def test_total_tat_is_raw_and_normalized_critic_only_scalar(self):
+    def test_total_tat_is_normalized_for_actor_and_direct_critic_input(self):
         builder = self.builder(
             normalizer_config=ObservationNormalizerConfig(clip=None)
         )
@@ -376,6 +378,11 @@ class ContextualObservationTests(unittest.TestCase):
         np.testing.assert_array_equal(
             first.critic_total_tat, np.asarray([120.0], np.float32)
         )
+        self.assertEqual(float(first.actor_global_raw[0]), 120.0)
+        self.assertEqual(
+            float(first.actor_global_state[0]),
+            float(first.critic_total_tat[0]),
+        )
 
         pclient.TotalTat = 240.0
         expected_normalized = builder.critic_normalizer.normalize(
@@ -389,6 +396,11 @@ class ContextualObservationTests(unittest.TestCase):
         )
         np.testing.assert_array_equal(
             second.critic_total_tat, expected_normalized
+        )
+        self.assertEqual(float(second.actor_global_raw[0]), 240.0)
+        self.assertEqual(
+            float(second.actor_global_state[0]),
+            float(second.critic_total_tat[0]),
         )
         self.assertIs(second.actor_global_state, second.global_state)
         self.assertIs(second.actor_global_raw, second.global_raw)
@@ -694,7 +706,7 @@ class ContextualObservationTests(unittest.TestCase):
                 pclient, next_10_route_oht_count=self.route_ahead
             )
 
-    def test_v5_three_state_normalizers_save_and_load_exact_contract(self):
+    def test_v6_three_state_normalizers_save_and_load_exact_contract(self):
         first = self.builder(
             normalizer_config=ObservationNormalizerConfig(
                 freeze_after_env_steps=1
@@ -748,31 +760,25 @@ class ContextualObservationTests(unittest.TestCase):
             second.critic_normalizer.count, first.critic_normalizer.count
         )
 
-    def test_v5_state_normalizer_remains_compatible_with_v6_runtime(self):
+    def test_pre_actor_tat_v6_normalizer_is_rejected(self):
         first = self.builder(
             normalizer_config=ObservationNormalizerConfig(
                 freeze_after_env_steps=1
             )
         )
         self.build(builder=first)
-        path = Path(self.directory.name) / "v5_0_normalizers.npz"
+        path = Path(self.directory.name) / "v6_1_normalizers.npz"
         first.save_normalizers(path, require_frozen=True)
         with np.load(path, allow_pickle=False) as saved:
             payload = {key: saved[key].copy() for key in saved.files}
-        payload["version"] = np.asarray("v5.0.0")
+        payload["version"] = np.asarray("v6.1.0")
+        payload["observation_version"] = np.asarray("v5")
         np.savez_compressed(path, **payload)
 
-        second = self.builder()
-        second.load_normalizers(path, require_frozen=True)
-        np.testing.assert_array_equal(
-            second.local_normalizer.mean, first.local_normalizer.mean
-        )
-        np.testing.assert_array_equal(
-            second.global_normalizer.mean, first.global_normalizer.mean
-        )
-        np.testing.assert_array_equal(
-            second.critic_normalizer.mean, first.critic_normalizer.mean
-        )
+        with self.assertRaisesRegex(
+            ObservationContractError, "version mismatch"
+        ):
+            self.builder().load_normalizers(path, require_frozen=True)
 
     def test_state_normalizer_feature_order_mismatch_fails_fast(self):
         first = self.builder(
@@ -789,6 +795,10 @@ class ContextualObservationTests(unittest.TestCase):
             (
                 "local_physical_feature_names",
                 np.asarray(tuple(reversed(LOCAL_PHYSICAL_FEATURE_NAMES))),
+            ),
+            (
+                "global_feature_names",
+                np.asarray(ACTOR_GLOBAL_FEATURE_NAMES[1:]),
             ),
             ("critic_feature_names", np.asarray(("wrong_total_tat",))),
         )
