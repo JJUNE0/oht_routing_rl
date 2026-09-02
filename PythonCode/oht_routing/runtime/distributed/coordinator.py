@@ -180,7 +180,8 @@ class CentralTrainingCoordinator:
             f"{algorithm}_g{self.config.stage or 0}_"
             f"k{self.config.num_stacks}_i{self.config.stack_interval}_"
             f"r{self.config.reward_version}_{self.config.action_mode}_"
-            f"{self.config.replay_sampling_mode}"
+            f"{self.config.replay_sampling_mode}_"
+            f"e{self.config.replay_eviction_mode}"
         )
 
     def _queue_request(self, target: queue.Queue, request) -> None:
@@ -365,6 +366,7 @@ class CentralTrainingCoordinator:
             lap_enabled=self.config.lap_enabled,
             reward_version=self.config.reward_version,
             sampling_mode=self.config.replay_sampling_mode,
+            eviction_mode=self.config.replay_eviction_mode,
             num_stacks=self.config.num_stacks,
             stack_interval=self.config.stack_interval,
         )
@@ -753,6 +755,7 @@ class CentralTrainingCoordinator:
             "reward_version": self.config.reward_version,
             "num_stacks": self.config.num_stacks,
             "stack_interval": self.config.stack_interval,
+            "replay_eviction_mode": self.config.replay_eviction_mode,
             "dispatch_mode": self.config.dispatch_mode,
             "runtime_env_step": self._schedule_step,
             "episode_id": 0,

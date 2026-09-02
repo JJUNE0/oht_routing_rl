@@ -10,6 +10,8 @@ import numpy as np
 
 from oht_dispatching.config import DISPATCH_MODES
 from oht_routing.algorithms.rl.contextual_td7 import (
+    REPLAY_EVICTION_MODES,
+    REPLAY_EVICTION_RANDOM,
     REPLAY_SAMPLING_MODES,
     REPLAY_SAMPLING_RANDOM_RAIL,
     REPLAY_SAMPLING_SNAPSHOT,
@@ -163,6 +165,17 @@ def _validate_runtime_modes(config: ContextualRuntimeConfig) -> None:
     if config.replay_sampling_mode not in REPLAY_SAMPLING_MODES:
         raise ValueError(
             f"replay_sampling_mode must be one of {REPLAY_SAMPLING_MODES}"
+        )
+    if config.replay_eviction_mode not in REPLAY_EVICTION_MODES:
+        raise ValueError(
+            f"replay_eviction_mode must be one of {REPLAY_EVICTION_MODES}"
+        )
+    if (
+        config.replay_eviction_mode == REPLAY_EVICTION_RANDOM
+        and config.num_stacks != 1
+    ):
+        raise ValueError(
+            "random replay eviction currently requires num_stacks=1"
         )
     if config.dispatch_mode not in DISPATCH_MODES:
         raise ValueError(f"dispatch_mode must be one of {DISPATCH_MODES}")

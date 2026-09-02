@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from oht_routing.algorithms.rl.contextual_td7 import (
+    REPLAY_EVICTION_FIFO,
     contextual_algorithm_variant,
 )
 from oht_routing.mdp.action import (
@@ -138,6 +139,7 @@ EXP_META = {
     ),
     "centering": False,
     "replay_capacity_env_steps": 100_000,
+    "replay_eviction_mode": REPLAY_EVICTION_FIFO,
     "replay_storage": (
         "packed_v5_local_u8_u16_critic_tat_f32_action_q15_lap_fp16"
     ),
@@ -163,13 +165,12 @@ EXP_META = {
     "distributed_runtime": "central_gpu_owner_with_independent_collectors",
     "distributed_live_replay": "central_packed_ram",
     "distributed_inference": "deadline_bounded_dynamic_microbatch",
-    "note": "residual",
+    "note": "eviction",
     "description": (
-        "Apply normalized actor actions directly as additive free-flow-time "
-        "residuals with lambda 0.5; action_scale and b_rl are not part of the "
-        "new rail-cost formula. Observation, Reward P, networks, replay, "
-        "noise, congestion inputs, routing, and simulator transport remain "
-        "unchanged."
+        "Add configurable full-buffer replay eviction while retaining FIFO "
+        "as the default; random replacement is an opt-in mode restricted to "
+        "single-frame observations. Observation, Reward P, networks, actions, "
+        "routing, and simulator transport remain unchanged."
     ),
 }
 
@@ -787,7 +788,7 @@ def runtime_exp_meta(config) -> dict:
         f"{int(config.stack_interval)}_dispatch_"
         f"{str(config.dispatch_mode).replace('-', '_')}_normreuse"
         f"{int(config.state_normalizer_warmup_bypass)}_b"
-        f"{int(config.batch_size)}_"
+        f"{int(config.batch_size)}_evict{config.replay_eviction_mode}_"
         f"fullrefill{int(config.resume_inference_until_replay_full)}_"
         f"detfirst{int(config.resume_deterministic_first_episode)}_"
         f"warmstart{int(config.resume_warmstart_steps)}_"
@@ -797,6 +798,7 @@ def runtime_exp_meta(config) -> dict:
     meta["sale"] = sale
     meta["lap"] = lap
     meta["replay_sampling_mode"] = config.replay_sampling_mode
+    meta["replay_eviction_mode"] = config.replay_eviction_mode
     meta["num_stacks"] = int(config.num_stacks)
     meta["stack_interval"] = int(config.stack_interval)
     meta["critic_loss_mode"] = config.critic_loss_mode
@@ -988,12 +990,14 @@ def runtime_exp_meta(config) -> dict:
     replay_mode = "lap" if lap else "uniform"
     meta["replay"] = (
         f"{config.replay_sampling_mode}_{replay_mode}_"
+        f"evict_{config.replay_eviction_mode}_"
         f"{int(config.replay_capacity_env_steps)}"
     )
     meta["description"] = (
         f"{EXP_META['description']} Directional contextual TD7 with "
         f"SALE={'on' if sale else 'off'}, LAP={'on' if lap else 'off'}, "
         f"replay_sampling={config.replay_sampling_mode}, "
+        f"replay_eviction={config.replay_eviction_mode}, "
         f"stack={int(config.num_stacks)}x{int(config.stack_interval)}, "
         f"action_mode={action_mode}, dispatch_mode={config.dispatch_mode}, "
         f"critic_loss={config.critic_loss_mode}, "

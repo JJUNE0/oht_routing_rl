@@ -536,6 +536,9 @@ def save_contextual_checkpoint(
             torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
         ),
         "replay_rng_state": learner.replay.rng.bit_generator.state,
+        "replay_eviction_rng_state": (
+            learner.replay.eviction_rng.bit_generator.state
+        ),
         "exploration_rng_state": (
             exploration_rng.bit_generator.state
             if exploration_rng is not None else None
@@ -687,6 +690,12 @@ def load_contextual_checkpoint(
         ]
         torch.cuda.set_rng_state_all(cuda_rng_states)
     learner.replay.rng.bit_generator.state = payload["replay_rng_state"]
+    replay_eviction_state = payload.get("replay_eviction_rng_state")
+    if (
+        replay_eviction_state is not None
+        and hasattr(learner.replay, "eviction_rng")
+    ):
+        learner.replay.eviction_rng.bit_generator.state = replay_eviction_state
     if exploration_rng is not None:
         exploration_state = payload.get("exploration_rng_state")
         if exploration_state is not None:

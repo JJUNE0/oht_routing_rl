@@ -45,3 +45,43 @@ checkpoints must not be resumed or used as Stage 1 policies.
   function checks. At capture index 0 all 4,996 controlled rails had zero
   congestion and nonzero action, yet all costs changed according to the
   free-flow residual; rail 1 changed from `0.73` to `1.0897705835103988`.
+
+## v7.1.0 — Configurable full-buffer replay eviction
+
+### Purpose
+
+Add `replay_eviction_mode` with `fifo` and `random` choices. `fifo` remains the
+default and preserves the existing circular overwrite behavior exactly. Once a
+replay configured for `random` reaches capacity, each incoming environment-step
+transition replaces a uniformly selected live transition slot instead of the
+oldest slot. Insertion before capacity remains sequential.
+
+Random eviction uses a dedicated seeded RNG so replacement decisions do not
+advance the replay-sampling RNG. Live transition states use reference counts
+and a fixed-size free-slot stack, so a randomly retained transition cannot
+lose its current or next state to the former FIFO state cursor. Random eviction
+is currently restricted to `num_stacks=1`;
+stacked observations continue to require the contiguous-history guarantees of
+FIFO eviction. The runtime and checkpoint directory identities, startup
+summary, checkpoint metadata/config, and W&B config, run note, replay label,
+and description all record the resolved eviction mode.
+
+### Compatibility
+
+This is a MINOR release because it adds an opt-in replay policy and runtime
+configuration without changing network tensors, topology mapping, action or
+observation shapes, reward meaning, replay sample tensors, or the default FIFO
+behavior. V7.0 checkpoints remain compatible with V7.1; artifacts without the
+new configuration or eviction-RNG state resolve to FIFO and a deterministic
+seeded fallback. Replay contents remain excluded from checkpoints and are
+refilled after resume.
+
+### Verification
+
+- Focused configuration tests cover the FIFO default, both CLI choices,
+  rejection of unknown modes, and the `random` plus `num_stacks=1` contract.
+- Replay checks cover unchanged FIFO ordering, sequential fill followed by
+  seeded random replacement, sampling/eviction RNG independence, live-key and
+  state-reference integrity, and LAP priority reset on a replaced slot.
+- Provenance checks confirm distinct runtime, checkpoint, and W&B identities
+  for FIFO and random eviction modes.

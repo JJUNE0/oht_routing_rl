@@ -6,6 +6,7 @@ import numpy as np
 from oht_routing.algorithms.rl.contextual_td7.replay_buffer import (
     ContextualReplayError,
     ContextualStepReplayBuffer,
+    REPLAY_EVICTION_RANDOM,
     ReplaySampleKey,
 )
 from test_contextual_observation import make_topology
@@ -102,6 +103,75 @@ class ContextualLAPTests(unittest.TestCase):
         self.assertTrue(np.all(replay._priority[1] == maximum))
         replay.push(make_snapshot(replay.topology, 2))
         self.assertTrue(np.all(replay._priority[0] == maximum))
+
+    def test_random_eviction_resets_victim_priority_and_cached_statistics(self):
+        topology = make_topology()
+        replay = ContextualStepReplayBuffer(
+            topology,
+            FakeObservationBuilder(topology),
+            capacity_env_steps=4,
+            seed=0,
+            lap_enabled=True,
+            lap_alpha=0.4,
+            lap_min_priority=1.0,
+            eviction_mode=REPLAY_EVICTION_RANDOM,
+        )
+        initial = [
+            replay.push(make_snapshot(topology, step))
+            for step in range(replay.capacity)
+        ]
+        reference_rng = np.random.default_rng()
+        reference_rng.bit_generator.state = copy.deepcopy(
+            replay.eviction_rng.bit_generator.state
+        )
+        expected_victim = int(reference_rng.integers(replay.capacity))
+        self.assertNotEqual(expected_victim, 0)
+
+        hot = ReplaySampleKey(
+            initial[0].step_slot, initial[0].generation, 7
+        )
+        victim_key = ReplaySampleKey(
+            initial[expected_victim].step_slot,
+            initial[expected_victim].generation,
+            8,
+        )
+        replay.update_priorities([hot, victim_key], [1e5, 16.0])
+        maximum = replay.max_priority
+        before = replay._priority.copy()
+
+        replacement = replay.push(make_snapshot(topology, 4))
+        survivor_slots = np.asarray([
+            slot for slot in range(replay.capacity)
+            if slot != expected_victim
+        ], dtype=np.int64)
+        self.assertEqual(replacement.step_slot, expected_victim)
+        np.testing.assert_array_equal(
+            replay._priority[survivor_slots], before[survivor_slots]
+        )
+        self.assertTrue(
+            np.all(
+                replay._priority[expected_victim]
+                == np.float16(maximum)
+            )
+        )
+        active = replay._priority[expected_victim].astype(np.float64)
+        self.assertEqual(
+            replay._priority_sum[expected_victim],
+            active.sum(dtype=np.float64),
+        )
+        self.assertEqual(
+            replay._priority_sq_sum[expected_victim],
+            np.square(active).sum(dtype=np.float64),
+        )
+        self.assertEqual(
+            float(replay._priority_min[expected_victim]), maximum
+        )
+        self.assertEqual(
+            float(replay._priority_max[expected_victim]), maximum
+        )
+        self.assertEqual(replay.max_priority, maximum)
+        with self.assertRaises(ContextualReplayError):
+            replay.update_priorities([victim_key], [2.0])
 
     def test_stale_generation_priority_update_rejected(self):
         replay = self.replay()

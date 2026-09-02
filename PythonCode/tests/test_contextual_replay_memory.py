@@ -1,10 +1,14 @@
+import copy
 import unittest
+from collections import Counter
+from dataclasses import replace
 
 import numpy as np
 
 from oht_routing.algorithms.rl.contextual_td7.replay_buffer import (
     ContextualReplayError,
     ContextualStepReplayBuffer,
+    REPLAY_EVICTION_RANDOM,
     REPLAY_SAMPLING_SNAPSHOT,
     STATIC_PHYSICAL_FEATURE_INDICES,
     UINT16_PHYSICAL_FEATURE_INDICES,
@@ -32,6 +36,310 @@ class ContextualReplayMemoryTests(unittest.TestCase):
         with self.assertRaises(ContextualReplayError):
             replay.validate_sample_keys([stale])
         self.assertEqual(replay.stale_key_reject_count, 1)
+
+    def test_random_eviction_fills_before_seeded_non_fifo_replacement(self):
+        replay = ContextualStepReplayBuffer(
+            self.topology,
+            self.builder,
+            capacity_env_steps=4,
+            seed=0,
+            eviction_mode=REPLAY_EVICTION_RANDOM,
+        )
+        initial = [
+            replay.push(make_snapshot(self.topology, step))
+            for step in range(replay.capacity)
+        ]
+
+        self.assertEqual(
+            [key.step_slot for key in initial], list(range(replay.capacity))
+        )
+        self.assertEqual([key.generation for key in initial], [1] * 4)
+        self.assertEqual(replay.size_env_steps, replay.capacity)
+        self.assertEqual(replay.overwrite_count, 0)
+
+        reference_rng = np.random.default_rng()
+        reference_rng.bit_generator.state = copy.deepcopy(
+            replay.eviction_rng.bit_generator.state
+        )
+        expected_victim = int(reference_rng.integers(replay.capacity))
+        self.assertNotEqual(expected_victim, 0)
+
+        replacement = replay.push(make_snapshot(self.topology, 4))
+        live_keys = {
+            replay._transition_keys[slot]
+            for slot in np.flatnonzero(replay._transition_valid)
+        }
+        expected_live = {(0, step) for step in range(4)}
+        expected_live.remove((0, expected_victim))
+        expected_live.add((0, 4))
+
+        self.assertEqual(replacement.step_slot, expected_victim)
+        self.assertEqual(live_keys, expected_live)
+        self.assertIn((0, 0), live_keys)
+        self.assertEqual(replay.size_env_steps, replay.capacity)
+        self.assertEqual(replay.overwrite_count, 1)
+
+    def test_random_eviction_stales_only_the_selected_victim(self):
+        replay = ContextualStepReplayBuffer(
+            self.topology,
+            self.builder,
+            capacity_env_steps=4,
+            seed=0,
+            eviction_mode=REPLAY_EVICTION_RANDOM,
+        )
+        initial = [
+            replay.push(make_snapshot(self.topology, step))
+            for step in range(replay.capacity)
+        ]
+        reference_rng = np.random.default_rng()
+        reference_rng.bit_generator.state = copy.deepcopy(
+            replay.eviction_rng.bit_generator.state
+        )
+        expected_victim = int(reference_rng.integers(replay.capacity))
+
+        replacement = replay.push(make_snapshot(self.topology, 4))
+        stale = initial[expected_victim]
+        survivors = [
+            key for index, key in enumerate(initial)
+            if index != expected_victim
+        ]
+
+        self.assertEqual(replacement.step_slot, expected_victim)
+        self.assertEqual(replacement.generation, stale.generation + 1)
+        with self.assertRaises(ContextualReplayError):
+            replay.validate_sample_keys([stale])
+        replay.validate_sample_keys(survivors + [replacement])
+        self.assertEqual(replay.stale_key_reject_count, 1)
+
+    def test_random_eviction_keeps_capacity_and_state_references_valid(self):
+        replay = ContextualStepReplayBuffer(
+            self.topology,
+            self.builder,
+            capacity_env_steps=4,
+            seed=23,
+            sampling_mode=REPLAY_SAMPLING_SNAPSHOT,
+            eviction_mode=REPLAY_EVICTION_RANDOM,
+        )
+        allocated_bytes = replay.storage_bytes
+        for episode in range(24):
+            replay.push(
+                make_snapshot(
+                    self.topology,
+                    episode,
+                    episode=episode,
+                    done=True,
+                )
+            )
+            self.assertEqual(
+                replay.size_env_steps,
+                min(episode + 1, replay.capacity),
+            )
+            self.assertEqual(replay.storage_bytes, allocated_bytes)
+
+        valid_slots = replay._valid_transition_slots()
+        self.assertEqual(valid_slots.size, replay.capacity)
+        self.assertEqual(
+            np.count_nonzero(replay._transition_valid), replay.capacity
+        )
+        for slot in valid_slots:
+            transition_key = replay._transition_keys[int(slot)]
+            self.assertIsNotNone(transition_key)
+            episode, step = transition_key
+            state_slot = int(replay._state_slot[slot])
+            next_state_slot = int(replay._next_state_slot[slot])
+            self.assertTrue(replay._state_valid[state_slot])
+            self.assertTrue(replay._state_valid[next_state_slot])
+            self.assertEqual(
+                int(replay._state_generation[state_slot]),
+                int(replay._state_gen_ref[slot]),
+            )
+            self.assertEqual(
+                int(replay._state_generation[next_state_slot]),
+                int(replay._next_state_gen_ref[slot]),
+            )
+            self.assertEqual(replay._state_keys[state_slot], (episode, step))
+            self.assertEqual(
+                replay._state_keys[next_state_slot], (episode, step + 1)
+            )
+
+        expected_refcounts = np.zeros(
+            replay.state_capacity, dtype=np.uint8
+        )
+        np.add.at(
+            expected_refcounts,
+            replay._state_slot[valid_slots],
+            1,
+        )
+        np.add.at(
+            expected_refcounts,
+            replay._next_state_slot[valid_slots],
+            1,
+        )
+        np.testing.assert_array_equal(
+            replay._state_refcount, expected_refcounts
+        )
+        free_slots = replay._free_state_slots[:replay._free_state_count]
+        expected_free = np.flatnonzero(expected_refcounts == 0)
+        np.testing.assert_array_equal(
+            np.sort(free_slots), expected_free
+        )
+
+        batch = replay.sample(replay.capacity)
+        live_episodes = {
+            int(replay._episode_id[slot]) for slot in valid_slots
+        }
+        self.assertEqual(set(batch.episode_id.tolist()), live_episodes)
+        np.testing.assert_array_equal(
+            batch.critic_total_tat[:, 0].numpy(),
+            1_000.0 + 10.0 * batch.env_step.numpy(),
+        )
+
+    def test_random_eviction_prunes_multi_episode_metadata(self):
+        replay = ContextualStepReplayBuffer(
+            self.topology,
+            self.builder,
+            capacity_env_steps=5,
+            seed=31,
+            eviction_mode=REPLAY_EVICTION_RANDOM,
+        )
+        total_pushes = 20
+        for episode in range(total_pushes):
+            replay.push(
+                make_snapshot(
+                    self.topology,
+                    episode,
+                    episode=episode,
+                    done=True,
+                )
+            )
+
+        live_keys = [
+            replay._transition_keys[int(slot)]
+            for slot in replay._valid_transition_slots()
+        ]
+        live_counts = Counter(key[0] for key in live_keys)
+        self.assertEqual(replay._episode_transition_counts, dict(live_counts))
+        self.assertEqual(
+            set(replay._episode_first_step), set(live_counts)
+        )
+        for episode in live_counts:
+            self.assertEqual(replay._episode_first_step[episode], episode)
+        self.assertEqual(replay.overwrite_count, total_pushes - replay.capacity)
+
+    def test_random_eviction_is_seeded_and_does_not_advance_sampling_rng(self):
+        first = ContextualStepReplayBuffer(
+            self.topology,
+            self.builder,
+            capacity_env_steps=4,
+            seed=47,
+            eviction_mode=REPLAY_EVICTION_RANDOM,
+        )
+        second = ContextualStepReplayBuffer(
+            self.topology,
+            self.builder,
+            capacity_env_steps=4,
+            seed=47,
+            eviction_mode=REPLAY_EVICTION_RANDOM,
+        )
+        sampling_rng_state = copy.deepcopy(first.rng.bit_generator.state)
+        for step in range(20):
+            snapshot = make_snapshot(self.topology, step)
+            first.push(snapshot)
+            second.push(snapshot)
+            self.assertEqual(
+                first.rng.bit_generator.state, sampling_rng_state
+            )
+
+        self.assertEqual(first._transition_keys, second._transition_keys)
+        np.testing.assert_array_equal(
+            first._transition_generation, second._transition_generation
+        )
+        first_batch = first.sample(64)
+        second_batch = second.sample(64)
+        self.assertEqual(first_batch.sample_keys, second_batch.sample_keys)
+        np.testing.assert_array_equal(
+            first_batch.reward.numpy(), second_batch.reward.numpy()
+        )
+
+        sampled = ContextualStepReplayBuffer(
+            self.topology,
+            self.builder,
+            capacity_env_steps=4,
+            seed=71,
+            eviction_mode=REPLAY_EVICTION_RANDOM,
+        )
+        unsampled = ContextualStepReplayBuffer(
+            self.topology,
+            self.builder,
+            capacity_env_steps=4,
+            seed=71,
+            eviction_mode=REPLAY_EVICTION_RANDOM,
+        )
+        for step in range(20):
+            snapshot = make_snapshot(self.topology, step)
+            sampled.push(snapshot)
+            unsampled.push(snapshot)
+            sampled.sample(1)
+        self.assertEqual(
+            sampled._transition_keys, unsampled._transition_keys
+        )
+        np.testing.assert_array_equal(
+            sampled._transition_generation,
+            unsampled._transition_generation,
+        )
+
+    def test_invalid_random_push_does_not_evict_or_advance_rng(self):
+        replay = ContextualStepReplayBuffer(
+            self.topology,
+            self.builder,
+            capacity_env_steps=2,
+            seed=53,
+            eviction_mode=REPLAY_EVICTION_RANDOM,
+        )
+        for step in range(replay.capacity):
+            replay.push(make_snapshot(self.topology, step))
+
+        transition_keys = replay._transition_keys.copy()
+        transition_generation = replay._transition_generation.copy()
+        state_refcount = replay._state_refcount.copy()
+        free_state_count = replay._free_state_count
+        overwrite_count = replay.overwrite_count
+        push_count = replay.push_count
+        eviction_rng_state = copy.deepcopy(
+            replay.eviction_rng.bit_generator.state
+        )
+        invalid = make_snapshot(self.topology, 2)
+        physical = invalid.physical_local_state.copy()
+        physical[0, UINT8_PHYSICAL_FEATURE_INDICES[0]] = 1.5
+
+        with self.assertRaisesRegex(
+            ContextualReplayError, "must be exactly integral"
+        ):
+            replay.push(replace(invalid, physical_local_state=physical))
+
+        self.assertEqual(replay._transition_keys, transition_keys)
+        np.testing.assert_array_equal(
+            replay._transition_generation, transition_generation
+        )
+        np.testing.assert_array_equal(replay._state_refcount, state_refcount)
+        self.assertEqual(replay._free_state_count, free_state_count)
+        self.assertEqual(replay.overwrite_count, overwrite_count)
+        self.assertEqual(replay.push_count, push_count)
+        self.assertEqual(
+            replay.eviction_rng.bit_generator.state, eviction_rng_state
+        )
+
+    def test_random_eviction_rejects_stacked_replay(self):
+        with self.assertRaisesRegex(
+            ValueError, "random replay eviction.*num_stacks=1"
+        ):
+            ContextualStepReplayBuffer(
+                self.topology,
+                self.builder,
+                capacity_env_steps=4,
+                eviction_mode=REPLAY_EVICTION_RANDOM,
+                num_stacks=2,
+            )
 
     def test_multi_episode_has_no_linkage(self):
         replay = ContextualStepReplayBuffer(

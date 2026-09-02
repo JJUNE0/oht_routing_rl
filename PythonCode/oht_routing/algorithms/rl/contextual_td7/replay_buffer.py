@@ -44,6 +44,15 @@ REPLAY_SAMPLING_MODES = (
     REPLAY_SAMPLING_RANDOM_RAIL,
 )
 
+REPLAY_EVICTION_FIFO = "fifo"
+REPLAY_EVICTION_RANDOM = "random"
+REPLAY_EVICTION_MODES = (
+    REPLAY_EVICTION_FIFO,
+    REPLAY_EVICTION_RANDOM,
+)
+
+_EVICTION_RNG_STREAM = 0x45564943  # ASCII "EVIC"
+
 
 # Replay storage is deliberately narrower than the learner contract. Samples
 # are always materialized as float32 before normalization/model use.
@@ -209,6 +218,7 @@ class ContextualStepReplayBuffer:
         lap_min_priority: float = 1.0,
         reward_version: str = REWARD_VERSION,
         sampling_mode: str = REPLAY_SAMPLING_RAIL,
+        eviction_mode: str = REPLAY_EVICTION_FIFO,
         num_stacks: int = 1,
         stack_interval: int = 1,
     ):
@@ -217,6 +227,10 @@ class ContextualStepReplayBuffer:
         if sampling_mode not in REPLAY_SAMPLING_MODES:
             raise ValueError(
                 f"sampling_mode must be one of {REPLAY_SAMPLING_MODES}"
+            )
+        if eviction_mode not in REPLAY_EVICTION_MODES:
+            raise ValueError(
+                f"eviction_mode must be one of {REPLAY_EVICTION_MODES}"
             )
         if (
             sampling_mode
@@ -235,14 +249,22 @@ class ContextualStepReplayBuffer:
         self.controlled_count = len(topology.controlled_rail_ids)
         self.physical_count = len(topology.all_rail_ids)
         self.rng = np.random.default_rng(seed)
+        self.eviction_rng = np.random.default_rng(
+            np.random.SeedSequence([int(seed), _EVICTION_RNG_STREAM])
+        )
         self.lap_enabled = bool(lap_enabled)
         self.lap_alpha = float(lap_alpha)
         self.lap_min_priority = float(lap_min_priority)
         self.reward_version = canonical_reward_version(reward_version)
         self.sampling_mode = str(sampling_mode)
+        self.eviction_mode = str(eviction_mode)
         self.num_stacks, self.stack_interval = validate_stack_config(
             num_stacks, stack_interval
         )
+        if self.eviction_mode == REPLAY_EVICTION_RANDOM and self.num_stacks > 1:
+            raise ValueError(
+                "random replay eviction currently requires num_stacks=1"
+            )
         self._stack_offsets = stack_offsets(
             self.num_stacks, self.stack_interval
         )
@@ -329,6 +351,20 @@ class ContextualStepReplayBuffer:
         ] * self.state_capacity
         self._key_to_state: dict[tuple[int, int], tuple[int, int]] = {}
         self._state_cursor = 0
+        self._state_refcount = (
+            np.zeros(self.state_capacity, np.uint8)
+            if self.eviction_mode == REPLAY_EVICTION_RANDOM else None
+        )
+        self._free_state_slots = (
+            np.arange(
+                self.state_capacity - 1, -1, -1, dtype=np.int64
+            )
+            if self.eviction_mode == REPLAY_EVICTION_RANDOM else None
+        )
+        self._free_state_count = (
+            self.state_capacity
+            if self.eviction_mode == REPLAY_EVICTION_RANDOM else 0
+        )
 
         shape = (self.capacity, self.controlled_count)
         self._previous_applied_action = np.empty(shape, np.int16)
@@ -520,10 +556,48 @@ class ContextualStepReplayBuffer:
         result[..., UINT16_PHYSICAL_FEATURE_INDICES] = uint16_values
         return result
 
-    def _store_state(
-        self, key, physical, global_state, critic_total_tat
-    ) -> tuple[int, int]:
+    def _prepare_state(self, physical, global_state, critic_total_tat):
         physical_uint8, physical_uint16 = self._pack_physical(physical)
+        return (
+            physical_uint8,
+            physical_uint16,
+            np.ascontiguousarray(global_state, dtype=np.float32),
+            np.ascontiguousarray(critic_total_tat, dtype=np.float32),
+        )
+
+    def _state_values_match(self, slot: int, prepared) -> bool:
+        physical_uint8, physical_uint16, global_state, critic_total_tat = (
+            prepared
+        )
+        return bool(
+            np.array_equal(self._physical_uint8[slot], physical_uint8)
+            and np.array_equal(self._physical_uint16[slot], physical_uint16)
+            and np.array_equal(self._global[slot], global_state)
+            and np.array_equal(
+                self._critic_total_tat[slot], critic_total_tat
+            )
+        )
+
+    def _validate_prepared_state(self, key, prepared) -> None:
+        existing = self._key_to_state.get(key)
+        if existing is None:
+            return
+        slot, generation = existing
+        if not (
+            self._state_valid[slot]
+            and self._state_generation[slot] == generation
+        ):
+            return
+        if not self._state_values_match(slot, prepared):
+            raise ContextualReplayError(
+                "same episode/env step has different raw state"
+            )
+
+    def _acquire_prepared_state(self, key, prepared) -> tuple[int, int]:
+        if self._state_refcount is None or self._free_state_slots is None:
+            raise ContextualReplayError(
+                "reference-counted state allocation requires random eviction"
+            )
         existing = self._key_to_state.get(key)
         if existing is not None:
             slot, generation = existing
@@ -531,18 +605,97 @@ class ContextualStepReplayBuffer:
                 self._state_valid[slot]
                 and self._state_generation[slot] == generation
             ):
-                if not (
-                    np.array_equal(
-                        self._physical_uint8[slot], physical_uint8
+                if not self._state_values_match(slot, prepared):
+                    raise ContextualReplayError(
+                        "same episode/env step has different raw state"
                     )
-                    and np.array_equal(
-                        self._physical_uint16[slot], physical_uint16
+                references = int(self._state_refcount[slot])
+                if references <= 0 or references >= np.iinfo(np.uint8).max:
+                    raise ContextualReplayError(
+                        "invalid random-eviction state reference count"
                     )
-                    and np.array_equal(self._global[slot], global_state)
-                    and np.array_equal(
-                        self._critic_total_tat[slot], critic_total_tat
-                    )
-                ):
+                self._state_refcount[slot] = references + 1
+                return int(slot), int(generation)
+
+        if self._free_state_count <= 0:
+            raise ContextualReplayError(
+                "random-eviction state allocator exhausted"
+            )
+        self._free_state_count -= 1
+        slot = int(self._free_state_slots[self._free_state_count])
+        if self._state_valid[slot] or self._state_refcount[slot] != 0:
+            raise ContextualReplayError(
+                "random-eviction free state slot is still live"
+            )
+        generation = int(self._state_generation[slot]) + 1
+        physical_uint8, physical_uint16, global_state, critic_total_tat = (
+            prepared
+        )
+        self._physical_uint8[slot] = physical_uint8
+        self._physical_uint16[slot] = physical_uint16
+        self._global[slot] = global_state
+        self._critic_total_tat[slot] = critic_total_tat
+        self._state_generation[slot] = generation
+        self._state_valid[slot] = True
+        self._state_refcount[slot] = 1
+        self._state_keys[slot] = key
+        self._key_to_state[key] = (slot, generation)
+        return slot, generation
+
+    def _release_state_reference(self, slot: int, generation: int) -> None:
+        if self._state_refcount is None or self._free_state_slots is None:
+            raise ContextualReplayError(
+                "reference-counted state release requires random eviction"
+            )
+        if not (
+            self._state_valid[slot]
+            and self._state_generation[slot] == generation
+        ):
+            raise ContextualReplayError(
+                "random-eviction transition references a stale state"
+            )
+        references = int(self._state_refcount[slot])
+        if references <= 0:
+            raise ContextualReplayError(
+                "random-eviction state reference count underflow"
+            )
+        references -= 1
+        self._state_refcount[slot] = references
+        if references > 0:
+            return
+
+        old_key = self._state_keys[slot]
+        if (
+            old_key is not None
+            and self._key_to_state.get(old_key, (None,))[0] == slot
+        ):
+            self._key_to_state.pop(old_key, None)
+        self._state_valid[slot] = False
+        self._state_keys[slot] = None
+        if self._free_state_count >= self.state_capacity:
+            raise ContextualReplayError(
+                "random-eviction free state stack overflow"
+            )
+        self._free_state_slots[self._free_state_count] = int(slot)
+        self._free_state_count += 1
+
+    def _store_state(
+        self, key, physical, global_state, critic_total_tat
+    ) -> tuple[int, int]:
+        prepared = self._prepare_state(
+            physical, global_state, critic_total_tat
+        )
+        physical_uint8, physical_uint16, global_state, critic_total_tat = (
+            prepared
+        )
+        existing = self._key_to_state.get(key)
+        if existing is not None:
+            slot, generation = existing
+            if (
+                self._state_valid[slot]
+                and self._state_generation[slot] == generation
+            ):
+                if not self._state_values_match(slot, prepared):
                     raise ContextualReplayError(
                         "same episode/env step has different raw state"
                     )
@@ -602,6 +755,50 @@ class ContextualStepReplayBuffer:
             return None
         return int(slot), int(generation)
 
+    def _next_transition_slot(self) -> int:
+        if self.push_count < self.capacity:
+            slot = self._transition_cursor
+            self._transition_cursor = (slot + 1) % self.capacity
+            return int(slot)
+        if self.eviction_mode == REPLAY_EVICTION_RANDOM:
+            return int(self.eviction_rng.integers(self.capacity))
+        slot = self._transition_cursor
+        self._transition_cursor = (slot + 1) % self.capacity
+        return int(slot)
+
+    def _evict_transition_slot(
+        self, slot: int, *, incoming_episode: int
+    ) -> None:
+        if not self._transition_valid[slot]:
+            return
+
+        self.overwrite_count += 1
+        old_key = self._transition_keys[slot]
+        if old_key is not None:
+            current = self._key_to_transition.get(old_key)
+            if current is not None and current[0] == slot:
+                self._key_to_transition.pop(old_key, None)
+            old_episode = int(old_key[0])
+            remaining = self._episode_transition_counts.get(old_episode, 1) - 1
+            if remaining > 0:
+                self._episode_transition_counts[old_episode] = remaining
+            else:
+                self._episode_transition_counts.pop(old_episode, None)
+                if old_episode != int(incoming_episode):
+                    self._episode_first_step.pop(old_episode, None)
+
+        if self.eviction_mode == REPLAY_EVICTION_RANDOM:
+            self._release_state_reference(
+                int(self._state_slot[slot]),
+                int(self._state_gen_ref[slot]),
+            )
+            self._release_state_reference(
+                int(self._next_state_slot[slot]),
+                int(self._next_state_gen_ref[slot]),
+            )
+        self._transition_valid[slot] = False
+        self._transition_keys[slot] = None
+
     def push(self, snapshot: ContextualStepSnapshot) -> ReplaySampleKey:
         self._validate_snapshot(snapshot)
         state_key = (int(snapshot.episode_id), int(snapshot.env_step))
@@ -648,38 +845,46 @@ class ContextualStepReplayBuffer:
                 "contiguous transition previous_applied_action differs from "
                 "the prior transition applied_action after fixed-point encoding"
             )
-        state_slot, state_gen = self._store_state(
-            state_key,
-            snapshot.physical_local_state,
-            snapshot.global_state,
-            snapshot.critic_total_tat,
-        )
-        next_slot, next_gen = self._store_state(
-            next_key,
-            snapshot.next_physical_local_state,
-            snapshot.next_global_state,
-            snapshot.next_critic_total_tat,
-        )
-
-        slot = self._transition_cursor
-        self._transition_cursor = (slot + 1) % self.capacity
-        if self._transition_valid[slot]:
-            self.overwrite_count += 1
-            old_key = self._transition_keys[slot]
-            if old_key is not None:
-                current = self._key_to_transition.get(old_key)
-                if current is not None and current[0] == slot:
-                    self._key_to_transition.pop(old_key, None)
-                old_episode = int(old_key[0])
-                remaining = (
-                    self._episode_transition_counts.get(old_episode, 1) - 1
-                )
-                if remaining > 0:
-                    self._episode_transition_counts[old_episode] = remaining
-                else:
-                    self._episode_transition_counts.pop(old_episode, None)
-                    if old_episode != state_key[0]:
-                        self._episode_first_step.pop(old_episode, None)
+        if self.eviction_mode == REPLAY_EVICTION_RANDOM:
+            state_prepared = self._prepare_state(
+                snapshot.physical_local_state,
+                snapshot.global_state,
+                snapshot.critic_total_tat,
+            )
+            next_state_prepared = self._prepare_state(
+                snapshot.next_physical_local_state,
+                snapshot.next_global_state,
+                snapshot.next_critic_total_tat,
+            )
+            self._validate_prepared_state(state_key, state_prepared)
+            self._validate_prepared_state(next_key, next_state_prepared)
+            slot = self._next_transition_slot()
+            self._evict_transition_slot(
+                slot, incoming_episode=state_key[0]
+            )
+            state_slot, state_gen = self._acquire_prepared_state(
+                state_key, state_prepared
+            )
+            next_slot, next_gen = self._acquire_prepared_state(
+                next_key, next_state_prepared
+            )
+        else:
+            state_slot, state_gen = self._store_state(
+                state_key,
+                snapshot.physical_local_state,
+                snapshot.global_state,
+                snapshot.critic_total_tat,
+            )
+            next_slot, next_gen = self._store_state(
+                next_key,
+                snapshot.next_physical_local_state,
+                snapshot.next_global_state,
+                snapshot.next_critic_total_tat,
+            )
+            slot = self._next_transition_slot()
+            self._evict_transition_slot(
+                slot, incoming_episode=state_key[0]
+            )
         generation = int(self._transition_generation[slot]) + 1
         self._episode_first_step.setdefault(state_key[0], state_key[1])
         self._previous_applied_action[slot] = previous_action_stored
@@ -1355,8 +1560,13 @@ class ContextualStepReplayBuffer:
         controlled_count: int = 4_996,
         neighbor_count: int = 15,
         lap_enabled: bool = False,
+        eviction_mode: str = REPLAY_EVICTION_FIFO,
     ) -> int:
         c = int(capacity_env_steps)
+        if eviction_mode not in REPLAY_EVICTION_MODES:
+            raise ValueError(
+                f"eviction_mode must be one of {REPLAY_EVICTION_MODES}"
+            )
         state_capacity = 2 * c
         packed_physical_bytes = (
             len(UINT8_PHYSICAL_FEATURE_INDICES)
@@ -1373,6 +1583,10 @@ class ContextualStepReplayBuffer:
         # int16 fixed point. Reward remains float32.
         vectors = c * controlled_count * (3 * 2 + 4)
         metadata = c * (7 * 8 + 4 + 1) + (2 * c) * (8 + 1)
+        if eviction_mode == REPLAY_EVICTION_RANDOM:
+            # One uint8 reference count and one int64 free-stack entry per
+            # state slot. The scalar free-stack cursor is negligible here.
+            metadata += (2 * c) * (1 + 8)
         static_mapping = controlled_count * (
             1 + 2 * int(neighbor_count)
         ) * 8
@@ -1421,6 +1635,7 @@ class ContextualStepReplayBuffer:
                     self.controlled_count,
                     neighbor_count=self.neighbor_count,
                     lap_enabled=self.lap_enabled,
+                    eviction_mode=self.eviction_mode,
                 )
             ),
             "replay/storage_physical_bytes_per_rail_state": float(

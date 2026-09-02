@@ -5,7 +5,7 @@ from unittest.mock import patch
 import torch
 
 from oht_dispatching.config import DISPATCH_COST, DISPATCH_FIRST_MATCH
-from oht_routing.runtime.client import ContextualRuntimeConfig
+from oht_routing.runtime.client import ClientAlgorithm, ContextualRuntimeConfig
 from oht_routing.runtime.config import (
     RESUME_LAUNCH_CONTROL_FIELDS,
     runtime_config_from_args,
@@ -20,11 +20,14 @@ from oht_routing.version import CONTEXTUAL_VERSION
 from oht_routing.algorithms.rl.contextual_td7 import (
     ContextualLearnerConfig,
     ContextualTD7Learner,
+    REPLAY_EVICTION_FIFO,
+    REPLAY_EVICTION_RANDOM,
     REPLAY_SAMPLING_RANDOM_RAIL,
     REPLAY_SAMPLING_RAIL,
     REPLAY_SAMPLING_SNAPSHOT,
     contextual_algorithm_variant,
 )
+from oht_routing.utils.wandb_logging import runtime_exp_meta
 from main import parse_args
 from test_contextual_learner import SMALL_NETWORK
 from test_contextual_sale import sale_replay
@@ -48,7 +51,7 @@ class ContextualVariantTests(unittest.TestCase):
             return parse_args()
 
     def test_cli_and_runtime_are_locked_to_reward_p(self):
-        self.assertEqual(CONTEXTUAL_VERSION, "v7.0.0")
+        self.assertEqual(CONTEXTUAL_VERSION, "v7.1.0")
         parsed = self.parse()
         self.assertNotIn("reward_version", vars(parsed))
         self.assertEqual(
@@ -103,6 +106,7 @@ class ContextualVariantTests(unittest.TestCase):
         self.assertEqual(config.curriculum_scale_end, 1.0)
         self.assertEqual(config.curriculum_end_step, 20_000)
         self.assertEqual(config.replay_capacity_env_steps, 100_000)
+        self.assertEqual(config.replay_eviction_mode, REPLAY_EVICTION_FIFO)
         self.assertEqual(config.replay_sampling_mode, REPLAY_SAMPLING_RAIL)
         self.assertEqual(config.batch_size, 1_024)
         self.assertEqual(config.warmup_steps, 10_000)
@@ -231,6 +235,7 @@ class ContextualVariantTests(unittest.TestCase):
 
     def test_runtime_and_resume_launch_control_contract_is_declared(self):
         self.assertIn("replay_capacity_env_steps", RESUME_LAUNCH_CONTROL_FIELDS)
+        self.assertIn("replay_eviction_mode", RESUME_LAUNCH_CONTROL_FIELDS)
         self.assertIn("lap_enabled", RESUME_LAUNCH_CONTROL_FIELDS)
         self.assertIn("reward_version", RESUME_LAUNCH_CONTROL_FIELDS)
         self.assertIn("console_log_interval", RESUME_LAUNCH_CONTROL_FIELDS)
@@ -402,6 +407,7 @@ class ContextualVariantTests(unittest.TestCase):
                 "reward_version": "P",
                 "lap_enabled": True,
                 "replay_capacity_env_steps": 10_000,
+                "replay_eviction_mode": REPLAY_EVICTION_FIFO,
                 "warmup_steps": 321,
                 "console_log_interval": 7,
                 "sim_end_time": 9,
@@ -417,6 +423,8 @@ class ContextualVariantTests(unittest.TestCase):
             "--no-lap",
             "--replay-capacity-env-steps",
             "100000",
+            "--replay-eviction-mode",
+            "random",
             "--console-log-interval",
             "200",
             "--periodic-checkpoint-interval",
@@ -429,6 +437,7 @@ class ContextualVariantTests(unittest.TestCase):
         self.assertTrue(config.resume_deterministic_first_episode)
         self.assertFalse(config.lap_enabled)
         self.assertEqual(config.replay_capacity_env_steps, 100_000)
+        self.assertEqual(config.replay_eviction_mode, REPLAY_EVICTION_RANDOM)
         self.assertEqual(config.warmup_steps, 321)
         self.assertEqual(config.console_log_interval, 200)
         self.assertEqual(config.periodic_checkpoint_interval, 2_000)
@@ -622,6 +631,58 @@ class ContextualVariantTests(unittest.TestCase):
             self.parse(
                 "--replay-buffer-rail", "--replay-buffer-snapshot"
             )
+
+    def test_cli_replay_eviction_modes_and_stack_contract(self):
+        cases = (
+            ((), REPLAY_EVICTION_FIFO),
+            (("--replay-eviction-mode", "fifo"), REPLAY_EVICTION_FIFO),
+            (("--replay-eviction-mode", "random"), REPLAY_EVICTION_RANDOM),
+        )
+        for arguments, expected in cases:
+            with self.subTest(arguments=arguments):
+                config = runtime_config_from_args(self.parse(*arguments))
+                self.assertEqual(config.replay_eviction_mode, expected)
+
+        with self.assertRaises(SystemExit):
+            self.parse("--replay-eviction-mode", "unknown")
+        with self.assertRaisesRegex(ValueError, "replay_eviction_mode"):
+            ContextualRuntimeConfig(replay_eviction_mode="unknown")
+        with self.assertRaisesRegex(ValueError, "requires num_stacks=1"):
+            ContextualRuntimeConfig(
+                replay_eviction_mode=REPLAY_EVICTION_RANDOM,
+                num_stacks=2,
+            )
+
+        random_meta = runtime_exp_meta(ContextualRuntimeConfig(
+            replay_eviction_mode=REPLAY_EVICTION_RANDOM
+        ))
+        self.assertEqual(
+            random_meta["replay_eviction_mode"], REPLAY_EVICTION_RANDOM
+        )
+        self.assertIn("evictrandom", random_meta["note"])
+        self.assertIn("evict_random", random_meta["replay"])
+        self.assertIn("replay_eviction=random", random_meta["description"])
+
+    def test_replay_eviction_mode_changes_runtime_and_checkpoint_identity(self):
+        fifo_runtime = object.__new__(ClientAlgorithm)
+        fifo_runtime.config = ContextualRuntimeConfig(
+            replay_eviction_mode=REPLAY_EVICTION_FIFO
+        )
+        random_runtime = object.__new__(ClientAlgorithm)
+        random_runtime.config = ContextualRuntimeConfig(
+            replay_eviction_mode=REPLAY_EVICTION_RANDOM
+        )
+
+        self.assertNotEqual(
+            fifo_runtime.runtime_variant, random_runtime.runtime_variant
+        )
+        self.assertNotEqual(
+            fifo_runtime.checkpoint_variant, random_runtime.checkpoint_variant
+        )
+        self.assertIn("evict_fifo", fifo_runtime.runtime_variant)
+        self.assertIn("evict_random", random_runtime.runtime_variant)
+        self.assertIn("efifo", fifo_runtime.checkpoint_variant)
+        self.assertIn("erandom", random_runtime.checkpoint_variant)
 
     def test_snapshot_runtime_config_requires_uniform_replay(self):
         for mode in (

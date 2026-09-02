@@ -245,6 +245,7 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
             f"s{self.config.num_stacks}i{self.config.stack_interval}_"
             f"{'attention' if self.config.use_attention else 'flat'}_"
             f"{self.config.replay_sampling_mode}_"
+            f"evict_{self.config.replay_eviction_mode}_"
             f"curr{self.config.curriculum_scale_start:g}-"
             f"{self.config.curriculum_scale_end:g}-"
             f"{self.config.curriculum_end_step}-"
@@ -268,6 +269,7 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
             f"r{self.config.reward_version}_"
             f"{action_mode_tag}_"
             f"{self.config.replay_sampling_mode}_"
+            f"e{self.config.replay_eviction_mode}_"
             f"c{self.config.curriculum_scale_start:g}-"
             f"{self.config.curriculum_scale_end:g}-"
             f"{self.config.curriculum_end_step}"
@@ -385,6 +387,7 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
                 lap_enabled=self.config.lap_enabled,
                 reward_version=self.config.reward_version,
                 sampling_mode=self.config.replay_sampling_mode,
+                eviction_mode=self.config.replay_eviction_mode,
                 num_stacks=self.config.num_stacks,
                 stack_interval=self.config.stack_interval,
             )
@@ -760,6 +763,7 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
             "reward_version": self.reward_builder.reward_version,
             "num_stacks": self.config.num_stacks,
             "stack_interval": self.config.stack_interval,
+            "replay_eviction_mode": self.config.replay_eviction_mode,
             "dispatch_mode": self.config.dispatch_mode,
             "warmup_episode_boundary_sent": (
                 self.warmup_episode_boundary_sent

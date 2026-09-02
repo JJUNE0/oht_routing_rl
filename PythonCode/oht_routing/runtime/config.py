@@ -11,6 +11,7 @@ import torch
 
 from oht_dispatching.config import DISPATCH_FIRST_MATCH
 from oht_routing.algorithms.rl.contextual_td7 import (
+    REPLAY_EVICTION_FIFO,
     REPLAY_SAMPLING_RAIL,
     read_contextual_runtime_config,
 )
@@ -52,6 +53,7 @@ RESUME_LAUNCH_CONTROL_FIELDS = {
     "dispatch_mode",
     "batch_size",
     "replay_capacity_env_steps",
+    "replay_eviction_mode",
     "periodic_checkpoint_interval",
     "lap_enabled",
     "use_attention",
@@ -103,6 +105,7 @@ class ContextualRuntimeConfig:
     exploration_noise_anneal_steps: int = 100_000
     exploration_noise_clip: float = 0.20
     replay_capacity_env_steps: int = 100_000
+    replay_eviction_mode: str = REPLAY_EVICTION_FIFO
     replay_sampling_mode: str = REPLAY_SAMPLING_RAIL
     batch_size: int = 1_024
     minimum_replay_env_steps: int = 100

@@ -28,6 +28,7 @@ def print_runtime_summary(client):
         controlled_count=network.num_rails - 3,
         neighbor_count=network.neighbor_count,
         lap_enabled=config.lap_enabled,
+        eviction_mode=config.replay_eviction_mode,
     ) / (1024.0 ** 3)
     replay_storage = "packed V5 local u8/u16, critic TAT f32, Q15 actions"
     if config.lap_enabled:
@@ -150,6 +151,7 @@ def print_runtime_summary(client):
             ("resume checkpoint", config.resume_checkpoint_path),
             ("load status", checkpoint_status),
             ("sampling mode", config.replay_sampling_mode),
+            ("eviction mode", config.replay_eviction_mode),
             ("capacity (environment steps)", config.replay_capacity_env_steps),
             (
                 "storage format",

@@ -10,6 +10,7 @@ from oht_routing.mdp.reward.config import (
     canonical_reward_version,
 )
 from oht_routing.algorithms.rl.contextual_td7 import (
+    REPLAY_EVICTION_MODES,
     REPLAY_SAMPLING_RANDOM_RAIL,
     REPLAY_SAMPLING_RAIL,
     REPLAY_SAMPLING_SNAPSHOT,
@@ -180,6 +181,15 @@ def parse_args():
         help=(
             "Number of environment-step transitions retained by the packed "
             "CPU replay. The default is defined in ContextualRuntimeConfig."
+        ),
+    )
+    parser.add_argument(
+        "--replay-eviction-mode",
+        choices=REPLAY_EVICTION_MODES,
+        help=(
+            "Choose which environment-step transition to replace after the "
+            "replay reaches capacity. FIFO preserves the original behavior; "
+            "random replacement currently requires --num-stacks 1."
         ),
     )
     replay_sampling = parser.add_mutually_exclusive_group()

@@ -767,7 +767,7 @@ class ContextualCheckpointTests(unittest.TestCase):
 
     def test_v5_checkpoint_is_rejected_by_v6_encoder_contract(self):
         learner, obs, reward = components()
-        self.assertEqual(CONTEXTUAL_VERSION, "v7.0.0")
+        self.assertEqual(CONTEXTUAL_VERSION, "v7.1.0")
         with tempfile.TemporaryDirectory() as directory:
             path = save_contextual_checkpoint(
                 Path(directory) / "v5_0.pt",
@@ -793,7 +793,7 @@ class ContextualCheckpointTests(unittest.TestCase):
 
     def test_same_v6_reward_o_checkpoint_is_rejected_before_restore(self):
         learner, obs, reward = components()
-        self.assertEqual(CONTEXTUAL_VERSION, "v7.0.0")
+        self.assertEqual(CONTEXTUAL_VERSION, "v7.1.0")
         with tempfile.TemporaryDirectory() as directory:
             path = save_contextual_checkpoint(
                 Path(directory) / "reward_p.pt",
@@ -983,6 +983,60 @@ class ContextualCheckpointTests(unittest.TestCase):
                 "lap_version",
             ):
                 self.assertNotIn(retired_key, payload)
+
+    def test_replay_eviction_rng_round_trip_and_legacy_fallback(self):
+        source, source_obs, source_reward = components(
+            populate_replay=False
+        )
+        source.replay.eviction_rng.integers(10_000, size=17)
+        with tempfile.TemporaryDirectory() as directory:
+            path = save_contextual_checkpoint(
+                Path(directory) / "checkpoint.pt",
+                source,
+                observation_builder=source_obs,
+                reward_builder=source_reward,
+            )
+            expected_next = source.replay.eviction_rng.integers(
+                10_000, size=8
+            )
+
+            target, target_obs, target_reward = components(
+                seed=99, populate_replay=False
+            )
+            load_contextual_checkpoint(
+                path,
+                target,
+                observation_builder=target_obs,
+                reward_builder=target_reward,
+            )
+            np.testing.assert_array_equal(
+                target.replay.eviction_rng.integers(10_000, size=8),
+                expected_next,
+            )
+
+            legacy = torch.load(path, weights_only=False)
+            legacy.pop("replay_eviction_rng_state")
+            legacy["version"] = "v7.0.0"
+            legacy_path = Path(directory) / "legacy.pt"
+            torch.save(legacy, legacy_path)
+            legacy_target, legacy_obs, legacy_reward = components(
+                seed=101, populate_replay=False
+            )
+            fallback = np.random.default_rng()
+            fallback.bit_generator.state = copy.deepcopy(
+                legacy_target.replay.eviction_rng.bit_generator.state
+            )
+            expected_fallback = fallback.integers(10_000, size=8)
+            load_contextual_checkpoint(
+                legacy_path,
+                legacy_target,
+                observation_builder=legacy_obs,
+                reward_builder=legacy_reward,
+            )
+            np.testing.assert_array_equal(
+                legacy_target.replay.eviction_rng.integers(10_000, size=8),
+                expected_fallback,
+            )
 
     def test_exploration_rng_round_trip_and_legacy_fallback(self):
         learner, obs, reward = components()
