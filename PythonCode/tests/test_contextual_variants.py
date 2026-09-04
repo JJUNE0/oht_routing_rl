@@ -11,9 +11,9 @@ from oht_routing.runtime.config import (
     runtime_config_from_args,
 )
 from oht_routing.runtime.config_validation import make_reward_config
-from oht_routing.mdp.action import FREE_FLOW_RESIDUAL
+from oht_routing.mdp.action import REGION_B_RL
 from oht_routing.mdp.reward.config import (
-    RAIL_REWARD_FREE_FLOW_NEUTRAL_2,
+    RAIL_REWARD_FREE_FLOW_NEUTRAL_1_7,
     REWARD_VERSION,
 )
 from oht_routing.version import CONTEXTUAL_VERSION
@@ -50,8 +50,8 @@ class ContextualVariantTests(unittest.TestCase):
         ):
             return parse_args()
 
-    def test_cli_and_runtime_are_locked_to_reward_p(self):
-        self.assertEqual(CONTEXTUAL_VERSION, "v7.1.0")
+    def test_cli_and_runtime_are_locked_to_reward_q(self):
+        self.assertEqual(CONTEXTUAL_VERSION, "v9.0.0")
         parsed = self.parse()
         self.assertNotIn("reward_version", vars(parsed))
         self.assertEqual(
@@ -60,25 +60,26 @@ class ContextualVariantTests(unittest.TestCase):
         )
         self.assertEqual(
             runtime_config_from_args(
-                self.parse("--reward-version", "p")
+                self.parse("--reward-version", "q")
             ).reward_version,
-            "P",
+            "Q",
         )
-        with self.assertRaises(SystemExit):
-            self.parse("--reward-version", "O")
-        with self.assertRaisesRegex(ValueError, "only reward_version='P'"):
+        for retired in ("O", "P"):
+            with self.assertRaises(SystemExit):
+                self.parse("--reward-version", retired)
+        with self.assertRaisesRegex(ValueError, "only reward_version='Q'"):
             ContextualRuntimeConfig(reward_version="O")
 
         config = ContextualRuntimeConfig()
-        self.assertEqual(config.reward_version, "P")
-        self.assertEqual(config.action_mode, FREE_FLOW_RESIDUAL)
+        self.assertEqual(config.reward_version, "Q")
+        self.assertEqual(config.action_mode, REGION_B_RL)
         self.assertEqual(config.rl_cost_lambda, 0.5)
         self.assertEqual(config.early_stop_tat_threshold, 200.0)
         self.assertEqual(config.tat_termination_grace_steps, 10_000)
         self.assertEqual(config.tat_above_threshold_patience, 300)
         self.assertEqual(config.terminal_tat_penalty, -20.0)
         reward = make_reward_config(config)
-        self.assertEqual(reward.tat_weight, 4.3)
+        self.assertEqual(reward.tat_weight, 4.0)
         self.assertEqual(reward.op_weight, 0.0)
         self.assertFalse(reward.use_op)
         self.assertEqual(reward.tat_window_seconds, 300.0)
@@ -90,12 +91,14 @@ class ContextualVariantTests(unittest.TestCase):
         self.assertEqual(reward.backlog_weight, 0.0007)
         self.assertEqual(reward.backlog_growth_weight, 0.17)
         self.assertEqual(reward.idle_reserve_weight, 0.09)
-        self.assertEqual(reward.local_predicted_oht_weight, 0.05)
+        self.assertEqual(reward.local_predicted_oht_weight, 0.01)
+        self.assertEqual(reward.local_stop_weight, 0.30)
+        self.assertEqual(reward.local_density_weight, 5.5)
         self.assertEqual(reward.local_reward_scale, 2.0)
-        self.assertEqual(reward.rail_tat_weight, 30.0)
-        self.assertEqual(reward.rail_tat_clip, 1.0)
+        self.assertEqual(reward.rail_tat_weight, 660.0)
+        self.assertEqual(reward.rail_tat_clip, 22.0)
         self.assertEqual(
-            reward.rail_reward_mode, RAIL_REWARD_FREE_FLOW_NEUTRAL_2
+            reward.rail_reward_mode, RAIL_REWARD_FREE_FLOW_NEUTRAL_1_7
         )
 
     def test_cli_omits_runtime_defaults_and_config_resolves_them(self):
@@ -127,7 +130,7 @@ class ContextualVariantTests(unittest.TestCase):
         self.assertEqual(config.resume_warmstart_steps, 0)
         self.assertEqual(config.exploration_noise_std, 0.10)
         self.assertEqual(config.exploration_noise_final_std, 0.02)
-        self.assertEqual(config.action_mode, FREE_FLOW_RESIDUAL)
+        self.assertEqual(config.action_mode, REGION_B_RL)
         self.assertEqual(config.rl_cost_lambda, 0.5)
 
         override = runtime_config_from_args(
@@ -404,7 +407,7 @@ class ContextualVariantTests(unittest.TestCase):
     def test_resume_keeps_current_lap_and_capacity_controls(self, read_config):
         read_config.return_value = (
             {
-                "reward_version": "P",
+                "reward_version": "Q",
                 "lap_enabled": True,
                 "replay_capacity_env_steps": 10_000,
                 "replay_eviction_mode": REPLAY_EVICTION_FIFO,
@@ -444,14 +447,14 @@ class ContextualVariantTests(unittest.TestCase):
         self.assertEqual(config.sim_end_time, 55_000)
         self.assertTrue(config.state_normalizer_warmup_bypass)
         read_config.assert_called_once_with(
-            "checkpoint.pt", expected_reward_version="P"
+            "checkpoint.pt", expected_reward_version="Q"
         )
 
     @patch("oht_routing.runtime.config.read_contextual_runtime_config")
     def test_resume_keeps_current_simulator_launch_controls(self, read_config):
         read_config.return_value = (
             {
-                "reward_version": "P",
+                "reward_version": "Q",
                 "num_sim": 8,
                 "sim_ports": tuple(range(9_200, 9_208)),
             },
@@ -466,14 +469,14 @@ class ContextualVariantTests(unittest.TestCase):
         self.assertEqual(config.num_sim, 1)
         self.assertEqual(config.sim_ports, (9_100,))
         read_config.assert_called_once_with(
-            "checkpoint.pt", expected_reward_version="P"
+            "checkpoint.pt", expected_reward_version="Q"
         )
 
     @patch("oht_routing.runtime.config.read_contextual_runtime_config")
     def test_resume_warmstart_steps_stay_launch_controlled(self, read_config):
         read_config.return_value = (
             {
-                "reward_version": "P",
+                "reward_version": "Q",
                 "resume_warmstart_steps": 0,
             },
             True,
@@ -489,7 +492,7 @@ class ContextualVariantTests(unittest.TestCase):
         ))
         self.assertEqual(config.resume_warmstart_steps, 100)
         read_config.assert_called_once_with(
-            "checkpoint.pt", expected_reward_version="P"
+            "checkpoint.pt", expected_reward_version="Q"
         )
 
     @patch("oht_routing.runtime.config.read_contextual_runtime_config")
@@ -498,7 +501,7 @@ class ContextualVariantTests(unittest.TestCase):
     ):
         read_config.return_value = (
             {
-                "reward_version": "P",
+                "reward_version": "Q",
                 "episode_burnin_steps": 100,
             },
             True,
@@ -511,7 +514,7 @@ class ContextualVariantTests(unittest.TestCase):
     @patch("oht_routing.runtime.config.read_contextual_runtime_config")
     def test_attention_mode_stays_launch_controlled_on_resume(self, read_config):
         read_config.return_value = (
-            {"reward_version": "P", "use_attention": True},
+            {"reward_version": "Q", "use_attention": True},
             True,
         )
         default_flat = runtime_config_from_args(self.parse(
@@ -528,7 +531,7 @@ class ContextualVariantTests(unittest.TestCase):
     def test_stage_one_survives_checkpoint_runtime_restore(self, read_config):
         read_config.return_value = (
             {
-                "reward_version": "P",
+                "reward_version": "Q",
                 "sim_end_time": 9_000,
                 "warmup_steps": 321,
             },
@@ -544,7 +547,7 @@ class ContextualVariantTests(unittest.TestCase):
         self.assertEqual(config.warmup_steps, 321)
         self.assertTrue(config.state_normalizer_warmup_bypass)
         read_config.assert_called_once_with(
-            "checkpoint.pt", expected_reward_version="P"
+            "checkpoint.pt", expected_reward_version="Q"
         )
 
     def test_cli_diagnostics_are_opt_in(self):

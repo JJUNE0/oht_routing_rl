@@ -11,7 +11,11 @@ import torch
 
 from oht_routing.runtime.client import ClientAlgorithm, ContextualRuntimeConfig
 from oht_routing.runtime.client import ContextualTrainingFailure
-from oht_routing.mdp.action import EXP_RESIDUAL, REGION_B_RL
+from oht_routing.mdp.action import (
+    EXP_RESIDUAL,
+    FREE_FLOW_RESIDUAL,
+    REGION_B_RL,
+)
 from oht_routing.algorithms.rl.contextual_td7 import (
     ContextualLearnerConfig,
     ContextualNetworkConfig,
@@ -909,7 +913,7 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
             self.assertEqual(runtime.last_diagnostics["stage2/episode_step"], 0.0)
             self.assertEqual(runtime.last_diagnostics["stage2/env_steps"], 1.0)
             self.assertEqual(
-                runtime.last_diagnostics["curriculum/action_scale"], 1.0
+                runtime.last_diagnostics["curriculum/action_scale"], 0.05
             )
             self.assertEqual(pclient.sent_is_end, [0, 0, 0, 0])
             self.assertEqual(runtime.replay_buffer.push_count, 0)
@@ -1402,7 +1406,7 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
             diagnostics["action/noise_suppressed_by_clip_mean"], 0.0
         )
         self.assertAlmostEqual(
-            diagnostics["action/applied_std"], postclip.std(),
+            diagnostics["action/applied_std"], 0.05 * postclip.std(),
             places=7,
         )
 
@@ -1491,7 +1495,7 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
         baseline = np.asarray([
             p1.RAILLINE_DIC[int(rail_id)].DistancePerVelocity
             for rail_id in first.topology.all_rail_ids
-        ])
+        ]) + 0.5
         np.testing.assert_array_equal(r1.final_cost[boundary], baseline[boundary])
         np.testing.assert_array_equal(r2.final_cost[boundary], baseline[boundary])
 
@@ -1511,7 +1515,7 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
         baseline = np.asarray([
             pclient.RAILLINE_DIC[int(rail_id)].DistancePerVelocity
             for rail_id in runtime.topology.all_rail_ids
-        ])
+        ]) + 0.5
         np.testing.assert_array_equal(result.final_cost, baseline)
         self.assertEqual(crash_calls, ["crash"])
         self.assertTrue(runtime.training_failed)
@@ -1600,7 +1604,7 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
         baseline = np.asarray([
             pclient.RAILLINE_DIC[int(rail_id)].DistancePerVelocity
             for rail_id in runtime.topology.all_rail_ids
-        ])
+        ]) + 0.5
         np.testing.assert_array_equal(
             result.final_cost[boundary], baseline[boundary]
         )
@@ -1992,7 +1996,7 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
         self.assertEqual(runtime.last_diagnostics["env/termination_reason"], 1.0)
         self.assertIsNone(runtime.transition_aligner.pending)
 
-    def test_reward_p_tat_patience_adds_terminal_penalty_once(self):
+    def test_reward_q_tat_patience_adds_terminal_penalty_once(self):
         runtime, pclient = training_runtime(
             replay_capacity_env_steps=512,
             minimum_replay_env_steps=512,
@@ -2095,6 +2099,7 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
             "local/oht_abs_mean", "local/oht_std",
             "local/pred_abs_mean", "local/pred_std",
             "local/stop_abs_mean", "local/stop_std",
+            "local/density_abs_mean", "local/density_std",
             "local/idle_abs_mean", "local/idle_std",
             "local/capacity_abs_mean", "local/capacity_std",
             "reward/smooth_penalty_mean",
@@ -2185,7 +2190,7 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
         term_names = {
             "tat", "op", "backlog_level", "backlog_growth",
             "idle_reserve", "current_oht", "predicted_oht", "stop_time",
-            "local_idle", "capacity", "rail_outcome", "smooth",
+            "density", "local_idle", "capacity", "rail_outcome", "smooth",
         }
         expected.update({
             f"reward/term_scale/{name}_abs_mean" for name in term_names
@@ -2246,16 +2251,29 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
         self.assertEqual(captured["config"]["EXP_META"], meta)
         self.assertEqual(captured["notes"], meta["description"])
         self.assertEqual(meta["version"], CONTEXTUAL_VERSION)
-        self.assertEqual(meta["cost_structure"], "residual")
-        self.assertEqual(meta["action_range"], "0.5-1.5")
-        self.assertEqual(meta["residual_action_scale"], 1.0)
+        self.assertEqual(meta["cost_structure"], "b_rl")
+        self.assertEqual(
+            meta["action_range"],
+            "b_rl_0.0-1.0_curriculum_0.05-1",
+        )
+        self.assertEqual(meta["residual_action_scale"], 0.05)
         self.assertEqual(meta["rl_cost_lambda"], 0.5)
-        self.assertEqual(meta["action_scale"], 1.0)
-        self.assertFalse(meta["curriculum_enabled"])
+        self.assertEqual(meta["rail_cost_formula"], "t_ff+d_w*(c+1)*b_rl")
+        self.assertEqual(meta["congestion_count_offset"], 1.0)
+        self.assertEqual(meta["action_scale"], 0.05)
+        self.assertTrue(meta["curriculum_enabled"])
         lambda_override_meta = runtime_exp_meta(
-            ContextualRuntimeConfig(rl_cost_lambda=0.25)
+            ContextualRuntimeConfig(
+                action_mode=FREE_FLOW_RESIDUAL,
+                rl_cost_lambda=0.25,
+            )
         )
         self.assertEqual(lambda_override_meta["action_range"], "0.75-1.25")
+        self.assertEqual(lambda_override_meta["congestion_count_offset"], 0.0)
+        self.assertEqual(
+            lambda_override_meta["rail_cost_formula"],
+            "t_ff+0.5*d_w*c+rl_cost_lambda*t_ff*action",
+        )
         self.assertFalse(meta["use_attention"])
         self.assertEqual(
             meta["neighbor_aggregation"], "directional_flat_projection"
@@ -2269,7 +2287,7 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
             "directional_cross_attention",
         )
         self.assertNotEqual(meta["note"], attention_meta["note"])
-        self.assertEqual(meta["reward_version"], "P")
+        self.assertEqual(meta["reward_version"], "Q")
         self.assertEqual(
             meta["tat_signal"],
             "one_sided_cumulative_total_tat_penalty",
@@ -2282,7 +2300,7 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
         self.assertTrue(meta["tat_one_sided"])
         self.assertEqual(
             meta["tat_formula"],
-            "-4.3*max(TotalTat-160,0)/165_for_TotalTat_gt_0",
+            "-4.0*max(TotalTat-160,0)/165_for_TotalTat_gt_0",
         )
         self.assertEqual(
             meta["reward_tat_zero_policy"],
@@ -2352,7 +2370,7 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
             warmup_steps=10_000,
             seed=0,
         ))
-        self.assertEqual(experiment_meta["reward_version"], "P")
+        self.assertEqual(experiment_meta["reward_version"], "Q")
         self.assertEqual(experiment_meta["action_scale"], 1.0)
         self.assertFalse(experiment_meta["curriculum_enabled"])
         self.assertEqual(

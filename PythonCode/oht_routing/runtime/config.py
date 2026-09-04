@@ -15,7 +15,7 @@ from oht_routing.algorithms.rl.contextual_td7 import (
     REPLAY_SAMPLING_RAIL,
     read_contextual_runtime_config,
 )
-from oht_routing.mdp.action import FREE_FLOW_RESIDUAL
+from oht_routing.mdp.action import REGION_B_RL
 from oht_routing.mdp.reward.config import REWARD_VERSION
 from oht_routing.mdp.termination import TAT_TERMINATION_REWARD_PROFILE
 from oht_routing.runtime.console import (
@@ -77,7 +77,7 @@ class ContextualRuntimeConfig:
     stage: int | None = None
     action_enabled: bool = False
     reward_version: str = REWARD_VERSION
-    action_mode: str = FREE_FLOW_RESIDUAL
+    action_mode: str = REGION_B_RL
     action_scale: float = 0.05
     rl_cost_lambda: float = 0.5
     num_stacks: int = 1

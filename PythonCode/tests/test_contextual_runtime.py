@@ -19,7 +19,11 @@ from oht_routing.runtime.client import (
     ContextualRuntimeConfig,
 )
 from oht_dispatching.config import DISPATCH_COST
-from oht_routing.mdp.action import EXP_RESIDUAL, FREE_FLOW_RESIDUAL
+from oht_routing.mdp.action import (
+    EXP_RESIDUAL,
+    FREE_FLOW_RESIDUAL,
+    REGION_B_RL,
+)
 from oht_routing.mdp.observation import (
     CRITIC_EXTRA_DIM,
     GLOBAL_DIM,
@@ -190,19 +194,19 @@ class ContextualRuntimeTests(unittest.TestCase):
         self.assertTrue(np.isfinite(costs).all())
         np.testing.assert_array_equal(costs, result.final_cost)
 
-    def test_runtime_wires_locked_reward_p_profile(self):
+    def test_runtime_wires_locked_reward_q_profile(self):
         runtime = self.runtime()
         runtime._ensure_initialized(make_runtime_pclient())
         reward = runtime.reward_builder.config
 
-        self.assertEqual(reward.reward_version, "P")
+        self.assertEqual(reward.reward_version, "Q")
         self.assertEqual(
             reward.contract.tat_signal_description,
             "one_sided_cumulative_total_tat_penalty",
         )
         self.assertEqual(reward.contract.tat_window_seconds, 0.0)
         self.assertEqual(reward.tat_reference, 165.0)
-        self.assertEqual(reward.tat_weight, 4.3)
+        self.assertEqual(reward.tat_weight, 4.0)
         self.assertEqual(reward.tat_window_seconds, 300.0)
         self.assertEqual(reward.op_weight, 0.0)
         self.assertFalse(reward.use_op)
@@ -211,23 +215,24 @@ class ContextualRuntimeTests(unittest.TestCase):
         self.assertEqual(reward.backlog_growth_weight, 0.17)
         self.assertEqual(reward.idle_reserve_weight, 0.09)
         self.assertEqual(reward.local_oht_weight, 0.0)
-        self.assertEqual(reward.local_predicted_oht_weight, 0.05)
-        self.assertEqual(reward.local_stop_weight, 0.12)
+        self.assertEqual(reward.local_predicted_oht_weight, 0.01)
+        self.assertEqual(reward.local_stop_weight, 0.30)
+        self.assertEqual(reward.local_density_weight, 5.5)
         self.assertEqual(reward.local_idle_weight, 0.0)
         self.assertEqual(reward.local_capacity_weight, 0.0)
-        self.assertEqual(reward.rail_tat_weight, 30.0)
-        self.assertEqual(reward.rail_tat_clip, 1.0)
-        self.assertEqual(reward.rail_free_flow_neutral_ratio, 2.0)
+        self.assertEqual(reward.rail_tat_weight, 660.0)
+        self.assertEqual(reward.rail_tat_clip, 22.0)
+        self.assertEqual(reward.rail_free_flow_neutral_ratio, 1.70)
         self.assertEqual(reward.smooth_b_rl_weight, 0.25)
         self.assertIsNone(runtime.reward_diagnostic_writer)
         self.assertIsNone(runtime.rail_tat_diagnostic_path)
 
-    def test_reward_p_runtime_total_tat_dead_zone_and_penalty(self):
+    def test_reward_q_runtime_total_tat_dead_zone_and_penalty(self):
         for total_tat, expected_tat_raw in (
             (1.0, 0.0),
             (159.0, 0.0),
             (160.0, 0.0),
-            (175.0, -4.3 * 15.0 / 165.0),
+            (175.0, -4.0 * 15.0 / 165.0),
         ):
             with self.subTest(total_tat=total_tat):
                 runtime = self.runtime()
@@ -267,22 +272,22 @@ class ContextualRuntimeTests(unittest.TestCase):
             record = records[0]
             self.assertEqual(record["global_step"], 1)
             self.assertEqual(record["episode_step"], 0)
-            self.assertEqual(record["reward_version"], "P")
+            self.assertEqual(record["reward_version"], "Q")
             self.assertEqual(record["cumulative_total_tat"], 175.0)
             self.assertEqual(record["recent_completed_tat_300s_mean"], 0.0)
-            self.assertAlmostEqual(record["tat_raw"], -4.3 * 15.0 / 165.0)
+            self.assertAlmostEqual(record["tat_raw"], -4.0 * 15.0 / 165.0)
             completed_reward = runtime.transition_aligner.last_completed.reward
             self.assertEqual(completed_reward.total_tat_level, 175.0)
             self.assertEqual(
                 completed_reward.cumulative_total_tat_level, 175.0
             )
             self.assertEqual(completed_reward.recent_completed_tat_mean, 0.0)
-            self.assertEqual(record["tat_weight"], 4.3)
+            self.assertEqual(record["tat_weight"], 4.0)
             self.assertEqual(record["backlog_weight"], 0.0007)
-            self.assertEqual(record["local_predicted_oht_weight"], 0.05)
+            self.assertEqual(record["local_predicted_oht_weight"], 0.01)
             self.assertEqual(record["local_reward_scale"], 2.0)
-            self.assertEqual(record["rail_tat_weight"], 30.0)
-            self.assertEqual(record["rail_tat_clip"], 1.0)
+            self.assertEqual(record["rail_tat_weight"], 660.0)
+            self.assertEqual(record["rail_tat_clip"], 22.0)
             for field in (
                 "tat_raw_abs",
                 "backlog_raw_abs",
@@ -487,12 +492,13 @@ class ContextualRuntimeTests(unittest.TestCase):
         boundary_rows = np.flatnonzero(
             runtime.topology.physical_index_to_controlled_row == -1
         )
-        baseline = np.asarray(
+        t_ff = np.asarray(
             [
                 pclient.RAILLINE_DIC[int(rail_id)].DistancePerVelocity
                 for rail_id in runtime.topology.all_rail_ids
             ]
         )
+        baseline = t_ff + 0.5
         for _ in range(100):
             result = runtime.Algorithm(pclient)
             np.testing.assert_array_equal(
@@ -505,6 +511,44 @@ class ContextualRuntimeTests(unittest.TestCase):
                 0.0,
             )
         self.assertEqual(runtime.observation_builder.calls, 100)
+
+    def test_region_b_rl_uses_c_plus_one_at_zero_congestion(self):
+        runtime = self.runtime(
+            mode="actor_inference",
+            action_enabled=True,
+            action_mode=REGION_B_RL,
+            curriculum_scale_start=1.0,
+            curriculum_scale_end=1.0,
+        )
+        pclient = make_runtime_pclient()
+        runtime._ensure_initialized(pclient)
+        rows = runtime.topology.controlled_row_to_physical_index[:3]
+        rail_ids = runtime.topology.all_rail_ids[rows]
+        runtime.parameterDw.update({int(rail_id): 3.0 for rail_id in rail_ids})
+        action = np.zeros(CONTROLLED_COUNT, dtype=np.float32)
+        action[:3] = (-1.0, 0.0, 1.0)
+
+        with patch.object(
+            runtime, "_actor_inference", return_value=(action, {})
+        ):
+            result = runtime.Algorithm(pclient)
+
+        t_ff = np.asarray([
+            pclient.RAILLINE_DIC[int(rail_id)].DistancePerVelocity
+            for rail_id in rail_ids
+        ])
+        np.testing.assert_allclose(
+            result.final_cost[rows],
+            t_ff + 3.0 * np.asarray((0.0, 0.5, 1.0)),
+            rtol=0.0,
+            atol=1e-12,
+        )
+        np.testing.assert_allclose(
+            runtime._current_baseline[rows] - t_ff,
+            np.full(3, 1.5),
+            rtol=0.0,
+            atol=1e-12,
+        )
 
     def test_normalized_actor_action_reaches_free_flow_cost_without_scale(self):
         runtime = self.runtime(
@@ -545,7 +589,7 @@ class ContextualRuntimeTests(unittest.TestCase):
             first.last_controlled_action, second.last_controlled_action
         )
 
-    def test_action_disabled_and_scale_zero_runtime_parity(self):
+    def test_disabled_region_uses_strengthened_neutral_baseline(self):
         disabled = self.runtime(
             mode="actor_inference", action_enabled=False, action_scale=1.0
         )
@@ -559,14 +603,14 @@ class ContextualRuntimeTests(unittest.TestCase):
         zero_client = make_runtime_pclient()
         disabled_result = disabled.Algorithm(disabled_client)
         zero_result = zero.Algorithm(zero_client)
-        baseline = np.asarray(
+        t_ff = np.asarray(
             [
                 disabled_client.RAILLINE_DIC[int(rail_id)].DistancePerVelocity
                 for rail_id in disabled.topology.all_rail_ids
             ]
         )
-        np.testing.assert_array_equal(disabled_result.final_cost, baseline)
-        np.testing.assert_array_equal(zero_result.final_cost, baseline)
+        np.testing.assert_array_equal(disabled_result.final_cost, t_ff + 0.5)
+        np.testing.assert_array_equal(zero_result.final_cost, t_ff)
 
 
 if __name__ == "__main__":

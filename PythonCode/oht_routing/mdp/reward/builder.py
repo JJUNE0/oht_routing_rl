@@ -23,7 +23,8 @@ from oht_routing.mdp.action import (
 from oht_routing.utils.reward_diagnostic import RewardDiagnosticWriter
 from oht_routing.mdp.topology import ContextualTopology
 from oht_routing.mdp.reward.config import (
-    RAIL_REWARD_FREE_FLOW_NEUTRAL_2,
+    RAIL_FREE_FLOW_NEUTRAL_RATIO,
+    RAIL_REWARD_FREE_FLOW_NEUTRAL_1_7,
     REWARD_VERSION,
     TAT_PENALTY_START,
     RewardContract,
@@ -45,12 +46,12 @@ class ContextualRewardConfig:
     reward_version: str = REWARD_VERSION
     global_alpha: float = 0.5
     local_alpha: float = 0.5
-    rail_tat_weight: float = 30.0
-    rail_free_flow_neutral_ratio: float = 2.0
+    rail_tat_weight: float = 660.0
+    rail_free_flow_neutral_ratio: float = RAIL_FREE_FLOW_NEUTRAL_RATIO
     action_mode: str = REGION_B_RL
     smooth_b_rl_weight: float = 0.25
     smooth_exp_residual_weight: float = 0.5
-    tat_weight: float = 4.3
+    tat_weight: float = 4.0
     tat_window_seconds: float = 300.0
     op_weight: float = 0.0
     backlog_weight: float = 0.0007
@@ -62,8 +63,9 @@ class ContextualRewardConfig:
     idle_reserve_scale: float = 50.0
     idle_reserve_weight: float = 0.09
     local_oht_weight: float = 0.0
-    local_predicted_oht_weight: float = 0.05
-    local_stop_weight: float = 0.12
+    local_predicted_oht_weight: float = 0.01
+    local_stop_weight: float = 0.30
+    local_density_weight: float = 5.5
     local_idle_weight: float = 0.0
     local_capacity_weight: float = 0.0
     use_tat: bool = True
@@ -72,7 +74,10 @@ class ContextualRewardConfig:
     tat_reference: float = 165.0
     op_reference: float = 0.80
     local_reward_scale: float = 2.0
-    rail_tat_clip: float | None = 1.0
+    # Scaled with rail_tat_weight (30 -> 660) so the clip still binds at the
+    # same ~11.5% route-time share. Holding it at 1.0 would truncate exactly
+    # the rails an OHT dwelt longest on.
+    rail_tat_clip: float | None = 22.0
 
     @classmethod
     def for_version(
@@ -81,7 +86,7 @@ class ContextualRewardConfig:
         *,
         action_mode: str = REGION_B_RL,
     ) -> "ContextualRewardConfig":
-        """Build the single immutable Reward P profile."""
+        """Build the single immutable Reward Q profile."""
         canonical_reward_version(reward_version)
         return cls(action_mode=action_mode)
 
@@ -91,8 +96,15 @@ class ContextualRewardConfig:
 
     @property
     def rail_reward_mode(self) -> str:
-        """Constant diagnostic label; Reward P has no rail-mode selector."""
-        return RAIL_REWARD_FREE_FLOW_NEUTRAL_2
+        """Diagnostic label naming the configured free-flow neutral ratio.
+
+        Reward Q's default renders as ``free_flow_neutral_1_7``; the historical
+        2.0 neutral point still renders as ``free_flow_neutral_2``.
+        """
+        ratio = float(self.rail_free_flow_neutral_ratio)
+        if ratio.is_integer():
+            return f"free_flow_neutral_{int(ratio)}"
+        return f"free_flow_neutral_{ratio:g}".replace(".", "_")
 
     def __post_init__(self):
         canonical_version = canonical_reward_version(self.reward_version)
@@ -107,6 +119,7 @@ class ContextualRewardConfig:
             self.idle_reserve_weight,
             self.local_reward_scale, self.local_oht_weight,
             self.local_predicted_oht_weight, self.local_stop_weight,
+            self.local_density_weight,
             self.local_idle_weight, self.local_capacity_weight,
         )
         if not np.isfinite(numeric).all():
@@ -139,6 +152,7 @@ class ContextualRewardConfig:
             self.local_oht_weight,
             self.local_predicted_oht_weight,
             self.local_stop_weight,
+            self.local_density_weight,
             self.local_idle_weight,
             self.local_capacity_weight,
         ) < 0:
@@ -210,6 +224,7 @@ class ControlledRewardBatch:
     local_oht_raw: np.ndarray
     local_predicted_raw: np.ndarray
     local_stop_raw: np.ndarray
+    local_density_raw: np.ndarray
     local_idle_raw: np.ndarray
     local_capacity_raw: np.ndarray
     waiting: float
@@ -344,9 +359,9 @@ class ContextualRewardBuilder(ContextualRailRewardMixin):
         return self._recent_tat_tracker.update(pclient)
 
     def _global_raw(self, pclient) -> float:
-        """Compute Reward P from the cumulative simulator TotalTat level."""
+        """Compute Reward Q from the cumulative simulator TotalTat level."""
         cfg = self.config
-        # Retained strictly for recent-300 diagnostic continuity. Reward P
+        # Retained strictly for recent-300 diagnostic continuity. Reward Q
         # never consumes any value from this snapshot.
         recent_tat = self.update_recent_completed_tat(pclient)
         # simulator.client decodes the two-byte wire value with ``/ 10``;
@@ -370,12 +385,18 @@ class ContextualRewardBuilder(ContextualRailRewardMixin):
             )
         self._total_completed_jobs += completed_delta
         # A zero wire value means that no cumulative TAT sample is available
-        # yet. Reward P applies no positive credit below the 160 s target and
+        # yet. Reward Q applies no positive credit below the 160 s target and
         # an unbounded linear penalty above it.
         tat_signal_available = cumulative_tat > 0.0
         tat_excess = (
-            # max(0.0, cur_tat - TAT_PENALTY_START)
-            cur_tat - TAT_PENALTY_START
+            # The one-sided clamp is part of the contract: below the 160 s
+            # target the term is zero, never a positive bonus. Reward P
+            # dropped it so Stage 1, which starts near zero TotalTat, would
+            # still see a TAT signal. It is restored because Stage 2 never
+            # goes below 160 (0 of 18,826 logged points, min 165.1), so this
+            # is a no-op there, while in Stage 1 the sub-160 bonus is ~87%
+            # episode-phase trend rather than policy quality.
+            max(0.0, cur_tat - TAT_PENALTY_START)
             if tat_signal_available else 0.0
         )
         tat_error = -tat_excess / cfg.tat_reference
@@ -476,7 +497,9 @@ class ContextualRewardBuilder(ContextualRailRewardMixin):
         result = np.empty(len(self.topology.controlled_rail_ids), dtype=np.float64)
         local_values = {
             name: np.empty(len(self.topology.controlled_rail_ids), dtype=np.float64)
-            for name in ("oht", "predicted", "stop", "idle", "capacity")
+            for name in (
+                "oht", "predicted", "stop", "density", "idle", "capacity"
+            )
         }
         idle_observation = np.empty(
             len(self.topology.controlled_rail_ids), dtype=np.float64
@@ -497,17 +520,32 @@ class ContextualRewardBuilder(ContextualRailRewardMixin):
             ))
             oht_count = len(getattr(rail, "OhtList"))
             capacity = oht_count / max(1, int(getattr(rail, "PortCount")) + 1)
+            distance_mm = float(getattr(rail, "Distance"))
+            if not np.isfinite(distance_mm) or distance_mm <= 0.0:
+                raise ContextualRewardError(
+                    f"invalid Distance for local density: rail={rail_id}, "
+                    f"value={distance_mm}"
+                )
+            density = oht_count / (distance_mm / 1000.0)
             result[row] = 0.0
             local_values["oht"][row] = -self.config.local_oht_weight * oht_count
             local_values["predicted"][row] = (
                 -self.config.local_predicted_oht_weight
                 * float(getattr(rail, "PredictedOHTCount"))
             )
-            # Reward P inherits this rail-local congestion signal from O
+            # Reward Q inherits this rail-local congestion signal from O
             # additive and unclipped. Multiple stopped OHTs and worsening
             # dwell must remain distinguishable to the policy.
             local_values["stop"][row] = (
                 -self.config.local_stop_weight * stop_time_sum
+            )
+            # OHT count per metre. Raw occupancy correlates +0.60 with rail
+            # length, so an unnormalized count penalty mostly teaches the
+            # policy to avoid long rails; dividing by length removes that
+            # (measured cross-rail corr with length -0.04) while keeping the
+            # congestion signal.
+            local_values["density"][row] = (
+                -self.config.local_density_weight * density
             )
             idle_observation[row] = float(getattr(rail, "IdleOHTCount"))
             local_values["idle"][row] = (
@@ -586,6 +624,7 @@ class ContextualRewardBuilder(ContextualRailRewardMixin):
             "local_oht_raw": self._last_local_terms["oht"],
             "local_predicted_raw": self._last_local_terms["predicted"],
             "local_stop_raw": self._last_local_terms["stop"],
+            "local_density_raw": self._last_local_terms["density"],
             "local_idle_raw": self._last_local_terms["idle"],
             "local_capacity_raw": self._last_local_terms["capacity"],
             "idle_oht_observation": self._last_idle_oht_observation,
@@ -752,6 +791,11 @@ class ContextualRewardBuilder(ContextualRailRewardMixin):
             "stop_time": float(np.mean(np.abs(
                 self.config.local_alpha
                 * batch.local_stop_raw
+                / self.config.local_reward_scale
+            ))),
+            "density": float(np.mean(np.abs(
+                self.config.local_alpha
+                * batch.local_density_raw
                 / self.config.local_reward_scale
             ))),
             "local_idle": float(np.mean(np.abs(
@@ -958,6 +1002,7 @@ class ContextualRewardBuilder(ContextualRailRewardMixin):
                 - batch.local_oht_raw
                 - batch.local_predicted_raw
                 - batch.local_stop_raw
+                - batch.local_density_raw
                 - batch.local_idle_raw
                 - batch.local_capacity_raw
             ))),
@@ -1078,6 +1123,7 @@ class ContextualRewardBuilder(ContextualRailRewardMixin):
             ("oht", batch.local_oht_raw),
             ("predicted", batch.local_predicted_raw),
             ("stop", batch.local_stop_raw),
+            ("density", batch.local_density_raw),
             ("idle", batch.local_idle_raw),
             ("capacity", batch.local_capacity_raw),
         ):
@@ -1086,7 +1132,7 @@ class ContextualRewardBuilder(ContextualRailRewardMixin):
             result[f"reward/local/{name}_raw_abs_mean"] = float(
                 np.abs(values).mean()
             )
-            # Compact Reward P metrics use coefficient-applied subterms,
+            # Compact Reward Q metrics use coefficient-applied subterms,
             # not the unweighted input features.
             compact_name = "pred" if name == "predicted" else name
             result[f"local/{compact_name}_abs_mean"] = float(
@@ -1095,7 +1141,9 @@ class ContextualRewardBuilder(ContextualRailRewardMixin):
             result[f"local/{compact_name}_std"] = float(values.std())
         local_term_abs = {
             name: result[f"reward/local/{name}_raw_abs_mean"]
-            for name in ("oht", "predicted", "stop", "idle", "capacity")
+            for name in (
+                "oht", "predicted", "stop", "density", "idle", "capacity"
+            )
         }
         local_term_denominator = (
             sum(local_term_abs.values()) + np.finfo(np.float64).eps
@@ -1104,6 +1152,7 @@ class ContextualRewardBuilder(ContextualRailRewardMixin):
             ("predicted", "predicted_abs_share"),
             ("oht", "oht_abs_share"),
             ("stop", "stop_abs_share"),
+            ("density", "density_abs_share"),
             ("idle", "idle_abs_share"),
             ("capacity", "capacity_abs_share"),
         ):

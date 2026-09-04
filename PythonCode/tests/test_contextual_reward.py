@@ -114,15 +114,15 @@ class ContextualRewardTests(unittest.TestCase):
             (100.0, 0.0),
             (159.0, 0.0),
             (160.0, 0.0),
-            (170.0, -4.3 * 10.0 / 165.0),
-            (360.0, -4.3 * 200.0 / 165.0),
+            (170.0, -4.0 * 10.0 / 165.0),
+            (360.0, -4.0 * 200.0 / 165.0),
         ):
             with self.subTest(total_tat=total_tat):
                 client = reward_client()
                 client.TotalTat = total_tat
                 builder = ContextualRewardBuilder(self.topology, config)
                 # Deliberately disagree with TotalTat: the recent signal is
-                # diagnostic-only in Reward P.
+                # diagnostic-only in Reward Q.
                 snapshot = prime_recent_tat(builder, client, 999.0)
                 self.assertTrue(snapshot.available)
                 batch = builder.build(
@@ -255,12 +255,13 @@ class ContextualRewardTests(unittest.TestCase):
             backlog_growth_enabled=False,
             idle_reserve_weight=0.0,
             local_predicted_oht_weight=0.0,
+            local_density_weight=0.0,
             rail_tat_weight=0.0,
             smooth_b_rl_weight=0.0,
         )
         batch = self.build(client, config)
         row = int(self.topology.physical_index_to_controlled_row[0])
-        expected_raw = -0.12 * (2.0 + 100.0)
+        expected_raw = -0.30 * (2.0 + 100.0)
         self.assertAlmostEqual(batch.local_stop_raw[row], expected_raw)
         self.assertAlmostEqual(
             batch.local_component[row],

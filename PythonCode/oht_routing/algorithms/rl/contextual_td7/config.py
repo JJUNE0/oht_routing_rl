@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 
-from oht_routing.mdp.action import ACTION_MODES, FREE_FLOW_RESIDUAL
+from oht_routing.mdp.action import ACTION_MODES, REGION_B_RL
 
 from .stacking import validate_stack_config
 
@@ -111,7 +111,7 @@ class ContextualNetworkConfig:
 @dataclass(frozen=True)
 class ContextualLearnerConfig:
     gamma: float = 0.99
-    action_mode: str = FREE_FLOW_RESIDUAL
+    action_mode: str = REGION_B_RL
     action_scale: float = 0.1
     actor_lr: float = 3e-4
     critic_lr: float = 3e-4

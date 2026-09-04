@@ -33,10 +33,34 @@ from oht_routing.version import CONTEXTUAL_VERSION
 _EXP_REWARD_VERSION = REWARD_VERSION
 _EXP_REWARD_CONTRACT = reward_contract(_EXP_REWARD_VERSION)
 
+# Reward Q calibration targets, as projected onto the Stage 2 segment of run
+# 017jxhcc (18,826 points, TotalTat p50 172.8) by rescaling its measured
+# Reward P term magnitudes with the Reward Q coefficient factors. The density
+# term has no Stage 2 measurement and is estimated from the
+# density-to-predicted_oht magnitude ratio of 1.32 observed on
+# results/environment_capture/capture_20260821_081812_v2.2.0_actor_inference.
+# These are observed shares to check the next run against, not coefficient
+# percentages. Below the 160 s TAT threshold the TAT term is zero by contract,
+# so the same weights read differently there; see EXPERIMENTS_v9.md.
+_REWARD_Q_TARGET_SHARES = {
+    "rail_outcome": 0.3052,
+    "tat": 0.2994,
+    "density": 0.1891,
+    "backlog_level": 0.1183,
+    "backlog_growth": 0.0278,
+    "predicted_oht": 0.0260,
+    "idle_reserve": 0.0152,
+    "smooth": 0.0123,
+    "stop_time": 0.0067,
+}
+# Delay-carrying terms (stop_time + density + rail_outcome) hold 50.1% against
+# 3.3% under Reward P; TAT drops from 49.7% to 29.9% purely by dilution, and
+# the demand forecast from 20.1% to 2.6%.
+
 EXP_META = {
     "version": CONTEXTUAL_VERSION,
-    "cost_structure": "residual",
-    "action_range": "0.5-1.5",
+    "cost_structure": "b_rl",
+    "action_range": "0.0-1.0",
     "topology": "directed_15in_15out_controlled_centers_v3",
     "observation_version": OBSERVATION_VERSION,
     "observation": "compact_local14_actor_global6_shared_tat_v6",
@@ -71,7 +95,7 @@ EXP_META = {
     "reward_version": _EXP_REWARD_VERSION,
     "tat_signal": _EXP_REWARD_CONTRACT.tat_signal_description,
     "calibration_status": (
-        "v7_free_flow_additive_residual_reward_p"
+        "v9_reward_q_delay_weighted_local_and_rail_budget"
     ),
     "reward_global_alpha": 0.5,
     "reward_local_alpha": 0.5,
@@ -79,14 +103,14 @@ EXP_META = {
     "tat_penalty_start": 160.0,
     "tat_penalty_threshold": 160.0,
     "tat_one_sided": True,
-    "tat_formula": "-4.3*max(TotalTat-160,0)/165_for_TotalTat_gt_0",
+    "tat_formula": "-4.0*max(TotalTat-160,0)/165_for_TotalTat_gt_0",
     "reward_tat_input": "pclient.TotalTat",
     "reward_recent_300_tat_used": False,
     "reward_tat_zero_policy": "unavailable_zero_contribution",
     "reward_tat_at_or_below_threshold_policy": "zero_contribution",
     "reward_tat_negative_policy": "invalid_fail_fast",
     "recent_tat_diagnostic_window_seconds": 300.0,
-    "tat_weight": 4.3,
+    "tat_weight": 4.0,
     "op_reference": 0.80,
     "op_weight": 0.0,
     "use_op": False,
@@ -99,28 +123,23 @@ EXP_META = {
     "idle_reserve_scale": 50.0,
     "idle_reserve_weight": 0.09,
     "local_oht_weight": 0.0,
-    "local_predicted_oht_weight": 0.05,
-    "local_stop_weight": 0.12,
+    "local_predicted_oht_weight": 0.01,
+    "local_stop_weight": 0.30,
     "local_stop_aggregation": "sum_unclipped",
+    "local_density_weight": 5.5,
+    "local_density_signal": "oht_count_per_rail_metre",
     "local_idle_weight": 0.0,
     "local_capacity_weight": 0.0,
     "local_reward_scale": 2.0,
-    "rail_reward_mode": "free_flow_neutral_2",
-    "rail_free_flow_neutral_ratio": 2.0,
-    "rail_tat_weight": 30.0,
-    "rail_tat_clip": 1.0,
-    "reward_target_shares": {
-        "tat": 0.2842,
-        "backlog_level": 0.0842,
-        "backlog_growth": 0.0526,
-        "idle_reserve": 0.0316,
-        "predicted_oht": 0.1263,
-        "stop_time": 0.1895,
-        "rail_outcome": 0.20,
-        "smooth": 0.0316,
-    },
-    "action_scale": 1.0,
+    "rail_reward_mode": "free_flow_neutral_1_7",
+    "rail_free_flow_neutral_ratio": 1.70,
+    "rail_tat_weight": 660.0,
+    "rail_tat_clip": 22.0,
+    "reward_target_shares": _REWARD_Q_TARGET_SHARES,
+    "action_scale": 0.05,
     "rl_cost_lambda": 0.5,
+    "rail_cost_formula": "t_ff+d_w*(c+1)*b_rl",
+    "congestion_count_offset": 1.0,
     "curriculum_scale_start": 0.05,
     "curriculum_scale_end": 1.0,
     "curriculum_shape": "geometric",
@@ -165,12 +184,21 @@ EXP_META = {
     "distributed_runtime": "central_gpu_owner_with_independent_collectors",
     "distributed_live_replay": "central_packed_ram",
     "distributed_inference": "deadline_bounded_dynamic_microbatch",
-    "note": "eviction",
+    "note": "rewardq_delaybudget",
     "description": (
-        "Add configurable full-buffer replay eviction while retaining FIFO "
-        "as the default; random replacement is an opt-in mode restricted to "
-        "single-frame observations. Observation, Reward P, networks, actions, "
-        "routing, and simulator transport remain unchanged."
+        "Reward Q rebalances per-rail credit onto measured delay: on Stage 2 "
+        "the delay terms (StopTime, density, rail-cycle outcome) carry 50.1% "
+        "of the budget against 3.3% under Reward P, TAT falls to 29.9% by "
+        "dilution, and the predicted-traffic forecast falls to 2.6% because "
+        "that signal is accurate about demand rather than congestion and is "
+        "already an observation feature. The increase is routed through "
+        "density (OHT per rail metre, weight 5.5) and the rail-cycle outcome "
+        "(weight 660, clip 22.0, neutral 2.0->1.70 at the measured "
+        "route-ratio median) rather than through StopTime, which is lowered "
+        "0.60->0.30 because it fires on 0.94% of rail-steps and otherwise "
+        "supplies three quarters of the local variance. Global backlog and "
+        "idle coefficients, observations, networks, replay, action mapping, "
+        "and routing are unchanged; tat_weight moves 4.3->4.0."
     ),
 }
 
@@ -372,6 +400,7 @@ WANDB_METRIC_KEYS += (
     "reward/local/local_component_abs_mean",
     "reward/local/predicted_abs_share", "reward/local/oht_abs_share",
     "reward/local/stop_abs_share", "reward/local/capacity_abs_share",
+    "reward/local/density_abs_share",
     "reward/rail/neutral_ratio", "reward/rail/weight", "reward/rail/clip",
     "reward/rail/nonzero_raw_abs_mean",
     "reward/rail/nonzero_weighted_abs_mean",
@@ -400,7 +429,7 @@ WANDB_METRIC_KEYS += (
     )
 ) + tuple(
     f"reward/local/{term}_raw_{stat}"
-    for term in ("oht", "predicted", "stop", "idle", "capacity")
+    for term in ("oht", "predicted", "stop", "density", "idle", "capacity")
     for stat in ("mean", "std", "abs_mean")
 )
 
@@ -601,6 +630,8 @@ WANDB_METRIC_KEYS = (
     "local/pred_std",
     "local/stop_abs_mean",
     "local/stop_std",
+    "local/density_abs_mean",
+    "local/density_std",
     "local/idle_abs_mean",
     "local/idle_std",
     "local/capacity_abs_mean",
@@ -626,7 +657,8 @@ WANDB_METRIC_KEYS = (
         for name in (
             "tat", "op", "backlog_level", "backlog_growth",
             "idle_reserve", "current_oht", "predicted_oht", "stop_time",
-            "local_idle", "capacity", "rail_outcome", "smooth",
+            "density", "local_idle", "capacity", "rail_outcome",
+            "smooth",
         )
     ),
     *(
@@ -634,7 +666,8 @@ WANDB_METRIC_KEYS = (
         for name in (
             "tat", "op", "backlog_level", "backlog_growth",
             "idle_reserve", "current_oht", "predicted_oht", "stop_time",
-            "local_idle", "capacity", "rail_outcome", "smooth",
+            "density", "local_idle", "capacity", "rail_outcome",
+            "smooth",
         )
     ),
     "reward/rail/route_ratio_mean",
@@ -828,6 +861,7 @@ def runtime_exp_meta(config) -> dict:
     )
     meta["local_oht_weight"] = float(reward_config.local_oht_weight)
     meta["local_stop_weight"] = float(reward_config.local_stop_weight)
+    meta["local_density_weight"] = float(reward_config.local_density_weight)
     meta["local_idle_weight"] = float(reward_config.local_idle_weight)
     meta["local_capacity_weight"] = float(reward_config.local_capacity_weight)
     meta["rail_tat_weight"] = float(reward_config.rail_tat_weight)
@@ -947,12 +981,18 @@ def runtime_exp_meta(config) -> dict:
     )
     if action_mode == FREE_FLOW_RESIDUAL:
         meta["cost_structure"] = "residual"
+        meta["rail_cost_formula"] = (
+            "t_ff+0.5*d_w*c+rl_cost_lambda*t_ff*action"
+        )
+        meta["congestion_count_offset"] = 0.0
         meta["action_range"] = (
             f"{1.0 - float(config.rl_cost_lambda):g}-"
             f"{1.0 + float(config.rl_cost_lambda):g}"
         )
     elif action_mode == REGION_B_RL:
         meta["cost_structure"] = "b_rl"
+        meta["rail_cost_formula"] = "t_ff+d_w*(c+1)*b_rl"
+        meta["congestion_count_offset"] = 1.0
         meta["action_range"] = (
             "b_rl_0.0-1.0_"
             f"curriculum_{float(config.curriculum_scale_start):g}-"
@@ -960,6 +1000,10 @@ def runtime_exp_meta(config) -> dict:
         )
     else:
         meta["cost_structure"] = "baseline_exp_residual"
+        meta["rail_cost_formula"] = (
+            "(t_ff+0.5*d_w*c)*exp(applied_action)"
+        )
+        meta["congestion_count_offset"] = 0.0
         meta["action_range"] = f"{float(config.action_scale):g}-scaled"
     meta["exploration_noise_std"] = float(config.exploration_noise_std)
     meta["exploration_noise_final_std"] = float(
@@ -1000,6 +1044,7 @@ def runtime_exp_meta(config) -> dict:
         f"replay_eviction={config.replay_eviction_mode}, "
         f"stack={int(config.num_stacks)}x{int(config.stack_interval)}, "
         f"action_mode={action_mode}, dispatch_mode={config.dispatch_mode}, "
+        f"rail_cost_formula={meta['rail_cost_formula']}, "
         f"critic_loss={config.critic_loss_mode}, "
         f"neighbor_aggregation={meta['neighbor_aggregation']}, "
         "independently initialized Q1/Q2 heads, "

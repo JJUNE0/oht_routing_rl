@@ -209,6 +209,8 @@ def print_runtime_summary(client):
             ("predicted-OHT weight", reward.local_predicted_oht_weight),
             ("StopTime aggregation", "sum (unclipped)"),
             ("StopTime weight", reward.local_stop_weight),
+            ("density signal", "OHT count per rail metre"),
+            ("density weight", reward.local_density_weight),
             ("local reward scale", reward.local_reward_scale),
             ("rail TAT weight", reward.rail_tat_weight),
             ("rail TAT clip", reward.rail_tat_clip),

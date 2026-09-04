@@ -103,7 +103,7 @@ def apply_controlled_action(
     *,
     action_enabled: bool,
     action_scale: float,
-    action_mode: str = FREE_FLOW_RESIDUAL,
+    action_mode: str = REGION_B_RL,
     base_cost=None,
     congestion_cost=None,
     rl_cost_lambda: float = 0.5,
@@ -186,6 +186,9 @@ def apply_controlled_action(
             ),
         }
     elif action_mode == REGION_B_RL:
+        # In the canonical runtime, ``congestion`` is d_w * (c + 1).  Keeping
+        # the coefficient explicit here makes the action mapping exactly
+        # C = t_ff + d_w * (c + 1) * b_rl.
         b_rl = 0.5 + 0.5 * applied
         final_cost[controlled_rows] = (
             base[controlled_rows]

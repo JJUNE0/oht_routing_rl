@@ -527,8 +527,8 @@ class ContextualReplayTests(unittest.TestCase):
         self.assertEqual(replay._policy_action.dtype, np.int16)
         self.assertEqual(replay._applied_action.dtype, np.int16)
 
-    def test_replay_is_locked_to_reward_p(self):
-        with self.assertRaisesRegex(ValueError, "only reward_version='P'"):
+    def test_replay_is_locked_to_reward_q(self):
+        with self.assertRaisesRegex(ValueError, "only reward_version='Q'"):
             ContextualStepReplayBuffer(
                 self.topology,
                 self.builder,

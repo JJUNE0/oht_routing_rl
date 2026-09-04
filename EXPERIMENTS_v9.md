@@ -1,0 +1,250 @@
+# Contextual TD7 experiment history — V9
+
+## v9.0.0 — Reward Q delay-weighted per-rail credit
+
+### Purpose
+
+Move the per-rail reward budget off the predicted-traffic forecast and onto
+measured delay. Reward P's global TAT/backlog/idle coefficients, the
+observation schema, networks, replay tensors, SALE/LAP, exploration, the
+curriculum, the action mapping, and simulator transport are all unchanged.
+
+### Why
+
+Measured on
+`results/environment_capture/capture_20260821_081812_v2.2.0_actor_inference`
+(steps 300–1999, 4,996 controlled rails = 8,493,200 rail-steps) and on the
+9,008 completed cycles in
+`results/reward_diagnostics/v4_reward_o_activescale_seed0`:
+
+- `predicted_oht_count` carried 98% of the local reward budget while its
+  within-rail correlation with actual local delay was −0.014 (StopTime) and
+  −0.035 (excess dwell), at every lag from 0 to 60 s. Its relationship to
+  congestion is real but non-monotonic: the probability of any stop rises
+  from 0.28% at `pred=0` to 1.87% at `pred=11–20`, then falls back to 0.68%
+  at `pred≥41`. A linear penalty cannot express that shape, so it penalised
+  the free-flowing trunk rails hardest.
+- The forecast itself is accurate — 28.1% of predicted OHTs appear on the
+  rail within 30 s against a 0.33% base rate (86× lift), and 74.1% of the
+  OHTs that do appear within 30 s were predicted — so it belongs in the
+  observation, where it already is (v5 local feature 5), not in the reward.
+- The rail-cycle outcome term is the only term with correct per-rail credit
+  for actual delay, and it held 2.9% of the budget. Its neutral point of 2.0
+  sat well above the measured route-ratio median of 1.693, so 79.9% of
+  completed cycles received positive credit; it paid out more than it
+  discriminated.
+- `local_oht_weight`, removed earlier, was a defensible removal for the wrong
+  reason: raw occupancy correlates +0.604 with rail length, so it taught
+  "avoid long rails" (the longest quartile carries 3.2× the OHTs but the
+  *lowest* stop time per OHT). Normalising by length removes the confound
+  (cross-rail correlation with length −0.044) while keeping the signal.
+
+### Contract changes
+
+| Parameter | Reward P | Reward Q |
+| --- | ---: | ---: |
+| `tat_weight` | 4.3 | 4.0 |
+| `local_predicted_oht_weight` | 0.05 | 0.01 |
+| `local_stop_weight` | 0.12 | 0.30 |
+| `local_density_weight` | — | 5.5 |
+| `rail_free_flow_neutral_ratio` | 2.0 | 1.70 |
+| `rail_tat_weight` | 30.0 | 660.0 |
+| `rail_tat_clip` | 1.0 | 22.0 |
+
+The target is a Stage 2 budget of roughly 50% delay and 30% TAT. TAT needs
+almost no coefficient change to get there — raising the delay terms dilutes it
+from 49.7% to 29.9% on its own, and `tat_weight` only trims 4.3 -> 4.0.
+
+The increase is deliberately *not* spread evenly across the three delay terms.
+`stop_time` fires on 0.94% of rail-steps with std/mean 17.8 and a maximum of
+117 s, so at Reward Q's earlier 0.60 weight it held 2-3% of the budget but
+74.5% of the local reward variance. Scaling all three delay terms equally to
+reach 50% would push the local std/mean from 3.67 to 5.02 and the maximum to
+606x the mean. Routing the increase through density (dense: 17.4% nonzero,
+std/mean 2.6, bounded at 3.5) and the rail-cycle outcome instead, and lowering
+`stop_time` to 0.30, reaches the same 50% delay share at std/mean **2.40** and
+83x maximum — less noisy than Reward Q was before the change, and far less
+noisy than the equal-scaling alternative.
+
+`local_density_weight` applies to OHT count per metre of rail
+(`len(rail.OhtList) / (rail.Distance / 1000)`), read from the same live rail
+record as the existing terms. The clip is raised in proportion to the weight
+so it still binds at the same ~11.5% route-time share; holding it at 1.0 with
+weight 660 would have truncated credit at a 0.5% share, that is, exactly the
+rails an OHT dwelt longest on.
+
+Every other coefficient — `backlog_weight` 0.0007,
+`backlog_growth_weight` 0.17, `idle_reserve_weight` 0.09, `global_alpha` and
+`local_alpha` 0.5, `local_reward_scale` 2.0, `smooth_b_rl_weight` 0.25,
+`op_weight` 0.0 — is inherited from Reward P unchanged.
+
+### Measured term budget
+
+Replayed on the capture window above (steps 300–1999). The rail-outcome term
+is not computable from the capture, which holds no completed-cycle ledger, so
+it is derived as `cycles_per_step * mean|neutral - route_ratio| * weight /
+rail_count` — the route length cancels because per-cycle credit is split
+across the route in proportion to time — calibrated by a 0.82 attribution
+factor that reproduces the measured Reward P value of 0.0090 and absorbs
+clipping and controlled-only assignment.
+
+| Term | Reward P share | Reward Q share |
+| --- | ---: | ---: |
+| `rail_outcome` | 3.93% | 35.02% |
+| `density` | — | 25.34% |
+| `backlog_level` | 27.79% | 15.25% |
+| `tat` | 15.92% | 8.74% |
+| `backlog_growth` | 11.86% | 6.51% |
+| `idle_reserve` | 7.95% | 4.36% |
+| `predicted_oht` | 30.99% | 3.40% |
+| `stop_time` | 0.63% | 0.86% |
+| `smooth` | 0.92% | 0.50% |
+
+Delay-carrying credit moves from **4.6% to 61.2%** on this window and the
+demand forecast from **31.0% to 3.4%**. The delay share reads higher here than
+the 50% Stage 2 target because the capture is the Stage 1 window, where
+`TotalTat` sits at p50 161.3 — barely above the 160 s threshold — so the TAT
+term is nearly inactive. The 50/30 split is calibrated against Stage 2, where
+`TotalTat` runs at p50 172.8; see the cross-check below.
+
+One thing this exposes that is outside the v9 change and worth deciding
+separately: `TotalTat` on this capture spans 120.1–169.1, so a TAT term that
+only activates above 160 is inactive across most of the Stage 1 range.
+
+### One-sided TAT clamp restored
+
+Reward P documented `-4.3 * max(TotalTat - 160, 0) / 165` in its contract,
+its `EXP_META`, its `reward/global/tat_excess` diagnostic, and its tests, but
+`_global_raw` shipped the unclamped difference:
+
+```python
+tat_excess = cur_tat - TAT_PENALTY_START      # no max(0, ...)
+```
+
+The clamp was dropped deliberately, to give Stage 1 a TAT signal: Stage 1
+episodes start with `TotalTat` near zero and spend much of their 2,000 ticks
+below the 160 s threshold, where a clamped term is identically zero. Reward Q
+restores the clamp anyway. The scope of that decision, measured:
+
+| Regime | source | points | below 160 s | min |
+| --- | --- | ---: | ---: | ---: |
+| Stage 2 (`episode_step >= 2000`) | run `017jxhcc` | 18,826 | **0.0%** | 165.1 |
+| Stage 1 prefix inside that run | run `017jxhcc` | 1,000 | 67.8% | 0.0 |
+| Standalone Stage 1 | run `vp0nzi3s`, 64 episodes | 12,583 | 56.6% | 0.0 |
+
+So the clamp is a **no-op in Stage 2** — `TotalTat` never once dropped below
+160 there — and the Stage 1 prefix inside a Stage 2 run produces no replay
+entry, learner sample, or update (v6.1.0), so its rewards never reach
+training. The clamp changes behaviour only in standalone Stage 1 runs.
+
+In that regime the unclamped term is mostly episode phase, not policy:
+
+| Stage 1 signal (steps >= 300) | corr with episode step | linear-trend R² |
+| --- | ---: | ---: |
+| cumulative `TotalTat` | +0.904 | 81.7% |
+| `recent_completed_tat_300s_mean` | +0.790 | 62.4% |
+
+On the v2.2.0 capture, whose 2,000 steps are exactly the Stage 1 window,
+`corr(step, TotalTat)` is +0.932 after step 300 and the trend explains 86.8%
+of variance; residual fluctuation around it is 4.32 s against a raw std of
+11.92 s. The unclamped term therefore paid a bonus that decays with episode
+step — action-independent credit the critic must model and the actor cannot
+earn. Over that window it averaged **+0.0883** (a *penalty* term with a
+positive mean) at 0.2451 mean absolute magnitude, against −0.0784/0.0784
+clamped: 3.1x the size it was calibrated for.
+
+What the clamp costs is real but small: Stage 1 loses the ~13–18% of TAT
+variation that is genuine fluctuation, for roughly the first 1,000 ticks of
+each episode. Two things offset it. Reward Q raises the phase-free per-rail
+delay term (`rail_outcome`) from 3.9% to 12.2% of the budget, and it is
+active from the first completed cycle. And the warm-up confound is intrinsic
+to the Stage 1 window rather than to the cumulative statistic — the
+recent-300 s tracker trends with episode step almost as strongly. Note that
+its Stage 1 mean is 167.2 s, above the 160 s threshold, so a clamped rule on
+*that* signal would stay active in Stage 1; that is a separate experiment,
+not part of v9.
+
+This is also why `test_total_tat_uses_one_sided_unbounded_reward_p_curve` was
+failing on `v8.0.0` for `TotalTat` of 100 and 159, and why
+`reward/global/tat_excess` — which always applied the clamp — disagreed with
+the reward actually paid.
+
+#### Budget split by `TotalTat` regime
+
+Reward Q coefficients on the same capture window, split at the 160 s
+threshold (`reward_budget_by_tat_regime.py`):
+
+| Term | `>= 160` clamped | `< 160` clamped | `< 160` unclamped (v8) |
+| --- | ---: | ---: | ---: |
+| `tat` | 15.04% | **0.00%** | **30.74%** |
+| `rail_outcome` | 32.54% | 38.47% | 26.64% |
+| `density` | 23.64% | 27.70% | 19.19% |
+| `backlog_level` | 14.75% | 15.96% | 11.05% |
+| `backlog_growth` | 3.61% | 10.53% | 7.30% |
+| `idle_reserve` | 5.61% | 2.63% | 1.82% |
+| `predicted_oht` | 3.25% | 3.61% | 2.50% |
+| `stop_time` | 0.78% | 0.98% | 0.68% |
+| `smooth` | 0.79% | 0.10% | 0.07% |
+| delay credit | 56.95% | **67.16%** | 46.51% |
+| backlog | 18.36% | **26.49%** | 18.35% |
+
+Below the threshold the clamped reward is exactly "delay + backlog + local":
+67.2% delay, 26.5% backlog, 3.6% demand, and every term is one the policy can
+move. Unclamped, the TAT bonus takes 30.7% — its signed mean is **+0.1812**, a
+payout, not a penalty — and it displaces the actionable terms proportionally
+(delay 67.2% -> 46.5%). That dilution, not the bonus itself, is the reason to
+keep the clamp.
+
+#### Cross-check against a real Stage 2 run
+
+The capture's `>= 160` slice is late Stage 1, where `TotalTat` p50 is 166.1 —
+close to the threshold, so it understates the TAT term. Measured on the Stage
+2 segment of run `017jxhcc` (18,826 points, `TotalTat` p50 172.8) under
+Reward P, and rescaled by the Reward Q coefficient factors:
+
+| Term | Reward P (measured) | Reward Q (projected) |
+| --- | ---: | ---: |
+| `rail_outcome` | 2.89% | 30.52% |
+| `tat` | 49.73% | 29.94% |
+| `density` | — | 18.91% |
+| `backlog_level` | 18.28% | 11.83% |
+| `backlog_growth` | 4.30% | 2.78% |
+| `predicted_oht` | 20.13% | 2.60% |
+| `idle_reserve` | 2.34% | 1.52% |
+| `smooth` | 1.90% | 1.23% |
+| `stop_time` | 0.42% | 0.67% |
+| **delay** (stop + density + rail) | **3.31%** | **50.10%** |
+| backlog | 22.58% | 14.61% |
+
+`density` has no Stage 2 measurement, so it is estimated from the capture's
+density-to-`predicted_oht` magnitude ratio of 1.32; the other factors are
+exact. Stage 2 keeps TAT dominant at about half the budget, which is intended,
+while delay credit rises 5x and the demand forecast falls 5x.
+
+### Compatibility
+
+MAJOR. The reward changes meaning, so V8 and older checkpoints must not be
+resumed or loaded as Stage 1 policies, and `reward_version` is locked to `Q`:
+`O` and `P` are retained as historical contracts and profiles and are rejected
+by `canonical_reward_version`. Observation, network, topology mapping, replay
+tensors, and normalizer schemas are untouched, so state-normalizer snapshots
+remain structurally valid — but a policy trained under a different objective
+should not be carried across.
+
+### Verification
+
+- Full suite: 371 tests pass
+  (`python -m unittest discover -s tests -p 'test_contextual*.py'`).
+- Term budget replayed from the capture; see the measured shares recorded in
+  `_REWARD_Q_TARGET_SHARES` in
+  `PythonCode/oht_routing/utils/wandb_logging.py`.
+- No simulator or W&B run has been launched for Reward Q.
+
+### Experiment-design note
+
+`v8.0.0` (the `region_b_rl` `c+1` offset) has not been run either. Running
+v8 and v9 as one experiment would confound an action-mapping change with an
+objective change; they should be run as separate lineages. The capture used
+for this calibration is a v2.2.0 actor-inference episode, so its state
+distribution is not the one a v9 policy will produce — re-check the observed
+shares against the first v9 capture before any further retuning.

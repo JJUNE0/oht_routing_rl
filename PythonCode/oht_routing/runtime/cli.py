@@ -34,7 +34,7 @@ def _parse_stage(value: str) -> int:
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Contextual baseline, inference, and Phase 7 training runtime",
+        description="Contextual baseline, inference, and Phase 8 training runtime",
         argument_default=argparse.SUPPRESS,
     )
     parser.add_argument(
@@ -46,7 +46,7 @@ def parse_args():
         type=canonical_reward_version,
         choices=REWARD_VERSIONS,
         help=(
-            "Compatibility flag for the single locked Reward P contract."
+            "Compatibility flag for the single locked Reward Q contract."
         ),
     )
     parser.add_argument("--action-enabled", action="store_true")

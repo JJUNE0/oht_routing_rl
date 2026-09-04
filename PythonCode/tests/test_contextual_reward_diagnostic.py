@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from oht_routing.mdp.reward.builder import ContextualRewardBuilder, ContextualRewardConfig
+from oht_routing.mdp.reward.config import RAIL_FREE_FLOW_NEUTRAL_RATIO
 from oht_routing.utils.reward_diagnostic import (
     RewardDiagnosticWriter,
     diagnostic_window_name,
@@ -249,7 +250,14 @@ class ContextualRewardDiagnosticTests(unittest.TestCase):
         oht.State = 0
         oht.CmdCompleteTat = {}
         raw = builder._rail_tat_raw(client, env_step=4)
-        np.testing.assert_allclose(raw, [-1.0 / 3.0])
+        # 5 s of rail time against 3 s of free flow is a route ratio of 5/3,
+        # and _rail_tat_raw reports the negated cycle credit. Under the
+        # historical 2.0 neutral this route earned credit; Reward Q's 1.70
+        # neutral puts it just on the penalised side, which is the point of
+        # moving the neutral point to the measured route-ratio median.
+        np.testing.assert_allclose(
+            raw, [-(RAIL_FREE_FLOW_NEUTRAL_RATIO - 5.0 / 3.0)]
+        )
         self.assertEqual(builder._last_rail_tat_cycle_count, 1)
         self.assertEqual(
             builder._last_rail_tat_controlled_assignment_count, 1

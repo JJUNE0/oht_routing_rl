@@ -1225,13 +1225,18 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
         count = len(self.topology.all_rail_ids)
         base_cost = np.empty(count, dtype=np.float64)
         congestion_cost = np.empty(count, dtype=np.float64)
+        congestion_count_offset = (
+            1.0 if self.config.action_mode == REGION_B_RL else 0.0
+        )
         for row, rail_id_value in enumerate(self.topology.all_rail_ids):
             rail_id = int(rail_id_value)
             base = float(pclient.RAILLINE_DIC[rail_id].DistancePerVelocity)
             weight = float(self.parameterDw.get(rail_id, 1.0))
             future = float(self.parameterC.get(rail_id, 0.0))
             base_cost[row] = base
-            congestion_cost[row] = weight * future
+            congestion_cost[row] = weight * (
+                future + congestion_count_offset
+            )
         baseline = base_cost + 0.5 * congestion_cost
         if not all(
             np.isfinite(value).all()

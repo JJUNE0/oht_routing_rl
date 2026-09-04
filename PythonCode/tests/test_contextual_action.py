@@ -161,9 +161,11 @@ class ContextualActionTests(unittest.TestCase):
         np.testing.assert_array_equal(baseline, baseline_before)
         np.testing.assert_array_equal(action, action_before)
 
-    def test_region_b_rl_matches_legacy_mapping_at_full_scale(self):
+    def test_region_b_rl_uses_supplied_c_plus_one_coefficient(self):
         base = np.linspace(1.0, 2.0, PHYSICAL_COUNT)
-        congestion = np.linspace(2.0, 4.0, PHYSICAL_COUNT)
+        d_w = np.full(PHYSICAL_COUNT, 3.0)
+        c = np.linspace(0.0, 2.0, PHYSICAL_COUNT)
+        congestion = d_w * (c + 1.0)
         baseline = base + 0.5 * congestion
         action = np.zeros(CONTROLLED_COUNT)
         action[:3] = (-1.0, 0.0, 1.0)
@@ -184,15 +186,21 @@ class ContextualActionTests(unittest.TestCase):
             result.final_cost[rows[2]],
             base[rows[2]] + congestion[rows[2]],
         )
+        old_baseline = base + 0.5 * d_w * c
+        np.testing.assert_allclose(
+            baseline - old_baseline,
+            0.5 * d_w,
+            rtol=0.0,
+            atol=1e-12,
+        )
         np.testing.assert_allclose(
             result.applied_controlled_action[:3], (-1.0, 0.0, 1.0)
         )
 
-    def test_region_curriculum_scale_and_zero_congestion_contract(self):
+    def test_region_curriculum_scale_and_effective_coefficient_contract(self):
         base = np.linspace(1.0, 2.0, PHYSICAL_COUNT)
         congestion = np.ones(PHYSICAL_COUNT)
         rows = self.topology.controlled_row_to_physical_index
-        congestion[rows[1]] = 0.0
         baseline = base + 0.5 * congestion
         action = np.zeros(CONTROLLED_COUNT)
         action[:2] = (1.0, -1.0)
@@ -211,7 +219,9 @@ class ContextualActionTests(unittest.TestCase):
         self.assertAlmostEqual(
             result.final_cost[rows[0]], base[rows[0]] + 0.55
         )
-        self.assertEqual(result.final_cost[rows[1]], base[rows[1]])
+        self.assertAlmostEqual(
+            result.final_cost[rows[1]], base[rows[1]] + 0.45
+        )
 
     def test_free_flow_residual_matches_requested_values_and_ignores_scale(self):
         base = np.full(PHYSICAL_COUNT, 2.0)

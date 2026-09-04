@@ -54,6 +54,8 @@ REWARD_P_EXPORT_COLUMNS = {
     "local/pred_std",
     "local/stop_abs_mean",
     "local/stop_std",
+    "local/density_abs_mean",
+    "local/density_std",
     "local/idle_abs_mean",
     "local/idle_std",
     "local/capacity_abs_mean",
@@ -66,15 +68,15 @@ REWARD_P_EXPORT_COLUMNS = {
     f"reward/term_scale/{name}_abs_mean"
     for name in (
         "tat", "op", "backlog_level", "backlog_growth", "idle_reserve",
-        "current_oht", "predicted_oht", "stop_time", "local_idle",
-        "capacity", "rail_outcome", "smooth",
+        "current_oht", "predicted_oht", "stop_time", "density",
+        "local_idle", "capacity", "rail_outcome", "smooth",
     )
 } | {
     f"reward/term_share/{name}"
     for name in (
         "tat", "op", "backlog_level", "backlog_growth", "idle_reserve",
-        "current_oht", "predicted_oht", "stop_time", "local_idle",
-        "capacity", "rail_outcome", "smooth",
+        "current_oht", "predicted_oht", "stop_time", "density",
+        "local_idle", "capacity", "rail_outcome", "smooth",
     )
 }
 WARMUP_BOUNDARY_EXPORT_COLUMNS = {
@@ -131,7 +133,7 @@ if len(WANDB_METRIC_KEYS) != len(set(WANDB_METRIC_KEYS)):
 if any(key.startswith(REMOVED_WANDB_PREFIXES) for key in WANDB_METRIC_KEYS):
     raise RuntimeError("removed metric group leaked into W&B export schema")
 if not REWARD_P_EXPORT_COLUMNS <= set(WANDB_METRIC_KEYS):
-    raise RuntimeError("Reward P diagnostics are missing from W&B export schema")
+    raise RuntimeError("Reward Q diagnostics are missing from W&B export schema")
 if not WARMUP_BOUNDARY_EXPORT_COLUMNS <= set(WANDB_METRIC_KEYS):
     raise RuntimeError("warm-up boundary diagnostics are missing from W&B export schema")
 if not RUNTIME_SAFETY_EXPORT_COLUMNS <= set(WANDB_METRIC_KEYS):

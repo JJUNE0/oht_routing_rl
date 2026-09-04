@@ -81,7 +81,7 @@ def _resolve_checkpoint_version(
         f"saved={saved_version or legacy_version!r}, "
         f"runtime={CONTEXTUAL_VERSION!r}. A checkpoint must use the current "
         "major version without being newer than the runtime. Earlier-major "
-        "observation and network contracts are intentionally incompatible."
+        "contextual contracts are intentionally incompatible."
     )
 
 

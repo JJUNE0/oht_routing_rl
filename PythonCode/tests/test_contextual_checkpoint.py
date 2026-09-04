@@ -119,19 +119,19 @@ def components(
 
 
 class ContextualCheckpointTests(unittest.TestCase):
-    def test_v6_stage1_policy_is_rejected_by_v7_action_contract(self):
+    def test_v7_stage1_policy_is_rejected_by_v8_action_contract(self):
         source, source_obs, reward = components(seed=17, sale=True)
         source.set_applied_action_scale(1.0)
         with tempfile.TemporaryDirectory() as directory:
             path = save_contextual_checkpoint(
-                Path(directory) / "stage1_v6_1.pt",
+                Path(directory) / "stage1_v7_1.pt",
                 source,
                 observation_builder=source_obs,
                 reward_builder=reward,
                 runtime_metadata={"stage": 1},
             )
             payload = torch.load(path, weights_only=False)
-            payload["version"] = "v6.1.0"
+            payload["version"] = "v7.1.0"
             payload["network_config"] = dict(payload["network_config"])
             payload["network_config"]["global_dim"] = 5
             torch.save(payload, path)
@@ -148,17 +148,17 @@ class ContextualCheckpointTests(unittest.TestCase):
                     expected_reward_version=REWARD_VERSION,
                 )
 
-    def test_v6_resume_is_rejected_by_v7_action_contract(self):
+    def test_v7_resume_is_rejected_by_v8_action_contract(self):
         source, source_obs, reward = components(seed=17, sale=True)
         with tempfile.TemporaryDirectory() as directory:
             path = save_contextual_checkpoint(
-                Path(directory) / "resume_v6_1.pt",
+                Path(directory) / "resume_v7_1.pt",
                 source,
                 observation_builder=source_obs,
                 reward_builder=reward,
             )
             payload = torch.load(path, weights_only=False)
-            payload["version"] = "v6.1.0"
+            payload["version"] = "v7.1.0"
             payload["network_config"] = dict(payload["network_config"])
             payload["network_config"]["global_dim"] = 5
             torch.save(payload, path)
@@ -765,9 +765,9 @@ class ContextualCheckpointTests(unittest.TestCase):
             )
             self.assertEqual(target_reward.reward_steps, 12_345)
 
-    def test_v5_checkpoint_is_rejected_by_v6_encoder_contract(self):
+    def test_v5_checkpoint_is_rejected_by_current_major_contract(self):
         learner, obs, reward = components()
-        self.assertEqual(CONTEXTUAL_VERSION, "v7.1.0")
+        self.assertEqual(CONTEXTUAL_VERSION, "v9.0.0")
         with tempfile.TemporaryDirectory() as directory:
             path = save_contextual_checkpoint(
                 Path(directory) / "v5_0.pt",
@@ -791,9 +791,9 @@ class ContextualCheckpointTests(unittest.TestCase):
                     reward_builder=target_reward,
                 )
 
-    def test_same_v6_reward_o_checkpoint_is_rejected_before_restore(self):
+    def test_same_major_reward_o_checkpoint_is_rejected_before_restore(self):
         learner, obs, reward = components()
-        self.assertEqual(CONTEXTUAL_VERSION, "v7.1.0")
+        self.assertEqual(CONTEXTUAL_VERSION, "v9.0.0")
         with tempfile.TemporaryDirectory() as directory:
             path = save_contextual_checkpoint(
                 Path(directory) / "reward_p.pt",
@@ -810,14 +810,14 @@ class ContextualCheckpointTests(unittest.TestCase):
             torch.save(payload, incompatible)
             with self.assertRaisesRegex(
                 ContextualCheckpointError,
-                "reward_version mismatch: saved='O', runtime='P'",
+                "reward_version mismatch: saved='O', runtime='Q'",
             ):
                 read_contextual_runtime_config(
                     incompatible, expected_reward_version=REWARD_VERSION
                 )
             with self.assertRaisesRegex(
                 ContextualCheckpointError,
-                "reward_version mismatch: saved='O', runtime='P'",
+                "reward_version mismatch: saved='O', runtime='Q'",
             ):
                 restore_checkpoint_runtime_config(
                     {"reward_version": REWARD_VERSION}, incompatible
@@ -825,7 +825,7 @@ class ContextualCheckpointTests(unittest.TestCase):
             target, target_obs, target_reward = components(seed=99)
             with self.assertRaisesRegex(
                 ContextualCheckpointError,
-                "reward_version mismatch: saved='O', runtime='P'",
+                "reward_version mismatch: saved='O', runtime='Q'",
             ):
                 load_contextual_checkpoint(
                     incompatible,
@@ -839,7 +839,7 @@ class ContextualCheckpointTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaisesRegex(
                 ContextualCheckpointError,
-                "payload='P', runtime_config='O'",
+                "payload='Q', runtime_config='O'",
             ):
                 save_contextual_checkpoint(
                     Path(directory) / "inconsistent.pt",
@@ -1016,7 +1016,7 @@ class ContextualCheckpointTests(unittest.TestCase):
 
             legacy = torch.load(path, weights_only=False)
             legacy.pop("replay_eviction_rng_state")
-            legacy["version"] = "v7.0.0"
+            legacy["version"] = CONTEXTUAL_VERSION
             legacy_path = Path(directory) / "legacy.pt"
             torch.save(legacy, legacy_path)
             legacy_target, legacy_obs, legacy_reward = components(

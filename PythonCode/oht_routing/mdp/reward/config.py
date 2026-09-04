@@ -1,10 +1,12 @@
-"""Reward P identity and locked parameters for contextual TD7.
+"""Reward Q identity and locked parameters for contextual TD7.
 
-Reward O remains recorded below as the historical centered
-recent-completion-TAT profile. Reward P uses an unbounded one-sided penalty on
-the simulator's cumulative ``pclient.TotalTat`` level; every coefficient and
-non-TAT term stays locked to Reward O. The current runtime executes Reward P
-only.
+Rewards O and P remain recorded below as historical profiles. Reward Q keeps
+Reward P's unbounded one-sided penalty on the simulator's cumulative
+``pclient.TotalTat`` level and every global coefficient, and changes only how
+per-rail credit is distributed: the local channel moves its budget off the
+predicted-traffic forecast onto delay and density signals, and the rail-cycle
+outcome term becomes a signed discriminator around the measured route-ratio
+median. The current runtime executes Reward Q only.
 """
 
 from __future__ import annotations
@@ -12,14 +14,21 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
-REWARD_VERSION = "P"
+REWARD_VERSION = "Q"
 TAT_PENALTY_START = 160.0
 TAT_WINDOW_SECONDS = 300.0
 
 TAT_SIGNAL_RECENT_COMPLETED_300S = "recent_completed_tat_300s_mean"
 TAT_SIGNAL_CUMULATIVE_TOTAL = "cumulative_total_tat"
 
+# Historical label used while the rail-cycle term was neutral at ratio 2.0.
 RAIL_REWARD_FREE_FLOW_NEUTRAL_2 = "free_flow_neutral_2"
+# Reward Q neutral point. 1.70 is the measured p50 of route_time /
+# route_free_flow_time over the 9,008 completed cycles in
+# results/reward_diagnostics/v4_reward_o_activescale_seed0, so the term splits
+# roughly 51/49 positive/negative instead of paying out on 79.9% of cycles.
+RAIL_REWARD_FREE_FLOW_NEUTRAL_1_7 = "free_flow_neutral_1_7"
+RAIL_FREE_FLOW_NEUTRAL_RATIO = 1.70
 
 
 @dataclass(frozen=True)
@@ -64,6 +73,21 @@ REWARD_P_CONTRACT = RewardContract(
     terminal_tat_penalty=-20.0,
 )
 
+REWARD_Q_CONTRACT = RewardContract(
+    version="Q",
+    tat_signal_mode=TAT_SIGNAL_CUMULATIVE_TOTAL,
+    tat_signal_description="one_sided_cumulative_total_tat_penalty",
+    # Reward Q inherits Reward P's TAT contract unchanged; only the per-rail
+    # credit distribution differs.
+    tat_window_seconds=0.0,
+    tat_termination_enabled=True,
+    tat_termination_grace_steps=10_000,
+    tat_termination_threshold=200.0,
+    tat_termination_patience=300,
+    tat_termination_inclusive=True,
+    terminal_tat_penalty=-20.0,
+)
+
 REWARD_VERSIONS = (REWARD_VERSION,)
 
 
@@ -71,14 +95,14 @@ def canonical_reward_version(version: str) -> str:
     canonical = str(version).strip().upper().replace("-", "_")
     if canonical != REWARD_VERSION:
         raise ValueError(
-            "contextual TD7 supports only reward_version='P'"
+            "contextual TD7 supports only reward_version='Q'"
         )
     return REWARD_VERSION
 
 
 def reward_contract(version: str = REWARD_VERSION) -> RewardContract:
     canonical_reward_version(version)
-    return REWARD_P_CONTRACT
+    return REWARD_Q_CONTRACT
 
 
 REWARD_O_PROFILE = {
@@ -116,12 +140,41 @@ REWARD_O_PROFILE = {
 # Keep a distinct object so future P changes cannot mutate historical O data.
 REWARD_P_PROFILE = dict(REWARD_O_PROFILE)
 
+# Reward Q. Global terms are copied from P unchanged; the differences are the
+# per-rail credit weights. The coefficients below were sized against measured
+# signal magnitudes on
+# results/environment_capture/capture_20260821_081812_v2.2.0_actor_inference
+# so that delay/congestion terms carry roughly 18% of the reward budget
+# instead of 3.3%, and the predicted-traffic forecast drops from 21.4% to
+# under 5%.
+REWARD_Q_PROFILE = dict(REWARD_P_PROFILE)
+REWARD_Q_PROFILE.update({
+    # The forecast is accurate but measures demand, not delay, and it is
+    # already an observation feature. It keeps a small tie-breaking weight.
+    "local_predicted_oht_weight": 0.01,
+    # The only dense local term whose sign tracks actual delay.
+    "local_stop_weight": 0.30,
+    # OHT count per metre of rail. Unlike raw occupancy this is not a proxy
+    # for rail length (measured cross-rail corr with length -0.04 vs +0.60).
+    "local_density_weight": 5.5,
+    "rail_free_flow_neutral_ratio": RAIL_FREE_FLOW_NEUTRAL_RATIO,
+    "rail_tat_weight": 660.0,
+    # Raised with the weight so the clip still binds at the same route-time
+    # share (~11.5%). Holding it at 1.0 would truncate exactly the rails an
+    # OHT dwelt longest on.
+    "rail_tat_clip": 22.0,
+})
+
 __all__ = (
+    "RAIL_FREE_FLOW_NEUTRAL_RATIO",
+    "RAIL_REWARD_FREE_FLOW_NEUTRAL_1_7",
     "RAIL_REWARD_FREE_FLOW_NEUTRAL_2",
     "REWARD_O_CONTRACT",
     "REWARD_O_PROFILE",
     "REWARD_P_CONTRACT",
     "REWARD_P_PROFILE",
+    "REWARD_Q_CONTRACT",
+    "REWARD_Q_PROFILE",
     "REWARD_VERSION",
     "REWARD_VERSIONS",
     "RewardContract",
