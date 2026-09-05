@@ -32,6 +32,7 @@ RESUME_LAUNCH_CONTROL_FIELDS = {
     "mode",
     "action_enabled",
     "reward_version",
+    "stage1_policy_warm_start",
     "device",
     "topology_cache_path",
     "topology_audit_path",
@@ -77,6 +78,7 @@ class ContextualRuntimeConfig:
     stage: int | None = None
     action_enabled: bool = False
     reward_version: str = REWARD_VERSION
+    stage1_policy_warm_start: bool = False
     action_mode: str = REGION_B_RL
     action_scale: float = 0.05
     rl_cost_lambda: float = 0.5

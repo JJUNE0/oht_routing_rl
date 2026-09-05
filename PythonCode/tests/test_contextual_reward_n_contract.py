@@ -6,6 +6,9 @@ from oht_routing.mdp.action import REGION_B_RL
 from oht_routing.mdp.reward.builder import ContextualRewardBuilder, ContextualRewardConfig
 from oht_routing.mdp.reward.config import (
     RAIL_REWARD_FREE_FLOW_NEUTRAL_1_7,
+    RAIL_REWARD_FREE_FLOW_NEUTRAL_2,
+    REWARD_N_CONTRACT,
+    REWARD_N_PROFILE,
     REWARD_O_CONTRACT,
     REWARD_O_PROFILE,
     REWARD_P_CONTRACT,
@@ -72,24 +75,96 @@ class RewardQContractTests(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertEqual(getattr(config, name), value)
         self.assertEqual(REWARD_VERSION, "Q")
-        self.assertEqual(REWARD_VERSIONS, ("Q",))
+        self.assertEqual(REWARD_VERSIONS, ("Q", "N"))
         self.assertIsNot(REWARD_P_PROFILE, REWARD_O_PROFILE)
         self.assertEqual(REWARD_P_PROFILE, REWARD_O_PROFILE)
-        # Reward Q keeps every global coefficient from P and differs only
-        # in how per-rail credit is distributed.
+        # Reward Q inherits P's backlog/idle/mixing coefficients and differs
+        # in the TAT weight and in how per-rail credit is distributed.
         for shared in (
-            "tat_weight", "backlog_weight", "backlog_growth_weight",
+            "backlog_weight", "backlog_growth_weight",
             "idle_reserve_weight", "global_alpha", "local_alpha",
             "local_reward_scale", "smooth_b_rl_weight", "op_weight",
         ):
             self.assertEqual(
                 REWARD_Q_PROFILE[shared], REWARD_P_PROFILE[shared]
             )
+        self.assertEqual(REWARD_P_PROFILE["tat_weight"], 4.3)
+        self.assertEqual(REWARD_Q_PROFILE["tat_weight"], 4.0)
         self.assertNotEqual(
             REWARD_Q_PROFILE["local_stop_weight"],
             REWARD_P_PROFILE["local_stop_weight"],
         )
         self.assertNotIn("local_density_weight", REWARD_P_PROFILE)
+
+    def test_reward_n_restores_the_1y9sx4a5_coefficients(self):
+        """The `--reward-version N` fallback is a pure coefficient swap."""
+        config = ContextualRewardConfig.for_version(
+            "N", action_mode=REGION_B_RL
+        )
+        expected = {
+            "reward_version": "N",
+            "tat_weight": 11.0,
+            "tat_reference": 165.0,
+            "op_weight": 4.0,
+            "use_op": True,
+            "op_reference": 0.80,
+            "backlog_weight": 0.0004,
+            "backlog_growth_weight": 0.16,
+            "backlog_growth_scale": 30.0,
+            "backlog_growth_horizon": 300,
+            "idle_reserve_weight": 0.2,
+            "idle_reserve_target": 200.0,
+            "idle_reserve_scale": 50.0,
+            "local_oht_weight": 0.3,
+            "local_predicted_oht_weight": 0.075,
+            "local_stop_weight": 0.3,
+            "local_density_weight": 0.0,
+            "local_capacity_weight": 0.1,
+            "local_idle_weight": 0.0,
+            "local_reward_scale": 2.0,
+            "rail_tat_weight": 30.0,
+            "rail_tat_clip": 1.0,
+            "rail_free_flow_neutral_ratio": 2.0,
+            "rail_reward_mode": RAIL_REWARD_FREE_FLOW_NEUTRAL_2,
+            "global_alpha": 0.5,
+            "local_alpha": 0.5,
+            "smooth_b_rl_weight": 0.25,
+        }
+        for name, value in expected.items():
+            with self.subTest(name=name):
+                self.assertEqual(getattr(config, name), value)
+        # N keeps the same TAT contract and termination policy as Q.
+        self.assertIs(config.contract, REWARD_N_CONTRACT)
+        self.assertEqual(
+            config.contract.tat_signal_mode, TAT_SIGNAL_CUMULATIVE_TOTAL
+        )
+        self.assertEqual(config.contract.terminal_tat_penalty, -20.0)
+        self.assertEqual(config.contract.tat_termination_threshold, 200.0)
+
+    def test_reward_n_tat_curve_is_one_sided_at_weight_11(self):
+        """1y9sx4a5 ran commit 2ad214e, which clamped at the 160 s target."""
+        config = ContextualRewardConfig(
+            **dict(REWARD_N_PROFILE, reward_version="N",
+                   use_backlog=False, backlog_growth_enabled=False,
+                   idle_reserve_weight=0.0, use_op=False)
+        )
+        action = np.zeros(CONTROLLED_COUNT, dtype=np.float32)
+        for total_tat, excess in (
+            (100.0, 0.0), (160.0, 0.0), (170.0, 10.0), (360.0, 200.0),
+        ):
+            with self.subTest(total_tat=total_tat):
+                builder = ContextualRewardBuilder(self.topology, config)
+                client = reward_client()
+                client.TotalOhtOperationRate = 0.8
+                client.TotalTat = total_tat
+                prime_recent_tat(builder, client, total_tat + 500.0)
+                batch = builder.build(
+                    client, applied_action=action,
+                    previous_applied_action=None, env_step=0, episode_id=0,
+                )
+                self.assertAlmostEqual(
+                    batch.tat_raw, -11.0 * excess / 165.0
+                )
 
     def test_one_sided_unbounded_tat_curve(self):
         action = np.zeros(CONTROLLED_COUNT, dtype=np.float32)
@@ -159,11 +234,11 @@ class RewardQContractTests(unittest.TestCase):
         self.assertEqual(REWARD_O_CONTRACT.tat_window_seconds, 300.0)
         for retired in ("O", "P"):
             with self.assertRaisesRegex(
-                ValueError, "only reward_version='Q'"
+                ValueError, "only reward_version in \('Q', 'N'\)"
             ):
                 reward_contract(retired)
             with self.assertRaisesRegex(
-                ValueError, "only reward_version='Q'"
+                ValueError, "only reward_version in \('Q', 'N'\)"
             ):
                 ContextualRewardConfig.for_version(retired)
 

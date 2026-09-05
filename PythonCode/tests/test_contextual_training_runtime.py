@@ -789,12 +789,81 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
             "stage2_policy_warm_started_from_stage1": True,
         }
 
+    def test_stage1_policy_is_a_frozen_prefix_by_default(self):
+        """A fixed Stage 1 artifact must load under any reward version."""
+        config = ContextualRuntimeConfig(
+            mode="training",
+            action_enabled=True,
+            stage=2,
+            load_stage1_policy_path="stage1.pt",
+            reward_version="N",
+            device="cpu",
+            replay_capacity_env_steps=64,
+            batch_size=16,
+            minimum_replay_env_steps=1,
+            minimum_action_enabled_env_steps=1,
+            wandb_enabled=False,
+            sale_enabled=False,
+            lap_enabled=False,
+        )
+        self.assertFalse(config.stage1_policy_warm_start)
+        runtime = ClientAlgorithm(config)
+        runtime.topology = make_topology()
+        runtime.observation_builder = TrainingObservationBuilder(
+            runtime.topology, freeze_steps=1
+        )
+        calls = []
+
+        def load_stage1(*args, observation_builder, **kwargs):
+            calls.append(kwargs)
+            for normalizer, dim in (
+                (observation_builder.local_normalizer, LOCAL_PHYSICAL_DIM),
+                (observation_builder.global_normalizer, GLOBAL_DIM),
+                (observation_builder.critic_normalizer, CRITIC_EXTRA_DIM),
+            ):
+                normalizer.update(np.ones((1, dim)), name="stage1")
+                normalizer.freeze()
+            return SimpleNamespace(
+                encoder=torch.nn.Linear(1, 1),
+                actor=torch.nn.Linear(1, 1),
+                sale_fixed=None,
+                applied_action_scale=1.0,
+                action_mode=runtime.config.action_mode,
+                checkpoint_path=Path("stage1.pt"),
+                checkpoint_sha256="stage1-sha256",
+            )
+
+        learner = SimpleNamespace(
+            encoder=torch.nn.Linear(1, 1),
+            actor=torch.nn.Linear(1, 1),
+        )
+        pclient = make_runtime_pclient()
+        with (
+            patch(
+                "oht_routing.runtime.client.ContextualTD7Learner",
+                return_value=learner,
+            ),
+            patch(
+                "oht_routing.runtime.client.load_frozen_contextual_policy",
+                side_effect=load_stage1,
+            ),
+        ):
+            runtime._ensure_initialized(pclient)
+
+        self.assertEqual(len(calls), 1)
+        # No trainable weights are seeded, so the artifact's own reward
+        # version is irrelevant and must not be enforced.
+        self.assertFalse(calls[0]["initialize_fresh_learner_policy"])
+        self.assertIsNone(calls[0]["expected_reward_version"])
+        self.assertFalse(runtime.stage2_policy_warm_started_from_stage1)
+
     def test_fresh_stage2_requests_policy_warm_start_exactly_once(self):
         config = ContextualRuntimeConfig(
             mode="training",
             action_enabled=True,
             stage=2,
             load_stage1_policy_path="stage1.pt",
+            stage1_policy_warm_start=True,
             device="cpu",
             replay_capacity_env_steps=64,
             batch_size=16,
@@ -2300,7 +2369,7 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
         self.assertTrue(meta["tat_one_sided"])
         self.assertEqual(
             meta["tat_formula"],
-            "-4.0*max(TotalTat-160,0)/165_for_TotalTat_gt_0",
+            "-4*max(TotalTat-160,0)/165_for_TotalTat_gt_0",
         )
         self.assertEqual(
             meta["reward_tat_zero_policy"],

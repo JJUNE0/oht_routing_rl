@@ -30,6 +30,7 @@ from oht_routing.mdp.reward.config import (
     RewardContract,
     canonical_reward_version,
     reward_contract,
+    reward_profile,
 )
 from oht_routing.mdp.recent_tat import (
     RecentCompletedTatSnapshot,
@@ -86,9 +87,13 @@ class ContextualRewardConfig:
         *,
         action_mode: str = REGION_B_RL,
     ) -> "ContextualRewardConfig":
-        """Build the single immutable Reward Q profile."""
-        canonical_reward_version(reward_version)
-        return cls(action_mode=action_mode)
+        """Build the locked coefficient set for an executable reward version."""
+        canonical = canonical_reward_version(reward_version)
+        return cls(
+            reward_version=canonical,
+            action_mode=action_mode,
+            **reward_profile(canonical),
+        )
 
     @property
     def contract(self) -> RewardContract:

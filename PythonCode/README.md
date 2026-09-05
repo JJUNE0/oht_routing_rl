@@ -1,8 +1,9 @@
 # Contextual TD7 v9.0.0 for OHT routing
 
 반도체 FAB OHT의 rail cost를 학습해 혼잡 구간을 우회시키는 contextual TD7
-구현입니다. 현재 runtime은 **Reward Q**만 실행하며, 이전 Reward E~P 구현과
-실험 기록은 루트의 `EXPERIMENTS.md`, `EXPERIMENTS_v2.md` ~
+구현입니다. 실행 가능한 reward 계수는 **Q**(기본)와 **N**(2026-08-20 run
+`1y9sx4a5` 복원) 두 가지이며 `--reward-version`으로 선택합니다. O/P를 포함한
+이전 구현과 실험 기록은 루트의 `EXPERIMENTS.md`, `EXPERIMENTS_v2.md` ~
 `EXPERIMENTS_v8.md`에 보존합니다. v9 기록은 `EXPERIMENTS_v9.md`입니다.
 
 공식 진입점은 `main.py` 하나입니다. Runtime 기본값의 단일 원본은
@@ -38,12 +39,50 @@ python .\PythonCode\main.py `
   --replay-eviction-mode random
 ```
 
+Reward N 계수로 돌리려면 `--reward-version N`만 추가합니다. exploration은
+0.05 고정을 권장합니다(아래 참고).
+
+```powershell
+python .\PythonCode\main.py `
+  --mode training `
+  --action-enabled `
+  --stage 2 `
+  --reward-version N `
+  --load-stage1-policy ".\PythonCode\v9.0.0_stage1_policy.pt" `
+  --replay-eviction-mode random `
+  --exploration-noise-std 0.05 `
+  --exploration-noise-final-std 0.05
+```
+
+다른 장비에서 실행할 때 필요한 것은 저장소와
+**`PythonCode/v9.0.0_stage1_policy.pt` (23 MB) 하나**입니다. 이 파일은 Reward
+Q로 학습됐지만 frozen prefix로만 쓰이므로 `--reward-version N`에서도 그대로
+로드됩니다. 다만 topology는 분리되지 않으므로 simulator 레이아웃이 같아야
+합니다(`topology_hash`/`mapping_hash` 검사).
+
 매 episode의 1~2,000 tick은 frozen Stage 1 policy가 운전하며 exploration,
 replay insertion, learner update가 모두 없습니다. 2,001 tick에서 reset 없이
-Stage 2 policy로 전환합니다. Fresh Stage 2는 Stage 1의 encoder/actor/SALE로
-한 번만 warm-start하고 critic, optimizer, replay, RNG는 새로 시작합니다.
+Stage 2 policy로 전환합니다. **Stage 2 learner는 기본적으로 처음부터
+학습합니다** — Stage 1 가중치를 물려받으려면 `--stage1-policy-warm-start`를
+명시해야 하고, 그때만 Stage 1 artifact의 reward version이 일치해야 합니다.
 Stage 2의 curriculum과 checkpoint 주기는 prefix를 제외한 `stage2_env_steps`
-기준이며, exploration 기본값은 `0.05 -> 0.05`입니다.
+기준입니다.
+
+#### exploration noise
+
+`0.05` 고정을 권장합니다. 동일 조건에서 노이즈만 바꾼 두 run
+(`jki8xzcv` 0.05 vs `s31qyeko` 0.10, 그 외 설정과 Stage 1 artifact 동일):
+
+| | 0.05 | 0.10 |
+| --- | ---: | ---: |
+| TAT 초반 -> 후반 | 175.2 -> **172.3** | 174.7 -> **188.0** |
+| backlog | 170.4 | 237.1 |
+| action clip 비율 | 1.3% | **3.9%** |
+| policy 자체 std | 0.453 | **0.353** |
+
+0.10은 액션을 경계 밖으로 밀어 clipping을 3배로 늘리고, 정책 자체의 다양성을
+오히려 줄였습니다. 참고로 노이즈가 설명하는 행동 분산은 0.05에서 1.1%뿐이며,
+나머지는 정책이 상태에 반응해 만들어냅니다.
 
 ### Actor inference 평가
 
@@ -67,7 +106,25 @@ reward term share 재검증에 사용합니다 —
 `[checkpoint-loaded]` 블록의 environment step, action scale, 복원된
 normalizer를 확인한 뒤 결과를 사용하세요.
 
-## Reward Q 계약
+## Reward 계약
+
+기본은 Q입니다. `--reward-version N`은 아래 계수만 바꾸며 구조는 동일합니다.
+
+| 파라미터 | Q | N |
+| --- | ---: | ---: |
+| `tat_weight` | 4.0 | 11.0 |
+| `op_weight` / `use_op` | 0.0 / off | 4.0 / on |
+| `backlog_weight` | 0.0007 | 0.0004 |
+| `backlog_growth_weight` | 0.17 | 0.16 |
+| `idle_reserve_weight` | 0.09 | 0.2 |
+| `local_oht_weight` | 0.0 | 0.3 |
+| `local_predicted_oht_weight` | 0.01 | 0.075 |
+| `local_stop_weight` | 0.30 | 0.3 |
+| `local_density_weight` | 5.5 | 0.0 |
+| `local_capacity_weight` | 0.0 | 0.1 |
+| `rail_tat_weight` / clip / neutral | 660 / 22 / 1.70 | 30 / 1.0 / 2.0 |
+
+아래 식은 Q 기준입니다.
 
 controlled rail `i`의 최종 reward입니다.
 
@@ -108,8 +165,9 @@ TAT 종료 조건은 10,000 step grace 이후 `TotalTat >= 200`이 300회 연속
 발생하는 경우이며, 종료 transition에 `-20` terminal penalty를 broadcast합니다.
 
 계약의 단일 소스는 `oht_routing/mdp/reward/config.py`의
-`REWARD_Q_CONTRACT`와 `REWARD_Q_PROFILE`입니다. Reward O/P 정의는 과거 계약
-확인용으로만 보존됩니다. 고정값 검증은
+`REWARD_Q_CONTRACT`/`REWARD_Q_PROFILE`와 `REWARD_N_CONTRACT`/
+`REWARD_N_PROFILE`입니다. Reward O/P 정의는 과거 계약 확인용으로만 보존되며
+실행할 수 없습니다. 고정값 검증은
 `tests/test_contextual_reward_n_contract.py`에 있습니다.
 
 ## Action 계약
@@ -154,7 +212,9 @@ state count, `stop_time_sum`, `stopped_oht_count`입니다. actor global은
 
 통합 버전은 `oht_routing/version.py`의 `CONTEXTUAL_VERSION` = **v9.0.0**
 하나입니다. 로드 시 통합 버전, topology/mapping hash, network config, action
-mode, SALE/LAP 사용 여부, Reward Q를 검사합니다. replay payload는 저장하지
+mode, SALE/LAP 사용 여부, reward version을 검사합니다. 단
+`--load-stage1-policy`는 frozen prefix 전용이므로 reward version을 검사하지
+않습니다. replay payload는 저장하지
 않으므로 resume 후 다시 채웁니다. **v8 이하의 checkpoint, Stage 1 policy,
 state normalizer는 reward 의미가 달라 모두 거부됩니다.**
 

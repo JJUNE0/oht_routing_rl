@@ -555,16 +555,24 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
                 indent=2,
             )
         if self.config.load_stage1_policy_path:
+            warm_start = bool(
+                self.config.stage1_policy_warm_start
+                and self.config.resume_checkpoint_path is None
+            )
             self.stage1_policy = load_frozen_contextual_policy(
                 self.config.load_stage1_policy_path,
                 self.learner,
                 observation_builder=self.observation_builder,
-                expected_reward_version=self.config.reward_version,
-                initialize_fresh_learner_policy=(
-                    self.config.resume_checkpoint_path is None
+                # The prefix policy is frozen and never trained, so it does
+                # not have to share the learner's reward version. Only a
+                # warm-start, which seeds trainable weights, requires the
+                # objectives to match.
+                expected_reward_version=(
+                    self.config.reward_version if warm_start else None
                 ),
+                initialize_fresh_learner_policy=warm_start,
             )
-            if self.config.resume_checkpoint_path is None:
+            if warm_start:
                 self.stage2_policy_warm_started_from_stage1 = True
             resumed_stage1_sha256 = resumed_runtime_metadata.get(
                 "stage1_policy_sha256"

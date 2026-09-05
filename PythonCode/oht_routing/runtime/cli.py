@@ -46,7 +46,8 @@ def parse_args():
         type=canonical_reward_version,
         choices=REWARD_VERSIONS,
         help=(
-            "Compatibility flag for the single locked Reward Q contract."
+            "Locked reward coefficient set. Q is the current delay-weighted "
+            "profile; N restores the 2026-08-20 run 1y9sx4a5 coefficients."
         ),
     )
     parser.add_argument("--action-enabled", action="store_true")
@@ -289,6 +290,16 @@ def parse_args():
     )
     parser.add_argument(
         "--resume-checkpoint", dest="resume_checkpoint_path"
+    )
+    parser.add_argument(
+        "--stage1-policy-warm-start",
+        dest="stage1_policy_warm_start",
+        action="store_true",
+        help=(
+            "Also seed the fresh Stage 2 encoder/actor/SALE from the Stage 1 "
+            "policy. Off by default: the Stage 1 artifact is a fixed frozen "
+            "prefix and the Stage 2 learner trains from scratch."
+        ),
     )
     parser.add_argument(
         "--load-stage1-policy",

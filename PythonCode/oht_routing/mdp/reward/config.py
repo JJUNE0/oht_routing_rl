@@ -88,21 +88,49 @@ REWARD_Q_CONTRACT = RewardContract(
     terminal_tat_penalty=-20.0,
 )
 
-REWARD_VERSIONS = (REWARD_VERSION,)
+REWARD_N_CONTRACT = RewardContract(
+    version="N",
+    tat_signal_mode=TAT_SIGNAL_CUMULATIVE_TOTAL,
+    tat_signal_description="one_sided_cumulative_total_tat_penalty",
+    tat_window_seconds=0.0,
+    tat_termination_enabled=True,
+    tat_termination_grace_steps=10_000,
+    tat_termination_threshold=200.0,
+    tat_termination_patience=300,
+    tat_termination_inclusive=True,
+    terminal_tat_penalty=-20.0,
+)
+
+# Executable profiles, newest first. Q is the default; N is the restored
+# 2026-08-20 run 1y9sx4a5 coefficient set, kept selectable as a fallback.
+REWARD_VERSIONS = ("Q", "N")
 
 
 def canonical_reward_version(version: str) -> str:
     canonical = str(version).strip().upper().replace("-", "_")
-    if canonical != REWARD_VERSION:
+    if canonical not in REWARD_VERSIONS:
         raise ValueError(
-            "contextual TD7 supports only reward_version='Q'"
+            "contextual TD7 supports only reward_version in "
+            f"{REWARD_VERSIONS}"
         )
-    return REWARD_VERSION
+    return canonical
 
 
 def reward_contract(version: str = REWARD_VERSION) -> RewardContract:
-    canonical_reward_version(version)
-    return REWARD_Q_CONTRACT
+    canonical = canonical_reward_version(version)
+    return {
+        "Q": REWARD_Q_CONTRACT,
+        "N": REWARD_N_CONTRACT,
+    }[canonical]
+
+
+def reward_profile(version: str = REWARD_VERSION) -> dict:
+    """Locked coefficient set for an executable reward version."""
+    canonical = canonical_reward_version(version)
+    return dict({
+        "Q": REWARD_Q_PROFILE,
+        "N": REWARD_N_PROFILE,
+    }[canonical])
 
 
 REWARD_O_PROFILE = {
@@ -149,6 +177,9 @@ REWARD_P_PROFILE = dict(REWARD_O_PROFILE)
 # under 5%.
 REWARD_Q_PROFILE = dict(REWARD_P_PROFILE)
 REWARD_Q_PROFILE.update({
+    # Trimmed only enough to land the Stage 2 budget at ~30% TAT; raising the
+    # delay terms does the rest of the dilution.
+    "tat_weight": 4.0,
     # The forecast is accurate but measures demand, not delay, and it is
     # already an observation feature. It keeps a small tie-breaking weight.
     "local_predicted_oht_weight": 0.01,
@@ -165,16 +196,47 @@ REWARD_Q_PROFILE.update({
     "rail_tat_clip": 22.0,
 })
 
+# Reward N. The coefficient set that ran W&B run 1y9sx4a5 on 2026-08-20,
+# restored verbatim from that run's saved config and kept selectable with
+# `--reward-version N`. Only the coefficients are restored: the observation,
+# action mapping, Stage 1/2 contract, replay, and network are the current
+# ones, so this is not a reproduction of that run.
+#
+# The TAT clamp is part of this profile. Commit 2ad214e, the code 1y9sx4a5
+# actually ran, computed `max(0.0, cur_tat - TAT_PENALTY_START)` with
+# `tat_one_sided=True`; the clamp was only dropped later, in v6.0.0.
+REWARD_N_PROFILE = dict(REWARD_Q_PROFILE)
+REWARD_N_PROFILE.update({
+    "tat_weight": 11.0,
+    "op_weight": 4.0,
+    "use_op": True,
+    "backlog_weight": 0.0004,
+    "backlog_growth_weight": 0.16,
+    "idle_reserve_weight": 0.2,
+    "local_oht_weight": 0.3,
+    "local_predicted_oht_weight": 0.075,
+    "local_stop_weight": 0.3,
+    "local_capacity_weight": 0.1,
+    # Reward N predates the density term.
+    "local_density_weight": 0.0,
+    "rail_tat_weight": 30.0,
+    "rail_tat_clip": 1.0,
+    "rail_free_flow_neutral_ratio": 2.0,
+})
+
 __all__ = (
     "RAIL_FREE_FLOW_NEUTRAL_RATIO",
     "RAIL_REWARD_FREE_FLOW_NEUTRAL_1_7",
     "RAIL_REWARD_FREE_FLOW_NEUTRAL_2",
+    "REWARD_N_CONTRACT",
+    "REWARD_N_PROFILE",
     "REWARD_O_CONTRACT",
     "REWARD_O_PROFILE",
     "REWARD_P_CONTRACT",
     "REWARD_P_PROFILE",
     "REWARD_Q_CONTRACT",
     "REWARD_Q_PROFILE",
+    "reward_profile",
     "REWARD_VERSION",
     "REWARD_VERSIONS",
     "RewardContract",

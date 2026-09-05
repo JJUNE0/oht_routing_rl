@@ -397,12 +397,17 @@ class CentralTrainingCoordinator:
             device=self.device,
             seed=self.config.seed,
         )
+        warm_start = bool(self.config.stage1_policy_warm_start)
         self.stage1_policy = load_frozen_contextual_policy(
             self.config.load_stage1_policy_path,
             self.learner,
             observation_builder=self.observation_builder,
-            expected_reward_version=self.config.reward_version,
-            initialize_fresh_learner_policy=True,
+            # Frozen prefix only: the reward version has to match solely when
+            # the artifact also seeds trainable Stage 2 weights.
+            expected_reward_version=(
+                self.config.reward_version if warm_start else None
+            ),
+            initialize_fresh_learner_policy=warm_start,
         )
         self.stage1_metadata = Stage1PolicyMetadata(
             action_mode=self.stage1_policy.action_mode,

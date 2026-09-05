@@ -22,6 +22,7 @@ from oht_routing.mdp.observation import (
 from oht_routing.mdp.reward.builder import ContextualRewardConfig
 from oht_routing.mdp.reward.config import (
     REWARD_VERSION,
+    TAT_PENALTY_START,
     reward_contract,
 )
 from oht_routing.runtime.stages import (
@@ -32,6 +33,15 @@ from oht_routing.version import CONTEXTUAL_VERSION
 
 _EXP_REWARD_VERSION = REWARD_VERSION
 _EXP_REWARD_CONTRACT = reward_contract(_EXP_REWARD_VERSION)
+
+
+def _tat_formula(reward_config) -> str:
+    """One-sided TAT penalty, rendered from the live coefficients."""
+    return (
+        f"-{reward_config.tat_weight:g}*max(TotalTat-"
+        f"{int(TAT_PENALTY_START)},0)/{reward_config.tat_reference:g}"
+        "_for_TotalTat_gt_0"
+    )
 
 # Reward Q calibration targets, as projected onto the Stage 2 segment of run
 # 017jxhcc (18,826 points, TotalTat p50 172.8) by rescaling its measured
@@ -103,7 +113,9 @@ EXP_META = {
     "tat_penalty_start": 160.0,
     "tat_penalty_threshold": 160.0,
     "tat_one_sided": True,
-    "tat_formula": "-4.0*max(TotalTat-160,0)/165_for_TotalTat_gt_0",
+    "tat_formula": _tat_formula(
+        ContextualRewardConfig.for_version(_EXP_REWARD_VERSION)
+    ),
     "reward_tat_input": "pclient.TotalTat",
     "reward_recent_300_tat_used": False,
     "reward_tat_zero_policy": "unavailable_zero_contribution",
@@ -799,6 +811,23 @@ def runtime_exp_meta(config) -> dict:
         f"{EXP_META['calibration_status']}_"
         f"locked_reward_{contract.version.lower()}"
     )
+    meta["tat_formula"] = _tat_formula(reward_config)
+    # The calibrated shares describe Reward Q only; N predates them.
+    if contract.version == "Q":
+        meta["reward_target_shares"] = dict(_REWARD_Q_TARGET_SHARES)
+    else:
+        meta.pop("reward_target_shares", None)
+        meta["note"] = "rewardn_1y9sx4a5_coeffs"
+        meta["description"] = (
+            "Fallback to the Reward N coefficient set that ran W&B run "
+            "1y9sx4a5 on 2026-08-20: TAT weight 11, operation-rate term back "
+            "on at 4.0, backlog 0.0004, idle reserve 0.2, local "
+            "oht/predicted/stop/capacity 0.3/0.075/0.3/0.1, no density term, "
+            "rail-cycle weight 30 with clip 1.0 at the 2.0 neutral point. "
+            "Only the coefficients are restored - the observation, action "
+            "mapping, Stage 1/2 contract, replay, and network are the "
+            "current v9 ones, so this is not a reproduction of that run."
+        )
     sale = bool(config.sale_enabled)
     lap = bool(config.lap_enabled)
     action_mode = str(config.action_mode)

@@ -245,6 +245,13 @@ def _resolve_and_validate_resume(config: ContextualRuntimeConfig) -> None:
     elif config.load_stage1_policy_path is not None:
         raise ValueError("load_stage1_policy_path requires stage 2")
     if (
+        config.stage1_policy_warm_start
+        and config.load_stage1_policy_path is None
+    ):
+        raise ValueError(
+            "stage1_policy_warm_start requires --load-stage1-policy"
+        )
+    if (
         config.load_stage1_policy_path is not None
         and config.load_state_normalizer_path is not None
     ):

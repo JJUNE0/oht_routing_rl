@@ -290,12 +290,14 @@ class ContextualProtocolTests(unittest.TestCase):
         observation_type.assert_called_once()
         replay_type.assert_called_once()
         learner_type.assert_called_once()
+        # The Stage 1 artifact is a fixed frozen prefix by default: no
+        # trainable weights are seeded and its reward version is not enforced.
         load_stage1.assert_called_once_with(
             "stage1.pt",
             learner,
             observation_builder=central_builder,
-            expected_reward_version=config.reward_version,
-            initialize_fresh_learner_policy=True,
+            expected_reward_version=None,
+            initialize_fresh_learner_policy=False,
         )
         self.assertTrue(all(response.done() for response in responses))
         self.assertTrue(all(

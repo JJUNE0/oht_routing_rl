@@ -67,7 +67,7 @@ class ContextualVariantTests(unittest.TestCase):
         for retired in ("O", "P"):
             with self.assertRaises(SystemExit):
                 self.parse("--reward-version", retired)
-        with self.assertRaisesRegex(ValueError, "only reward_version='Q'"):
+        with self.assertRaisesRegex(ValueError, "only reward_version in \('Q', 'N'\)"):
             ContextualRuntimeConfig(reward_version="O")
 
         config = ContextualRuntimeConfig()
