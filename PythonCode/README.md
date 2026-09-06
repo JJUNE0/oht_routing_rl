@@ -54,11 +54,115 @@ python .\PythonCode\main.py `
   --exploration-noise-final-std 0.05
 ```
 
-다른 장비에서 실행할 때 필요한 것은 저장소와
-**`PythonCode/v9.0.0_stage1_policy.pt` (23 MB) 하나**입니다. 이 파일은 Reward
-Q로 학습됐지만 frozen prefix로만 쓰이므로 `--reward-version N`에서도 그대로
-로드됩니다. 다만 topology는 분리되지 않으므로 simulator 레이아웃이 같아야
-합니다(`topology_hash`/`mapping_hash` 검사).
+### 학습된 Stage 2 정책 이어서 돌리기
+
+`v9.0.0_stage2_policy.pt`는 `stage2_env_steps=220,000` 시점의 Stage 2
+학습 체크포인트입니다(전체 시뮬레이터 시간 `runtime_env_step=232,000`,
+에피소드 6). 여기서 학습을 이어가려면:
+
+```powershell
+python .\PythonCode\main.py `
+  --mode training `
+  --action-enabled `
+  --stage 2 `
+  --load-stage1-policy ".\PythonCode\v9.0.0_stage1_policy.pt" `
+  --resume-checkpoint ".\PythonCode\v9.0.0_stage2_policy.pt" `
+  --checkpoint-root ".\checkpoints\s2_from220k"
+```
+
+같은 정책을 노이즈 없이 평가하려면:
+
+```powershell
+python .\PythonCode\main.py `
+  --mode actor_inference `
+  --action-enabled `
+  --stage 2 `
+  --load-stage1-policy ".\PythonCode\v9.0.0_stage1_policy.pt" `
+  --resume-checkpoint ".\PythonCode\v9.0.0_stage2_policy.pt" `
+  --checkpoint-root ".\checkpoints\_inference_s2_220k"
+```
+
+`--checkpoint-root`는 항상 새 경로를 주세요. 생략하면 자동 생성된 슬러그가
+원본 학습 디렉터리와 같아져 periodic 아티팩트를 덮어씁니다.
+
+### 다른 장비로 옮길 때
+
+저장소와 아래 두 파일만 있으면 됩니다.
+
+| 파일 | 크기 | 용도 |
+| --- | ---: | --- |
+| `PythonCode/v9.0.0_stage1_policy.pt` | 23 MB | 매 episode 앞 2,000 tick을 운전하는 frozen prefix |
+| `PythonCode/v9.0.0_stage2_policy.pt` | 23 MB | 이어서 학습하거나 평가할 Stage 2 정책 |
+
+Stage 1 파일은 Reward Q로 학습됐지만 frozen prefix로만 쓰이므로
+`--reward-version N`에서도 그대로 로드됩니다. 다만 topology는 분리되지
+않으므로 simulator 레이아웃이 같아야 합니다
+(`topology_hash`/`mapping_hash` 검사). Stage 2 재개는 저장된
+`stage1_policy_sha256`과 실제 Stage 1 파일이 일치해야 합니다.
+
+### 학습 전에 버퍼만 채우기
+
+```powershell
+python .\PythonCode\main.py `
+  --mode training --action-enabled --stage 2 `
+  --load-stage1-policy ".\PythonCode\v9.0.0_stage1_policy.pt" `
+  --resume-checkpoint ".\PythonCode\v9.0.0_stage2_policy.pt" `
+  --checkpoint-root ".\checkpoints\s2_collect2" `
+  --resume-deterministic-episodes 2
+```
+
+`--resume-deterministic-episodes N`은 재개 직후 N개 episode를 복원된
+deterministic actor로만 진행합니다. exploration noise와 learner update가
+모두 없고 transition은 전부 replay에 남으므로, 고정된 정책으로 버퍼를 채운
+뒤 학습을 시작할 수 있습니다. N번째 episode가 끝나면 저장된 exploration
+schedule과 learner update가 재개됩니다.
+
+`--resume-deterministic-first-episode`(N=1과 동일)와 함께 쓸 수 없고,
+`--resume-warmstart-steps`와도 배타적입니다. 후자는 짧은 첫 episode를
+replay에서 아예 제외하는 별개 옵션입니다.
+
+### 재개 실험 예시 (노이즈·버퍼 조정)
+
+exploration noise를 낮추고 replay를 키워 이어서 학습하는 전체 예시입니다.
+
+```powershell
+python .\PythonCode\main.py `
+  --mode training --action-enabled --stage 2 `
+  --load-stage1-policy ".\PythonCode\v9.0.0_stage1_policy.pt" `
+  --resume-checkpoint ".\PythonCode\v9.0.0_stage2_policy.pt" `
+  --checkpoint-root ".\checkpoints\s2_from220k_noise001" `
+  --resume-deterministic-episodes 2 `
+  --replay-eviction-mode random `
+  --replay-capacity-env-steps 140000 `
+  --exploration-noise-std 0.01 `
+  --exploration-noise-final-std 0.01
+```
+
+**resume에서 명시가 필요한 인자들.** `replay_eviction_mode`,
+`replay_capacity_env_steps`, `batch_size`처럼 launch-control로 분류된 옵션은
+checkpoint에서 복원되지 않고 CLI/기본값을 씁니다. 생략하면 원본 run과 다른
+설정으로 재개되므로, 이어서 돌릴 때는 매번 명시하세요. 특히
+`--replay-eviction-mode`를 빼면 기본값 `fifo`가 적용되어 버퍼 구조가
+바뀝니다.
+
+`exploration_noise_std`처럼 launch-control이 아닌 옵션은 명시하지 않으면
+checkpoint 값이 복원되고, 명시하면 명시한 값이 이깁니다.
+
+**replay RAM.** capacity는 선형으로 메모리를 먹습니다(random eviction, LAP
+on 기준).
+
+| capacity | RAM | episode 환산 | 2 episode 수집 시 충전율 |
+| ---: | ---: | ---: | ---: |
+| 100,000 | 16.77 GiB | 2.3 | 86% |
+| 120,000 | 20.13 GiB | 2.8 | 72% |
+| 140,000 | 23.48 GiB | 3.3 | 61% |
+| 160,000 | 26.84 GiB | 3.7 | 54% |
+
+32 GiB 장비에서는 120,000~140,000이 상한입니다. OS, PyTorch/CUDA 컨텍스트,
+모델, 샘플링 임시 버퍼가 따로 필요합니다. capacity를 키우면 같은 수집
+episode로는 버퍼가 덜 차므로 `--resume-deterministic-episodes`도 함께
+올릴지 검토하세요. replay는 checkpoint에 저장되지 않으므로 재개할 때
+capacity를 바꿔도 안전하고, 매번 처음부터 다시 채웁니다.
 
 매 episode의 1~2,000 tick은 frozen Stage 1 policy가 운전하며 exploration,
 replay insertion, learner update가 모두 없습니다. 2,001 tick에서 reset 없이

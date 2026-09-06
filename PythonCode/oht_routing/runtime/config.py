@@ -60,6 +60,7 @@ RESUME_LAUNCH_CONTROL_FIELDS = {
     "lap_enabled",
     "use_attention",
     "resume_inference_until_replay_full",
+    "resume_deterministic_episodes",
     "resume_deterministic_first_episode",
     "resume_warmstart_steps",
     "load_stage1_policy_path",
@@ -122,6 +123,7 @@ class ContextualRuntimeConfig:
     resume_checkpoint_path: str | None = None
     load_stage1_policy_path: str | None = None
     resume_inference_until_replay_full: bool = False
+    resume_deterministic_episodes: int = 0
     resume_deterministic_first_episode: bool = False
     resume_warmstart_steps: int = 0
     rail_tat_diagnostic_path: str | None = None
@@ -210,16 +212,27 @@ def seed_everything(seed):
             torch.use_deterministic_algorithms(True)
 
 
-def restore_checkpoint_runtime_config(config_kwargs, checkpoint_path):
-    """Apply compatible saved settings while preserving launch controls."""
+def restore_checkpoint_runtime_config(
+    config_kwargs, checkpoint_path, explicit_fields=()
+):
+    """Apply compatible saved settings while preserving launch controls.
+
+    ``explicit_fields`` names the options the user actually typed. Those are
+    left alone: an explicit command-line value must win over the value stored
+    in the checkpoint, otherwise a resumed run silently ignores what was
+    asked for.
+    """
     saved, _ = read_contextual_runtime_config(
         checkpoint_path,
         expected_reward_version=config_kwargs["reward_version"],
     )
     valid_fields = set(ContextualRuntimeConfig.__dataclass_fields__)
+    explicit = set(explicit_fields)
     restored = []
     for key, value in saved.items():
         if key not in valid_fields or key in RESUME_LAUNCH_CONTROL_FIELDS:
+            continue
+        if key in explicit:
             continue
         config_kwargs[key] = value
         restored.append(key)
@@ -269,10 +282,13 @@ def runtime_config_from_args(args) -> ContextualRuntimeConfig:
         config_kwargs["exploration_noise_std"] = 0.05
         config_kwargs["exploration_noise_final_std"] = 0.05
 
+    explicit_fields = frozenset(config_kwargs)
     config = ContextualRuntimeConfig(**config_kwargs)
     if config.resume_checkpoint_path:
         config_kwargs = restore_checkpoint_runtime_config(
-            asdict(config), config.resume_checkpoint_path
+            asdict(config),
+            config.resume_checkpoint_path,
+            explicit_fields=explicit_fields,
         )
         config = ContextualRuntimeConfig(**config_kwargs)
     return config

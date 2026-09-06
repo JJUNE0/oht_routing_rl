@@ -207,6 +207,7 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
         self._last_replay_push_ms = 0.0
         self._resume_requires_refill = False
         self._resume_deterministic_episode_active = False
+        self._resume_deterministic_episodes_remaining = 0
         self._resume_warmstart_episode_active = False
         self._last_sim_time: float | None = None
         self._stale_sim_time_ticks = 0
@@ -525,9 +526,15 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
                     "observation state normalizers"
                 )
             self._resume_requires_refill = self.config.mode == "training"
+            requested_episodes = (
+                int(self.config.resume_deterministic_episodes)
+                or int(bool(self.config.resume_deterministic_first_episode))
+            )
+            self._resume_deterministic_episodes_remaining = (
+                requested_episodes if self.config.mode == "training" else 0
+            )
             self._resume_deterministic_episode_active = bool(
-                self.config.mode == "training"
-                and self.config.resume_deterministic_first_episode
+                self._resume_deterministic_episodes_remaining
             )
             self._resume_warmstart_episode_active = bool(
                 self.config.mode == "training"
@@ -1023,11 +1030,21 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
             getattr(self, "_resume_deterministic_episode_active", False)
             and self.episode_steps > 0
         ):
-            self._resume_deterministic_episode_active = False
+            self._resume_deterministic_episodes_remaining = max(
+                0, self._resume_deterministic_episodes_remaining - 1
+            )
+            self._resume_deterministic_episode_active = bool(
+                self._resume_deterministic_episodes_remaining
+            )
+            remaining = self._resume_deterministic_episodes_remaining
             print(
                 "[checkpoint-resume] deterministic collection episode "
-                "complete; learner updates and saved exploration resume "
-                "from this episode",
+                + (
+                    f"complete; {remaining} more to collect before learning"
+                    if remaining
+                    else "complete; learner updates and saved exploration "
+                    "resume from this episode"
+                ),
                 flush=True,
             )
         self.episode_id += 1

@@ -326,6 +326,17 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--resume-deterministic-episodes",
+        type=int,
+        metavar="N",
+        help=(
+            "Collect N whole episodes with the restored deterministic actor "
+            "before learning starts: no exploration noise and no learner "
+            "updates, but every transition is kept in replay. Use it to fill "
+            "the buffer from a fixed policy before any update."
+        ),
+    )
+    parser.add_argument(
         "--resume-deterministic-first-episode",
         action="store_true",
         help=(
