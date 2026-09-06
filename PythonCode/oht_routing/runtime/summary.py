@@ -29,6 +29,7 @@ def print_runtime_summary(client):
         neighbor_count=network.neighbor_count,
         lap_enabled=config.lap_enabled,
         eviction_mode=config.replay_eviction_mode,
+        state_capacity_margin=config.replay_state_capacity_margin,
     ) / (1024.0 ** 3)
     replay_storage = "packed V5 local u8/u16, critic TAT f32, Q15 actions"
     if config.lap_enabled:

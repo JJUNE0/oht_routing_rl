@@ -8,6 +8,7 @@ import numpy as np
 from oht_routing.algorithms.rl.contextual_td7.replay_buffer import (
     ContextualReplayError,
     ContextualStepReplayBuffer,
+    REPLAY_EVICTION_FIFO,
     REPLAY_EVICTION_RANDOM,
     REPLAY_SAMPLING_SNAPSHOT,
     STATIC_PHYSICAL_FEATURE_INDICES,
@@ -383,18 +384,26 @@ class ContextualReplayMemoryTests(unittest.TestCase):
         for capacity in (1_000, 5_000, 10_000, 45_000):
             self.assertGreater(replay.estimate_capacity_bytes(capacity), 0)
 
-        estimate_100k = replay.estimate_capacity_bytes(
-            100_000, lap_enabled=True
-        )
-        estimate_100k_gib = estimate_100k / (1024.0 ** 3)
-        self.assertLess(estimate_100k_gib, 20.0)
-        self.assertAlmostEqual(estimate_100k_gib, 16.772765, places=5)
-        estimate_100k_no_lap_gib = replay.estimate_capacity_bytes(
-            100_000, lap_enabled=False
-        ) / (1024.0 ** 3)
-        self.assertAlmostEqual(
-            estimate_100k_no_lap_gib, 15.840325, places=5
-        )
+        # FIFO reserves capacity + margin state slots; random keeps 2x
+        # because its live set is scattered and its allocator fails hard.
+        for lap, fifo_gib, random_gib in (
+            (True, 11.741527, 16.774441),
+            (False, 10.809087, 15.842001),
+        ):
+            with self.subTest(lap_enabled=lap):
+                fifo = replay.estimate_capacity_bytes(
+                    100_000, lap_enabled=lap,
+                    eviction_mode=REPLAY_EVICTION_FIFO,
+                ) / (1024.0 ** 3)
+                random_mode = replay.estimate_capacity_bytes(
+                    100_000, lap_enabled=lap,
+                    eviction_mode=REPLAY_EVICTION_RANDOM,
+                ) / (1024.0 ** 3)
+                self.assertLess(fifo, 20.0)
+                self.assertLess(random_mode, 20.0)
+                self.assertAlmostEqual(fifo, fifo_gib, places=5)
+                self.assertAlmostEqual(random_mode, random_gib, places=5)
+                self.assertLess(fifo, random_mode)
 
     def test_packed_storage_dtypes_match_capacity_estimate_contract(self):
         replay = ContextualStepReplayBuffer(

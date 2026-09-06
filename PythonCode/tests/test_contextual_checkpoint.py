@@ -767,7 +767,7 @@ class ContextualCheckpointTests(unittest.TestCase):
 
     def test_v5_checkpoint_is_rejected_by_current_major_contract(self):
         learner, obs, reward = components()
-        self.assertEqual(CONTEXTUAL_VERSION, "v9.0.0")
+        self.assertEqual(CONTEXTUAL_VERSION, "v9.2.0")
         with tempfile.TemporaryDirectory() as directory:
             path = save_contextual_checkpoint(
                 Path(directory) / "v5_0.pt",
@@ -793,7 +793,7 @@ class ContextualCheckpointTests(unittest.TestCase):
 
     def test_same_major_reward_o_checkpoint_is_rejected_before_restore(self):
         learner, obs, reward = components()
-        self.assertEqual(CONTEXTUAL_VERSION, "v9.0.0")
+        self.assertEqual(CONTEXTUAL_VERSION, "v9.2.0")
         with tempfile.TemporaryDirectory() as directory:
             path = save_contextual_checkpoint(
                 Path(directory) / "reward_p.pt",

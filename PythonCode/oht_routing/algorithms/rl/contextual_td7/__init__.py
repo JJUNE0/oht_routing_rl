@@ -20,6 +20,7 @@ from .networks import (
 from .replay_buffer import (
     ContextualReplayError,
     ContextualStepReplayBuffer,
+    DEFAULT_STATE_CAPACITY_MARGIN,
     REPLAY_EVICTION_FIFO,
     REPLAY_EVICTION_MODES,
     REPLAY_EVICTION_RANDOM,
@@ -81,6 +82,7 @@ __all__ = [
     "ContextualReplayError",
     "ContextualStepReplayBuffer",
     "ContextualStepSnapshot",
+    "DEFAULT_STATE_CAPACITY_MARGIN",
     "REPLAY_EVICTION_FIFO",
     "REPLAY_EVICTION_MODES",
     "REPLAY_EVICTION_RANDOM",

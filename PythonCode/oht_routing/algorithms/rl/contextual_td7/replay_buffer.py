@@ -54,6 +54,37 @@ REPLAY_EVICTION_MODES = (
 _EVICTION_RNG_STREAM = 0x45564943  # ASCII "EVIC"
 
 
+# Slots reserved above the transition capacity so every live transition can
+# still reach both of its states. Each episode boundary costs one extra state
+# because the state chain of an episode is one longer than its transition
+# chain, so the margin bounds how many episodes may coexist in the buffer.
+DEFAULT_STATE_CAPACITY_MARGIN = 10_000
+
+
+def _state_capacity_for(
+    capacity: int, eviction_mode: str, margin: int
+) -> int:
+    """State slots to allocate for a transition capacity.
+
+    FIFO retires transitions in insertion order, so the live set is a
+    contiguous window and needs ``capacity + one state per episode boundary``.
+    Measured peak usage is 1.00x capacity for long episodes and 1.10x for
+    10-step episodes. Overshooting the margin is not a correctness problem
+    either: ``_valid_transition_slots`` drops transitions whose state was
+    overwritten, so the buffer loses samples instead of corrupting them.
+
+    Random eviction replaces uniformly chosen slots, so the live set is
+    scattered across history and adjacent transitions rarely survive together.
+    Measured peak usage is 1.58x capacity even for long episodes and 2.00x for
+    single-step episodes, and its allocator fails hard when exhausted, so it
+    keeps the full 2x reservation.
+    """
+    capacity = int(capacity)
+    if eviction_mode == REPLAY_EVICTION_RANDOM:
+        return 2 * capacity
+    return capacity + min(int(margin), capacity)
+
+
 # Replay storage is deliberately narrower than the learner contract. Samples
 # are always materialized as float32 before normalization/model use.
 STATIC_PHYSICAL_FEATURE_INDICES = (0, 1, 2, 3)
@@ -221,9 +252,12 @@ class ContextualStepReplayBuffer:
         eviction_mode: str = REPLAY_EVICTION_FIFO,
         num_stacks: int = 1,
         stack_interval: int = 1,
+        state_capacity_margin: int = DEFAULT_STATE_CAPACITY_MARGIN,
     ):
         if int(capacity_env_steps) <= 0:
             raise ValueError("capacity_env_steps must be positive")
+        if int(state_capacity_margin) < 0:
+            raise ValueError("state_capacity_margin must be non-negative")
         if sampling_mode not in REPLAY_SAMPLING_MODES:
             raise ValueError(
                 f"sampling_mode must be one of {REPLAY_SAMPLING_MODES}"
@@ -243,9 +277,10 @@ class ContextualStepReplayBuffer:
         self.topology = topology
         self.observation_builder = observation_builder
         self.capacity = int(capacity_env_steps)
-        # Worst case is one completed transition per episode: no adjacent
-        # state can be shared, so C valid transitions require 2C state slots.
-        self.state_capacity = 2 * self.capacity
+        self.state_capacity_margin = int(state_capacity_margin)
+        self.state_capacity = _state_capacity_for(
+            self.capacity, eviction_mode, self.state_capacity_margin
+        )
         self.controlled_count = len(topology.controlled_rail_ids)
         self.physical_count = len(topology.all_rail_ids)
         self.rng = np.random.default_rng(seed)
@@ -931,6 +966,23 @@ class ContextualStepReplayBuffer:
             )
         )
 
+    def _referenced_state_slot_count(self) -> int:
+        """Distinct state slots the currently-valid transitions point at."""
+        slots = np.flatnonzero(self._transition_valid)
+        if slots.size == 0:
+            return 0
+        pairs = np.concatenate([
+            np.stack(
+                [self._state_slot[slots], self._state_gen_ref[slots]], axis=1
+            ),
+            np.stack(
+                [self._next_state_slot[slots],
+                 self._next_state_gen_ref[slots]],
+                axis=1,
+            ),
+        ])
+        return int(len(np.unique(pairs, axis=0)))
+
     def _valid_transition_slots(self) -> np.ndarray:
         candidates = np.flatnonzero(self._transition_valid)
         if candidates.size == 0:
@@ -1561,13 +1613,16 @@ class ContextualStepReplayBuffer:
         neighbor_count: int = 15,
         lap_enabled: bool = False,
         eviction_mode: str = REPLAY_EVICTION_FIFO,
+        state_capacity_margin: int = DEFAULT_STATE_CAPACITY_MARGIN,
     ) -> int:
         c = int(capacity_env_steps)
         if eviction_mode not in REPLAY_EVICTION_MODES:
             raise ValueError(
                 f"eviction_mode must be one of {REPLAY_EVICTION_MODES}"
             )
-        state_capacity = 2 * c
+        state_capacity = _state_capacity_for(
+            c, eviction_mode, state_capacity_margin
+        )
         packed_physical_bytes = (
             len(UINT8_PHYSICAL_FEATURE_INDICES)
             + 2 * len(UINT16_PHYSICAL_FEATURE_INDICES)
@@ -1582,11 +1637,11 @@ class ContextualStepReplayBuffer:
         # Previous, deterministic policy, and applied actions use signed
         # int16 fixed point. Reward remains float32.
         vectors = c * controlled_count * (3 * 2 + 4)
-        metadata = c * (7 * 8 + 4 + 1) + (2 * c) * (8 + 1)
+        metadata = c * (7 * 8 + 4 + 1) + state_capacity * (8 + 1)
         if eviction_mode == REPLAY_EVICTION_RANDOM:
             # One uint8 reference count and one int64 free-stack entry per
             # state slot. The scalar free-stack cursor is negligible here.
-            metadata += (2 * c) * (1 + 8)
+            metadata += state_capacity * (1 + 8)
         static_mapping = controlled_count * (
             1 + 2 * int(neighbor_count)
         ) * 8
@@ -1636,7 +1691,19 @@ class ContextualStepReplayBuffer:
                     neighbor_count=self.neighbor_count,
                     lap_enabled=self.lap_enabled,
                     eviction_mode=self.eviction_mode,
+                    state_capacity_margin=self.state_capacity_margin,
                 )
+            ),
+            "replay/state_capacity": float(self.state_capacity),
+            "replay/state_slots_referenced": float(
+                self._referenced_state_slot_count()
+            ),
+            # Transitions whose state was overwritten are dropped from
+            # sampling. A persistently positive value means the FIFO state
+            # margin is too small for the current episode length.
+            "replay/unsamplable_env_steps": float(
+                np.count_nonzero(self._transition_valid)
+                - self._valid_transition_slots().size
             ),
             "replay/storage_physical_bytes_per_rail_state": float(
                 len(UINT8_PHYSICAL_FEATURE_INDICES)

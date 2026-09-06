@@ -388,6 +388,9 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
                 reward_version=self.config.reward_version,
                 sampling_mode=self.config.replay_sampling_mode,
                 eviction_mode=self.config.replay_eviction_mode,
+                state_capacity_margin=(
+                    self.config.replay_state_capacity_margin
+                ),
                 num_stacks=self.config.num_stacks,
                 stack_interval=self.config.stack_interval,
             )

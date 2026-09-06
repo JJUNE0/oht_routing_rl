@@ -236,12 +236,27 @@ def _resolve_and_validate_resume(config: ContextualRuntimeConfig) -> None:
     if config.load_stage1_policy_path is not None:
         object.__setattr__(config, "state_normalizer_warmup_bypass", True)
     if config.stage == STAGE_TWO:
-        if config.mode != "training":
-            raise ValueError("stage 2 requires training mode")
+        # actor_inference is allowed so a Stage 2 policy can be evaluated
+        # under the same per-episode contract it trained on: the frozen
+        # Stage 1 prefix drives ticks 1..2,000 and the Stage 2 policy takes
+        # over from 2,001. Evaluating without the prefix would put the first
+        # 2,000 ticks out of distribution.
+        if config.mode not in {"training", "actor_inference"}:
+            raise ValueError(
+                "stage 2 requires training or actor_inference mode"
+            )
         if not config.action_enabled:
             raise ValueError("stage 2 requires explicit action_enabled")
         if config.load_stage1_policy_path is None:
             raise ValueError("stage 2 requires --load-stage1-policy")
+        if (
+            config.mode == "actor_inference"
+            and config.resume_checkpoint_path is None
+        ):
+            raise ValueError(
+                "stage 2 actor_inference requires --resume-checkpoint for "
+                "the Stage 2 policy"
+            )
     elif config.load_stage1_policy_path is not None:
         raise ValueError("load_stage1_policy_path requires stage 2")
     if (

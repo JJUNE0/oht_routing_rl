@@ -8,6 +8,8 @@ from oht_routing.algorithms.rl.contextual_td7.replay_buffer import (
     ACTION_FIXED_POINT_MAX_ABS_ERROR,
     ContextualReplayError,
     ContextualStepReplayBuffer,
+    REPLAY_EVICTION_FIFO,
+    REPLAY_EVICTION_RANDOM,
     REPLAY_SAMPLING_RANDOM_RAIL,
     REPLAY_SAMPLING_SNAPSHOT,
     snapshot_from_transition,
@@ -116,6 +118,106 @@ class ContextualReplayTests(unittest.TestCase):
     def setUp(self):
         self.topology = make_topology()
         self.builder = FakeObservationBuilder(self.topology)
+
+    def _fill(self, replay, pushes, episode_length):
+        step = episode = 0
+        for _ in range(pushes):
+            done = (step + 1) % episode_length == 0
+            replay.push(make_snapshot(
+                self.topology, step, episode=episode, done=done
+            ))
+            if done:
+                episode += 1
+                step = 0
+            else:
+                step += 1
+
+    def test_random_eviction_keeps_the_full_2x_state_reservation(self):
+        """Random eviction scatters the live set; measured need is up to 2x."""
+        for margin in (0, 5, 10_000):
+            replay = ContextualStepReplayBuffer(
+                self.topology, self.builder, capacity_env_steps=32, seed=3,
+                eviction_mode=REPLAY_EVICTION_RANDOM,
+                state_capacity_margin=margin,
+            )
+            self.assertEqual(replay.state_capacity, 64)
+
+    def test_fifo_state_capacity_follows_the_margin(self):
+        for margin, expected in ((0, 32), (8, 40), (10_000, 64)):
+            replay = ContextualStepReplayBuffer(
+                self.topology, self.builder, capacity_env_steps=32, seed=3,
+                eviction_mode=REPLAY_EVICTION_FIFO,
+                state_capacity_margin=margin,
+            )
+            # The margin is clamped to the capacity, so 10_000 lands on 2x.
+            self.assertEqual(replay.state_capacity, expected)
+
+    def test_fifo_margin_keeps_every_transition_samplable(self):
+        """One state per episode boundary is all FIFO needs above capacity."""
+        for episode_length in (16, 64, 10_000):
+            with self.subTest(episode_length=episode_length):
+                replay = ContextualStepReplayBuffer(
+                    self.topology, self.builder, capacity_env_steps=64, seed=3,
+                    eviction_mode=REPLAY_EVICTION_FIFO,
+                    state_capacity_margin=16,
+                )
+                self.assertEqual(replay.state_capacity, 80)
+                self._fill(replay, 400, episode_length)
+                live = int(np.count_nonzero(replay._transition_valid))
+                self.assertEqual(live, 64)
+                self.assertEqual(replay._valid_transition_slots().size, 64)
+                self.assertEqual(
+                    replay.diagnostics()["replay/unsamplable_env_steps"], 0.0
+                )
+
+    def test_undersized_fifo_margin_degrades_without_raising(self):
+        """A too-small margin must lose samples, never corrupt or crash."""
+        replay = ContextualStepReplayBuffer(
+            self.topology, self.builder, capacity_env_steps=64, seed=3,
+            eviction_mode=REPLAY_EVICTION_FIFO, state_capacity_margin=2,
+        )
+        self._fill(replay, 400, 1)          # every push ends its episode
+        live = int(np.count_nonzero(replay._transition_valid))
+        samplable = replay._valid_transition_slots().size
+        self.assertEqual(live, 64)
+        self.assertLess(samplable, live)
+        self.assertGreater(samplable, 0)
+        self.assertEqual(
+            replay.diagnostics()["replay/unsamplable_env_steps"],
+            float(live - samplable),
+        )
+        batch = replay.sample(8)            # sampling still works
+        self.assertEqual(batch.policy_action.shape, (8, 1))
+
+    def test_estimate_matches_allocated_state_capacity(self):
+        for eviction in (REPLAY_EVICTION_FIFO, REPLAY_EVICTION_RANDOM):
+            for margin in (4, 10_000):
+                replay = ContextualStepReplayBuffer(
+                    self.topology, self.builder, capacity_env_steps=32,
+                    seed=3, eviction_mode=eviction,
+                    state_capacity_margin=margin,
+                )
+                estimated = ContextualStepReplayBuffer.estimate_capacity_bytes(
+                    32,
+                    physical_count=replay.physical_count,
+                    controlled_count=replay.controlled_count,
+                    neighbor_count=replay.neighbor_count,
+                    lap_enabled=replay.lap_enabled,
+                    eviction_mode=eviction,
+                    state_capacity_margin=margin,
+                )
+                self.assertGreaterEqual(estimated, replay.storage_bytes)
+                self.assertEqual(
+                    replay.diagnostics()["replay/state_capacity"],
+                    float(replay.state_capacity),
+                )
+
+    def test_negative_state_capacity_margin_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "state_capacity_margin"):
+            ContextualStepReplayBuffer(
+                self.topology, self.builder, capacity_env_steps=8, seed=3,
+                state_capacity_margin=-1,
+            )
 
     def test_one_push_is_4996_logical_rows_and_sample_contract(self):
         replay = ContextualStepReplayBuffer(

@@ -51,7 +51,7 @@ class ContextualVariantTests(unittest.TestCase):
             return parse_args()
 
     def test_cli_and_runtime_are_locked_to_reward_q(self):
-        self.assertEqual(CONTEXTUAL_VERSION, "v9.0.0")
+        self.assertEqual(CONTEXTUAL_VERSION, "v9.2.0")
         parsed = self.parse()
         self.assertNotIn("reward_version", vars(parsed))
         self.assertEqual(
@@ -141,6 +141,42 @@ class ContextualVariantTests(unittest.TestCase):
             with self.subTest(rl_cost_lambda=invalid):
                 with self.assertRaisesRegex(ValueError, "rl_cost_lambda"):
                     ContextualRuntimeConfig(rl_cost_lambda=invalid)
+
+    def test_stage_two_actor_inference_keeps_the_frozen_prefix(self):
+        """Evaluating a Stage 2 policy must reproduce its training contract."""
+        config = ContextualRuntimeConfig(
+            mode="actor_inference",
+            action_enabled=True,
+            stage=2,
+            load_stage1_policy_path="stage1.pt",
+            resume_checkpoint_path="stage2.pt",
+        )
+        self.assertEqual(config.mode, "actor_inference")
+        self.assertEqual(config.stage, 2)
+        self.assertEqual(config.sim_end_time, 45_000)
+        self.assertFalse(config.stage1_policy_warm_start)
+
+        # Without the Stage 2 policy there is nothing to evaluate.
+        with self.assertRaisesRegex(
+            ValueError, "requires --resume-checkpoint"
+        ):
+            ContextualRuntimeConfig(
+                mode="actor_inference",
+                action_enabled=True,
+                stage=2,
+                load_stage1_policy_path="stage1.pt",
+            )
+        # baseline_only still has no Stage 2 contract.
+        with self.assertRaisesRegex(
+            ValueError, "training or actor_inference"
+        ):
+            ContextualRuntimeConfig(
+                mode="baseline_only",
+                action_enabled=True,
+                stage=2,
+                load_stage1_policy_path="stage1.pt",
+                resume_checkpoint_path="stage2.pt",
+            )
 
     def test_stage_one_preserves_identity_and_resolves_end_time(self):
         parsed = self.parse("--stage", "1")

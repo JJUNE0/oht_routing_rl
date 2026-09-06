@@ -1,5 +1,105 @@
 # Contextual TD7 experiment history — V9
 
+## v9.1.0 — Reward N selectable, Stage 1 policy decoupled
+
+### Purpose
+
+Make the reward coefficient set a launch choice instead of a single locked
+profile, and make a trained Stage 1 policy reusable across reward versions.
+
+### Reward N
+
+`--reward-version` now accepts `Q` (default) and `N`. Reward N restores the
+coefficients of W&B run `1y9sx4a5` verbatim from that run's saved config:
+`tat_weight` 11.0, operation-rate term back on at 4.0, `backlog_weight`
+0.0004, `backlog_growth_weight` 0.16, `idle_reserve_weight` 0.2, local
+oht/predicted/stop/capacity 0.3/0.075/0.3/0.1, no density term, rail-cycle
+weight 30 with clip 1.0 at the 2.0 neutral point. Only the coefficients are
+restored; the observation, action mapping, Stage 1/2 contract, replay, and
+network are the current v9 ones, so this is not a reproduction of that run.
+
+The TAT clamp is part of Reward N. Commit `2ad214e`, the code `1y9sx4a5`
+actually ran, computed `max(0.0, cur_tat - TAT_PENALTY_START)` with
+`tat_one_sided=True`; the clamp was dropped later, in v6.0.0.
+
+`ContextualRewardConfig.for_version` previously ignored the profile
+dictionaries and returned the dataclass defaults, so `REWARD_Q_PROFILE` was
+documentation rather than the executed contract. It now builds from the
+selected profile, and `REWARD_Q_PROFILE["tat_weight"]` was corrected to the
+4.0 the dataclass already used.
+
+### Stage 1 policy as a fixed frozen prefix
+
+`--load-stage1-policy` no longer seeds the Stage 2 learner by default and no
+longer requires the artifact's reward version to match the run's. A frozen
+prefix is never trained, so it does not have to share the learner's
+objective; only a warm-start, which seeds trainable weights, does. Opt back
+in with `--stage1-policy-warm-start`, which restores both the seeding and the
+reward-version check. This lets one trained Stage 1 artifact drive the prefix
+across reward versions. Topology and observation compatibility are still
+enforced.
+
+## v9.2.0 — FIFO state reservation and Stage 2 evaluation contract
+
+### Purpose
+
+Two runtime-contract additions. Neither changes the reward, observation,
+action mapping, network, or checkpoint tensors, so v9.0/v9.1 artifacts stay
+loadable.
+
+### FIFO replay state reservation
+
+`state_capacity` was `2 * capacity` for both eviction modes. Measuring the
+distinct state slots that live transitions actually reference shows the two
+modes need very different reservations:
+
+| eviction | 1-step episodes | 2 | 10 | 500 | long |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| fifo | 2.00x | 1.50x | 1.10x | 1.01x | **1.00x** |
+| random | 2.00x | 1.81x | 1.62x | 1.59x | **1.58x** |
+
+FIFO retires transitions in insertion order, so its live set is a contiguous
+window that needs one extra state per episode boundary. Random eviction
+replaces uniformly chosen slots, so its live set scatters across history and
+adjacent transitions rarely survive together.
+
+`state_capacity` is now `capacity + min(margin, capacity)` for FIFO with
+`replay_state_capacity_margin` defaulting to 10,000, and stays `2 * capacity`
+for random eviction. Random is unchanged byte for byte: its allocator fails
+hard on exhaustion, and the measured requirement reaches 2.00x.
+
+At capacity 100,000 with LAP the estimate drops from 16.77 GiB to 11.74 GiB
+for FIFO (10.81 GiB with `--no-lap`); random stays at 16.77 GiB. Undersizing
+the FIFO margin is not a correctness failure: `_valid_transition_slots` drops
+transitions whose state was overwritten, so the buffer loses samples instead
+of corrupting them. Three diagnostics make that visible —
+`replay/state_capacity`, `replay/state_slots_referenced`, and
+`replay/unsamplable_env_steps`.
+
+### Stage 2 actor_inference
+
+`--stage 2` previously required training mode, so a Stage 2 policy could only
+be evaluated without its frozen Stage 1 prefix, leaving the first 2,000 ticks
+of every episode out of distribution. `actor_inference` now accepts
+`--stage 2`, reproducing the training contract exactly: frozen Stage 1 for
+ticks 1-2,000, the resumed Stage 2 policy from 2,001, and zero exploration
+noise. It requires `--resume-checkpoint`, since the prefix alone is not a
+policy under evaluation. `baseline_only` is still rejected.
+
+No runtime change was needed: the prefix dispatch is mode-independent,
+`use_stage2_actor` already covered `actor_inference`, and non-training runs
+get an `_InferenceReplayContext` that satisfies the Stage 1 loader.
+
+### Verification
+
+- Full suite: 381 tests pass.
+- Peak state usage measured for both eviction modes across episode lengths of
+  1, 2, 10, 500, and none; the new reservation covers every case that the old
+  `2 * capacity` covered for random, and every case with episodes of 10 steps
+  or more for FIFO at the default margin.
+- Undersized FIFO margins were exercised explicitly and degrade to fewer
+  samplable transitions without raising.
+
 ## v9.0.0 — Reward Q delay-weighted per-rail credit
 
 ### Purpose

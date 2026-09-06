@@ -11,6 +11,7 @@ import torch
 
 from oht_dispatching.config import DISPATCH_FIRST_MATCH
 from oht_routing.algorithms.rl.contextual_td7 import (
+    DEFAULT_STATE_CAPACITY_MARGIN,
     REPLAY_EVICTION_FIFO,
     REPLAY_SAMPLING_RAIL,
     read_contextual_runtime_config,
@@ -79,6 +80,7 @@ class ContextualRuntimeConfig:
     action_enabled: bool = False
     reward_version: str = REWARD_VERSION
     stage1_policy_warm_start: bool = False
+    replay_state_capacity_margin: int = DEFAULT_STATE_CAPACITY_MARGIN
     action_mode: str = REGION_B_RL
     action_scale: float = 0.05
     rl_cost_lambda: float = 0.5
