@@ -789,6 +789,63 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
             "stage2_policy_warm_started_from_stage1": True,
         }
 
+    def test_resume_stochastic_episodes_keeps_noise_but_freezes_learning(self):
+        """Collect with exploration on so replay gains action variation."""
+        config = ContextualRuntimeConfig(
+            mode="training",
+            action_enabled=True,
+            device="cpu",
+            wandb_enabled=False,
+            exploration_noise_std=0.05,
+            exploration_noise_final_std=0.05,
+        )
+        runtime = ClientAlgorithm(config)
+        runtime._resume_stochastic_episodes_remaining = 2
+        pclient = make_runtime_pclient()
+
+        # The learner gate is closed while collecting...
+        self.assertTrue(runtime._resume_stochastic_episodes_remaining)
+        # ...but the deterministic flag, which is what silences exploration
+        # noise, must stay off.
+        self.assertFalse(runtime._resume_deterministic_episode_active)
+
+        runtime.episode_steps = 10
+        runtime.Reset(pclient)
+        self.assertEqual(runtime._resume_stochastic_episodes_remaining, 1)
+        self.assertFalse(runtime._resume_deterministic_episode_active)
+
+        runtime.episode_steps = 10
+        runtime.Reset(pclient)
+        self.assertEqual(runtime._resume_stochastic_episodes_remaining, 0)
+        self.assertFalse(runtime._resume_deterministic_episode_active)
+
+    def test_resume_deterministic_episodes_gate_counts_whole_episodes(self):
+        """Each Reset consumes one collection episode before learning opens."""
+        config = ContextualRuntimeConfig(
+            mode="training",
+            action_enabled=True,
+            device="cpu",
+            wandb_enabled=False,
+        )
+        runtime = ClientAlgorithm(config)
+        runtime._resume_deterministic_episodes_remaining = 2
+        runtime._resume_deterministic_episode_active = True
+        pclient = make_runtime_pclient()
+
+        # Episode 1 finishes: still collecting, learner stays frozen.
+        runtime.episode_steps = 10
+        runtime.Reset(pclient)
+        self.assertEqual(runtime._resume_deterministic_episodes_remaining, 1)
+        self.assertTrue(runtime._resume_deterministic_episode_active)
+
+        # Episode 2 finishes: the gate opens.
+        runtime.episode_steps = 10
+        runtime.Reset(pclient)
+        self.assertEqual(runtime._resume_deterministic_episodes_remaining, 0)
+        # The learner gate reads this flag directly, so clearing it is what
+        # unfreezes updates.
+        self.assertFalse(runtime._resume_deterministic_episode_active)
+
     def test_stage1_policy_is_a_frozen_prefix_by_default(self):
         """A fixed Stage 1 artifact must load under any reward version."""
         config = ContextualRuntimeConfig(

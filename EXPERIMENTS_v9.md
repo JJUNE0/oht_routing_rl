@@ -100,6 +100,139 @@ get an `_InferenceReplayContext` that satisfies the Stage 1 loader.
 - Undersized FIFO margins were exercised explicitly and degrade to fewer
   samplable transitions without raising.
 
+## v9.3.0 — Explicit resume overrides and staged collection controls
+
+### Purpose
+
+Three runtime fixes and additions, all driven by experiments in this release.
+Reward, observation, action mapping, network, and checkpoint tensors are
+unchanged, so v9.0-v9.2 artifacts stay loadable.
+
+### Explicit command-line values were ignored on resume
+
+`runtime_config_from_args` passed `asdict(config)` into
+`restore_checkpoint_runtime_config`, so by that point an explicitly typed
+option was indistinguishable from a default. Every saved field not listed in
+`RESUME_LAUNCH_CONTROL_FIELDS` then overwrote it. In practice
+`--exploration-noise-std`, `--warmup-steps`, `--curriculum-*`, and
+`--learn-every-env-steps` were silently discarded on every resumed run.
+
+The resolver now tracks which options the user actually typed and skips those
+during restore. This matches the contract v6.4.0 already documented. Untouched
+options still come back from the checkpoint.
+
+This was found while preparing a zero-noise experiment: `--exploration-noise-std 0`
+resolved to the checkpoint's 0.05.
+
+### Staged collection before learning
+
+Two options freeze the learner for whole episodes after a resume while replay
+keeps filling, so the first updates do not run against a nearly empty buffer:
+
+| option | exploration noise | learner updates | replay |
+| --- | --- | --- | --- |
+| `--resume-deterministic-episodes N` | forced to 0 | frozen | kept |
+| `--resume-stochastic-episodes N` | configured value | frozen | kept |
+
+`--resume-deterministic-episodes` generalises the existing
+`--resume-deterministic-first-episode` (N=1). `--resume-stochastic-episodes`
+exists because a deterministic collection phase produces replay with no action
+variation at all, which the zero-noise experiment below showed to be harmful.
+It gates only the learner; the exploration noise path is untouched. Both are
+mutually exclusive with each other, with
+`--resume-deterministic-first-episode`, `--resume-warmstart-steps`, and (for
+the stochastic form) `--resume-inference-until-replay-full`.
+
+### Verification
+
+Full suite: 385 tests pass.
+
+## Experiments — exploration noise
+
+### Noise is critic training data, not an execution tax
+
+Run `zw6vkys4` resumed `stage2_env_steps=220,000` with
+`--exploration-noise-std 0` and `--resume-deterministic-episodes 2`.
+
+The two collection episodes reproduced the deterministic evaluation exactly:
+TAT 168.3 and 168.0, `learner/updates` frozen at the restored 219,899. The
+load path is therefore correct.
+
+Learning then broke the policy in about 1,600 updates:
+
+| updates | act_mean | act_std | b_rl | TAT |
+| ---: | ---: | ---: | ---: | ---: |
+| 0 | +0.129 | 0.401 | 0.565 | 164.8 |
+| 650 | -0.673 | 0.284 | 0.163 | 167.9 |
+| 910 | -0.941 | **0.055** | 0.030 | 171.9 |
+| 1,560 | -0.903 | 0.080 | 0.048 | 186.4 |
+
+`action/applied_std` collapsed from 0.47 to 0.08: the actor stopped being a
+function of state and emitted a near-constant -0.9 on every rail. Meanwhile
+`critic/q1_mean` barely moved (-32 to -34) and the twin critics agreed to
+within 0.008. The critic saw the whole action direction as flat because
+replay contained only `a = pi(s)`, so its action gradient was pure
+extrapolation and nothing anchored the actor.
+
+The collapse is not permanent. Within the next episode `act_std` returned to
+0.5-0.76 and TAT fell back from 187.2 to 180.3: the collapsed action earned
+bad rewards, the critic learned that, and the actor moved off the boundary.
+It is a slow self-correcting oscillation, not a dead run — but 9,000 steps
+after the collapse it had still not returned to its starting 168.
+
+**`action/applied_std` dropping below roughly 0.4 is the early warning.**
+
+### Noise level A/B
+
+`jki8xzcv` (0.05) and `s31qyeko` (0.10) differed only in exploration noise and
+device; same Stage 1 artifact by SHA, same reward, same eviction mode.
+
+| | 0.05 | 0.10 |
+| --- | ---: | ---: |
+| TAT first -> last | 175.2 -> **172.3** | 174.7 -> **188.0** |
+| backlog | 170.4 | 237.1 |
+| action clip ratio | 1.3% | **3.9%** |
+| policy's own std | 0.453 | **0.353** |
+
+0.10 pushed actions past the bound three times as often and *reduced* the
+policy's own differentiation. Combined with the zero-noise collapse, the
+usable range is narrow: 0 collapses, 0.05 trains, 0.10 degrades.
+
+Noise contributes only 1.1% of action variance at 0.05, yet removing it
+breaks learning. Its value is coverage for the critic's action gradient, not
+diversity in the executed policy.
+
+### Measurement caveat
+
+Training TAT is measured under the noisy policy. Deterministic evaluation of
+the same checkpoint is better by about 0.9 s in Stage 1 and 3-5 s in Stage 2.
+Compare policies with `--mode actor_inference`, never with training TAT
+across runs that use different noise.
+
+### Where the remaining headroom is not
+
+Baseline (no RL) is 174 s; the current policy evaluates at 168 s
+deterministically, against a 165 s target. On `jki8xzcv` in steady state
+(`episode_step >= 20,000`):
+
+| correlation with TAT | |
+| --- | ---: |
+| `env/operation_rate` | **+0.921** |
+| `action/applied_std` | **-0.526** |
+| `oht/idle_count` | -0.275 |
+| `lead/route_ratio/p95` | **+0.024** |
+
+Route detour length has essentially no relationship with TAT, so the routing
+lever the policy controls is close to exhausted; TAT tracks load instead.
+Action differentiation still helps, which is consistent with the collapse
+result. `jki8xzcv` plateaued at 170.5-173.8 across episodes 5-8 with
+`q1` flat at -36 and `td_error` flat at 0.80-0.85.
+
+An earlier hypothesis in this file — that the `density` term drives detours
+that raise TAT — is **not supported**: `corr(TAT, route_ratio_p95)` is +0.024,
+and the best and worst episodes have indistinguishable route ratios. The
+`s31qyeko` degradation was caused by the noise level, not by `density`.
+
 ## v9.0.0 — Reward Q delay-weighted per-rail credit
 
 ### Purpose

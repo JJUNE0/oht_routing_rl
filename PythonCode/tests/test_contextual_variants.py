@@ -8,6 +8,7 @@ from oht_dispatching.config import DISPATCH_COST, DISPATCH_FIRST_MATCH
 from oht_routing.runtime.client import ClientAlgorithm, ContextualRuntimeConfig
 from oht_routing.runtime.config import (
     RESUME_LAUNCH_CONTROL_FIELDS,
+    restore_checkpoint_runtime_config,
     runtime_config_from_args,
 )
 from oht_routing.runtime.config_validation import make_reward_config
@@ -51,7 +52,7 @@ class ContextualVariantTests(unittest.TestCase):
             return parse_args()
 
     def test_cli_and_runtime_are_locked_to_reward_q(self):
-        self.assertEqual(CONTEXTUAL_VERSION, "v9.2.0")
+        self.assertEqual(CONTEXTUAL_VERSION, "v9.3.0")
         parsed = self.parse()
         self.assertNotIn("reward_version", vars(parsed))
         self.assertEqual(
@@ -141,6 +142,64 @@ class ContextualVariantTests(unittest.TestCase):
             with self.subTest(rl_cost_lambda=invalid):
                 with self.assertRaisesRegex(ValueError, "rl_cost_lambda"):
                     ContextualRuntimeConfig(rl_cost_lambda=invalid)
+
+    def test_explicit_cli_values_survive_checkpoint_resume(self):
+        """A typed option must beat the value stored in the checkpoint."""
+        saved = {
+            "reward_version": REWARD_VERSION,
+            "exploration_noise_std": 0.05,
+            "exploration_noise_final_std": 0.05,
+            "warmup_steps": 7_777,
+        }
+        with patch(
+            "oht_routing.runtime.config.read_contextual_runtime_config",
+            return_value=(saved, True),
+        ):
+            # Untouched options still come back from the checkpoint.
+            restored = restore_checkpoint_runtime_config(
+                {"reward_version": REWARD_VERSION,
+                 "exploration_noise_std": 0.1,
+                 "warmup_steps": 256},
+                "stage2.pt",
+            )
+            self.assertEqual(restored["exploration_noise_std"], 0.05)
+            self.assertEqual(restored["warmup_steps"], 7_777)
+
+            # Explicitly typed options win.
+            restored = restore_checkpoint_runtime_config(
+                {"reward_version": REWARD_VERSION,
+                 "exploration_noise_std": 0.0,
+                 "exploration_noise_final_std": 0.0,
+                 "warmup_steps": 256},
+                "stage2.pt",
+                explicit_fields=(
+                    "exploration_noise_std", "exploration_noise_final_std"
+                ),
+            )
+            self.assertEqual(restored["exploration_noise_std"], 0.0)
+            self.assertEqual(restored["exploration_noise_final_std"], 0.0)
+            # and everything else is still restored
+            self.assertEqual(restored["warmup_steps"], 7_777)
+
+    def test_resume_deterministic_episodes_rejects_bad_combinations(self):
+        with self.assertRaisesRegex(ValueError, "requires checkpoint resume"):
+            ContextualRuntimeConfig(
+                mode="training", action_enabled=True,
+                resume_deterministic_episodes=2,
+            )
+        with self.assertRaisesRegex(ValueError, "use only one"):
+            ContextualRuntimeConfig(
+                mode="training", action_enabled=True,
+                resume_checkpoint_path="stage2.pt",
+                resume_deterministic_episodes=2,
+                resume_deterministic_first_episode=True,
+            )
+        with self.assertRaisesRegex(ValueError, "non-negative integer"):
+            ContextualRuntimeConfig(
+                mode="training", action_enabled=True,
+                resume_checkpoint_path="stage2.pt",
+                resume_deterministic_episodes=-1,
+            )
 
     def test_stage_two_actor_inference_keeps_the_frozen_prefix(self):
         """Evaluating a Stage 2 policy must reproduce its training contract."""

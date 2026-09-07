@@ -61,6 +61,7 @@ RESUME_LAUNCH_CONTROL_FIELDS = {
     "use_attention",
     "resume_inference_until_replay_full",
     "resume_deterministic_episodes",
+    "resume_stochastic_episodes",
     "resume_deterministic_first_episode",
     "resume_warmstart_steps",
     "load_stage1_policy_path",
@@ -124,6 +125,7 @@ class ContextualRuntimeConfig:
     load_stage1_policy_path: str | None = None
     resume_inference_until_replay_full: bool = False
     resume_deterministic_episodes: int = 0
+    resume_stochastic_episodes: int = 0
     resume_deterministic_first_episode: bool = False
     resume_warmstart_steps: int = 0
     rail_tat_diagnostic_path: str | None = None

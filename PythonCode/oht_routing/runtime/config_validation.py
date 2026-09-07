@@ -308,6 +308,63 @@ def _resolve_and_validate_resume(config: ContextualRuntimeConfig) -> None:
             "resume_deterministic_first_episode requires checkpoint resume"
         )
     if (
+        isinstance(config.resume_deterministic_episodes, bool)
+        or not isinstance(config.resume_deterministic_episodes, int)
+        or config.resume_deterministic_episodes < 0
+    ):
+        raise ValueError(
+            "resume_deterministic_episodes must be a non-negative integer"
+        )
+    if (
+        config.resume_deterministic_episodes > 0
+        and config.resume_checkpoint_path is None
+    ):
+        raise ValueError(
+            "resume_deterministic_episodes requires checkpoint resume"
+        )
+    if (
+        config.resume_deterministic_episodes > 0
+        and config.resume_deterministic_first_episode
+    ):
+        raise ValueError(
+            "resume_deterministic_episodes replaces "
+            "--resume-deterministic-first-episode; use only one"
+        )
+    if (
+        config.resume_deterministic_episodes > 0
+        and config.resume_warmstart_steps > 0
+    ):
+        raise ValueError(
+            "resume_deterministic_episodes and resume_warmstart_steps are "
+            "mutually exclusive"
+        )
+    if (
+        isinstance(config.resume_stochastic_episodes, bool)
+        or not isinstance(config.resume_stochastic_episodes, int)
+        or config.resume_stochastic_episodes < 0
+    ):
+        raise ValueError(
+            "resume_stochastic_episodes must be a non-negative integer"
+        )
+    if (
+        config.resume_stochastic_episodes > 0
+        and config.resume_checkpoint_path is None
+    ):
+        raise ValueError(
+            "resume_stochastic_episodes requires checkpoint resume"
+        )
+    for other in (
+        "resume_deterministic_episodes",
+        "resume_deterministic_first_episode",
+        "resume_warmstart_steps",
+        "resume_inference_until_replay_full",
+    ):
+        if config.resume_stochastic_episodes > 0 and getattr(config, other):
+            raise ValueError(
+                f"resume_stochastic_episodes and {other} are mutually "
+                "exclusive"
+            )
+    if (
         config.resume_warmstart_steps > 0
         and config.resume_checkpoint_path is None
     ):

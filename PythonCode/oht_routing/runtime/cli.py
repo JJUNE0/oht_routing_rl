@@ -326,6 +326,17 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--resume-stochastic-episodes",
+        type=int,
+        metavar="N",
+        help=(
+            "Collect N whole episodes before learning starts while keeping "
+            "the configured exploration noise. Learner updates are frozen "
+            "and every transition is kept in replay, so the critic starts "
+            "from a buffer that already contains action variation."
+        ),
+    )
+    parser.add_argument(
         "--resume-deterministic-episodes",
         type=int,
         metavar="N",

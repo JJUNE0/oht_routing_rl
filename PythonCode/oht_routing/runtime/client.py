@@ -208,6 +208,7 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
         self._resume_requires_refill = False
         self._resume_deterministic_episode_active = False
         self._resume_deterministic_episodes_remaining = 0
+        self._resume_stochastic_episodes_remaining = 0
         self._resume_warmstart_episode_active = False
         self._last_sim_time: float | None = None
         self._stale_sim_time_ticks = 0
@@ -536,6 +537,13 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
             self._resume_deterministic_episode_active = bool(
                 self._resume_deterministic_episodes_remaining
             )
+            # Same collection-before-learning idea, but the exploration noise
+            # stays on so replay gains the action variation the critic needs
+            # to estimate its action gradient.
+            self._resume_stochastic_episodes_remaining = (
+                int(self.config.resume_stochastic_episodes)
+                if self.config.mode == "training" else 0
+            )
             self._resume_warmstart_episode_active = bool(
                 self.config.mode == "training"
                 and self.config.resume_warmstart_steps > 0
@@ -760,6 +768,9 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
             ),
             "gate/resume_deterministic_episode_complete": (
                 not self._resume_deterministic_episode_active
+            ),
+            "gate/resume_stochastic_episode_complete": (
+                not self._resume_stochastic_episodes_remaining
             ),
             "gate/resume_warmstart_complete": (
                 not self._resume_warmstart_episode_active
@@ -1024,6 +1035,21 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
                 "[checkpoint-resume] deterministic throwaway warm-start "
                 "complete; replay collection, exploration, and learner "
                 "updates begin in this episode",
+                flush=True,
+            )
+        if (
+            getattr(self, "_resume_stochastic_episodes_remaining", 0)
+            and self.episode_steps > 0
+        ):
+            self._resume_stochastic_episodes_remaining -= 1
+            remaining = self._resume_stochastic_episodes_remaining
+            print(
+                "[checkpoint-resume] stochastic collection episode "
+                + (
+                    f"complete; {remaining} more to collect before learning"
+                    if remaining
+                    else "complete; learner updates begin in this episode"
+                ),
                 flush=True,
             )
         if (
