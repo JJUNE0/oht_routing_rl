@@ -448,6 +448,8 @@ class ContextualStepReplayBuffer:
         self.sample_count = 0
         self.overwrite_count = 0
         self.stale_key_reject_count = 0
+        self._last_unsamplable_env_steps = 0
+        self._last_live_transition_count = 0
         self.hash_mismatch_count = 0
         self.episode_crossing_count = 0
         self._last_sample_diag: dict[str, float] = {}
@@ -967,25 +969,22 @@ class ContextualStepReplayBuffer:
         )
 
     def _referenced_state_slot_count(self) -> int:
-        """Distinct state slots the currently-valid transitions point at."""
-        slots = np.flatnonzero(self._transition_valid)
-        if slots.size == 0:
-            return 0
-        pairs = np.concatenate([
-            np.stack(
-                [self._state_slot[slots], self._state_gen_ref[slots]], axis=1
-            ),
-            np.stack(
-                [self._next_state_slot[slots],
-                 self._next_state_gen_ref[slots]],
-                axis=1,
-            ),
-        ])
-        return int(len(np.unique(pairs, axis=0)))
+        """Distinct state slots the currently-valid transitions point at.
+
+        Random eviction reference-counts its slots, so the live count is
+        already maintained. FIFO has no such bookkeeping; scanning every live
+        transition here costs O(n log n) per call, which is far too expensive
+        for a logging counter, so it reports the slots written so far instead.
+        """
+        if self._state_refcount is not None:
+            return int(np.count_nonzero(self._state_refcount))
+        return int(np.count_nonzero(self._state_valid))
 
     def _valid_transition_slots(self) -> np.ndarray:
         candidates = np.flatnonzero(self._transition_valid)
+        self._last_live_transition_count = int(candidates.size)
         if candidates.size == 0:
+            self._last_unsamplable_env_steps = 0
             return candidates
         state_ok = (
             self._state_valid[self._state_slot[candidates]]
@@ -998,6 +997,9 @@ class ContextualStepReplayBuffer:
                == self._next_state_gen_ref[candidates])
         )
         candidates = candidates[state_ok & next_ok]
+        self._last_unsamplable_env_steps = (
+            self._last_live_transition_count - int(candidates.size)
+        )
         if self.num_stacks == 1 or candidates.size == 0:
             return candidates
 
@@ -1700,10 +1702,11 @@ class ContextualStepReplayBuffer:
             ),
             # Transitions whose state was overwritten are dropped from
             # sampling. A persistently positive value means the FIFO state
-            # margin is too small for the current episode length.
+            # margin is too small for the current episode length. The count
+            # is taken from the last sample() rather than recomputed, so this
+            # stays O(1) per step.
             "replay/unsamplable_env_steps": float(
-                np.count_nonzero(self._transition_valid)
-                - self._valid_transition_slots().size
+                self._last_unsamplable_env_steps
             ),
             "replay/storage_physical_bytes_per_rail_state": float(
                 len(UINT8_PHYSICAL_FEATURE_INDICES)

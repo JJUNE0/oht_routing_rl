@@ -52,7 +52,7 @@ class ContextualVariantTests(unittest.TestCase):
             return parse_args()
 
     def test_cli_and_runtime_are_locked_to_reward_q(self):
-        self.assertEqual(CONTEXTUAL_VERSION, "v9.3.0")
+        self.assertEqual(CONTEXTUAL_VERSION, "v9.3.1")
         parsed = self.parse()
         self.assertNotIn("reward_version", vars(parsed))
         self.assertEqual(

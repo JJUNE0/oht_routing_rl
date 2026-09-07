@@ -233,6 +233,43 @@ that raise TAT — is **not supported**: `corr(TAT, route_ratio_p95)` is +0.024,
 and the best and worst episodes have indistinguishable route ratios. The
 `s31qyeko` degradation was caused by the noise level, not by `density`.
 
+## v9.3.1 — Replay diagnostics no longer scale with buffer size
+
+### Purpose
+
+`replay/state_slots_referenced` and `replay/unsamplable_env_steps`, added in
+v9.2.0, were recomputed from scratch on every environment step. The first ran
+`np.unique(..., axis=0)` over every live transition's two state references,
+which is O(n log n) in the buffer size, for a single logging counter.
+
+Measured cost per call, before:
+
+| live transitions | cost |
+| ---: | ---: |
+| 1,000 | 4.2 ms |
+| 5,000 | 7.7 ms |
+| 20,000 | 39.0 ms |
+| 60,000 | **145.7 ms** |
+
+Run `zw6vkys4` (capacity 140,000) showed the effect directly: while the
+learner was still frozen for its collection episodes, so `learner_update_ms`
+and `replay_sample_ms` were both zero, `total_algorithm_ms` still grew from
+205 ms at 3% fill to 418 ms at 50% fill. The v9.0.0 run `jki8xzcv` was flat
+near 400 ms from 41% to 100% fill.
+
+### Change
+
+Both counters are now O(1) per step. Random eviction already reference-counts
+its state slots, so the live count is read from that; FIFO has no such
+bookkeeping and reports slots written instead. The unsamplable count is
+recorded by `_valid_transition_slots` where the scan already happens and read
+from that cache, so it reflects the most recent sample rather than a fresh
+scan — it stays zero while a run is only collecting.
+
+`diagnostics()` at 60,000 live transitions drops from about 146 ms to 1.7 ms.
+
+PATCH: no contract, tensor, or schema change. 385 tests pass.
+
 ## v9.0.0 — Reward Q delay-weighted per-rail credit
 
 ### Purpose
