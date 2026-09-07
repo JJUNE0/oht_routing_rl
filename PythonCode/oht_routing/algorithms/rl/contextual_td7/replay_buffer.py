@@ -968,13 +968,15 @@ class ContextualStepReplayBuffer:
             )
         )
 
-    def _referenced_state_slot_count(self) -> int:
-        """Distinct state slots the currently-valid transitions point at.
+    def _state_slots_in_use(self) -> int:
+        """State slots holding data, as an upper bound on referenced slots.
 
-        Random eviction reference-counts its slots, so the live count is
-        already maintained. FIFO has no such bookkeeping; scanning every live
-        transition here costs O(n log n) per call, which is far too expensive
-        for a logging counter, so it reports the slots written so far instead.
+        Random eviction reference-counts its slots, so this is exactly the
+        set still referenced by live transitions. FIFO keeps no such
+        bookkeeping and scanning every live transition would cost O(n log n)
+        per call, so it reports the slots written instead. Written is a
+        superset of referenced, so the value stays a valid upper bound for
+        checking headroom against ``state_capacity`` in both modes.
         """
         if self._state_refcount is not None:
             return int(np.count_nonzero(self._state_refcount))
@@ -1697,9 +1699,8 @@ class ContextualStepReplayBuffer:
                 )
             ),
             "replay/state_capacity": float(self.state_capacity),
-            "replay/state_slots_referenced": float(
-                self._referenced_state_slot_count()
-            ),
+            # Exact under random eviction; an upper bound under FIFO.
+            "replay/state_slots_in_use": float(self._state_slots_in_use()),
             # Transitions whose state was overwritten are dropped from
             # sampling. A persistently positive value means the FIFO state
             # margin is too small for the current episode length. The count

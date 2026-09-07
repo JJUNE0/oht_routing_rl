@@ -266,6 +266,19 @@ recorded by `_valid_transition_slots` where the scan already happens and read
 from that cache, so it reflects the most recent sample rather than a fresh
 scan — it stays zero while a run is only collecting.
 
+`replay/state_slots_referenced` is renamed `replay/state_slots_in_use`
+because under FIFO it reports written rather than referenced slots. Verified
+against an exact recomputation: under random eviction the reported value
+matches the referenced set exactly (463/523/450 across episode lengths 10, 2
+and none), and under FIFO it is a correct upper bound (600 vs 330, 304 vs
+304, 600 vs 301). `replay/unsamplable_env_steps` matches exactly in both
+modes.
+
+The check also showed the original slow computation was itself counting the
+wrong thing: it took distinct `(slot, generation)` pairs without testing
+whether the generation was still current, so it included references to states
+that had already been overwritten.
+
 `diagnostics()` at 60,000 live transitions drops from about 146 ms to 1.7 ms.
 
 PATCH: no contract, tensor, or schema change. 385 tests pass.
