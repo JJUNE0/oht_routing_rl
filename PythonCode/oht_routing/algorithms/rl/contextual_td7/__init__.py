@@ -1,4 +1,7 @@
 from .config import (
+    ACTOR_Q_AGGREGATIONS,
+    ACTOR_Q_FIRST,
+    ACTOR_Q_MEAN,
     ContextualLearnerConfig,
     ContextualNetworkConfig,
     contextual_algorithm_variant,
@@ -12,10 +15,10 @@ from .networks import (
     ActorOutput,
     ContextualActor,
     ContextualEncoding,
+    ContextualEnsembleCritic,
     ContextualNetworkError,
-    ContextualTwinCritic,
     DirectionalContextEncoder,
-    TwinCriticOutput,
+    EnsembleCriticOutput,
 )
 from .replay_buffer import (
     ContextualReplayError,
@@ -37,7 +40,22 @@ from .replay_types import (
 )
 from .learner import ContextualTD7Learner
 from .learner_types import ContextualLearnerUpdate
-from .targets import bellman_target, scale_policy_action, target_applied_action
+from .targets import (
+    CRITIC_TARGET_CDQ,
+    CRITIC_TARGET_MODES,
+    CRITIC_TARGET_UBOC,
+    UBOC_BETA,
+    CriticTargetAggregate,
+    aggregate_critic_target,
+    bellman_target,
+    cdq_target_value,
+    critic_target_value,
+    scale_policy_action,
+    target_applied_action,
+    uboc_ensemble_statistics,
+    uboc_target_value,
+    validate_critic_target_mode,
+)
 from .checkpoint import (
     CRITIC_INITIALIZATION,
     PROMOTED_CHECKPOINTS,
@@ -66,15 +84,18 @@ from .stacking import (
 )
 
 __all__ = [
+    "ACTOR_Q_AGGREGATIONS",
+    "ACTOR_Q_FIRST",
+    "ACTOR_Q_MEAN",
     "ActorOutput",
     "ContextualActor",
     "ContextualEncoding",
+    "ContextualEnsembleCritic",
     "ContextualNetworkConfig",
     "contextual_algorithm_variant",
     "ContextualNetworkError",
-    "ContextualTwinCritic",
     "DirectionalContextEncoder",
-    "TwinCriticOutput",
+    "EnsembleCriticOutput",
     "actor_diagnostics",
     "critic_diagnostics",
     "encoding_diagnostics",
@@ -95,9 +116,20 @@ __all__ = [
     "ContextualLearnerConfig",
     "ContextualLearnerUpdate",
     "ContextualTD7Learner",
+    "CRITIC_TARGET_CDQ",
+    "CRITIC_TARGET_MODES",
+    "CRITIC_TARGET_UBOC",
+    "CriticTargetAggregate",
+    "UBOC_BETA",
+    "aggregate_critic_target",
     "bellman_target",
+    "cdq_target_value",
+    "critic_target_value",
     "scale_policy_action",
     "target_applied_action",
+    "uboc_ensemble_statistics",
+    "uboc_target_value",
+    "validate_critic_target_mode",
     "CRITIC_INITIALIZATION",
     "PROMOTED_CHECKPOINTS",
     "ContextualCheckpointError",

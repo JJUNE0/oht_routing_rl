@@ -1,6 +1,6 @@
 import torch
 
-from .networks import ActorOutput, ContextualEncoding, TwinCriticOutput
+from .networks import ActorOutput, ContextualEncoding, EnsembleCriticOutput
 
 
 def _scalar(value: torch.Tensor) -> float:
@@ -56,10 +56,14 @@ def actor_diagnostics(output: ActorOutput) -> dict[str, float]:
     }
 
 
-def critic_diagnostics(output: TwinCriticOutput) -> dict[str, float]:
-    combined = torch.cat((output.q1, output.q2), dim=0)
+def critic_diagnostics(output: EnsembleCriticOutput) -> dict[str, float]:
+    q = output.q
     return {
-        "critic/q1_mean": _scalar(output.q1.mean()),
-        "critic/q2_mean": _scalar(output.q2.mean()),
-        "critic/q_range": _scalar(combined.max() - combined.min()),
+        "critic/q1_mean": _scalar(q[:, 0].mean()),
+        "critic/q2_mean": _scalar(q[:, 1].mean()),
+        "critic/q_ensemble_mean": _scalar(q.mean()),
+        "critic/q_ensemble_std_mean": _scalar(
+            q.std(dim=1, unbiased=True).mean()
+        ),
+        "critic/q_range": _scalar(q.max() - q.min()),
     }

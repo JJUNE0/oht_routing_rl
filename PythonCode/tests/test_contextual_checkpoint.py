@@ -767,7 +767,7 @@ class ContextualCheckpointTests(unittest.TestCase):
 
     def test_v5_checkpoint_is_rejected_by_current_major_contract(self):
         learner, obs, reward = components()
-        self.assertEqual(CONTEXTUAL_VERSION, "v9.3.1")
+        self.assertNotEqual(CONTEXTUAL_VERSION.split(".")[0], "v5")
         with tempfile.TemporaryDirectory() as directory:
             path = save_contextual_checkpoint(
                 Path(directory) / "v5_0.pt",
@@ -793,7 +793,6 @@ class ContextualCheckpointTests(unittest.TestCase):
 
     def test_same_major_reward_o_checkpoint_is_rejected_before_restore(self):
         learner, obs, reward = components()
-        self.assertEqual(CONTEXTUAL_VERSION, "v9.3.1")
         with tempfile.TemporaryDirectory() as directory:
             path = save_contextual_checkpoint(
                 Path(directory) / "reward_p.pt",
@@ -1155,25 +1154,27 @@ class ContextualCheckpointTests(unittest.TestCase):
                 source.critic.parameters(), restored.critic.parameters()
             ):
                 torch.testing.assert_close(left, right, rtol=0, atol=0)
-            source_q1 = dict(source.critic.q1.named_parameters())
-            source_q2 = dict(source.critic.q2.named_parameters())
-            restored_q1 = dict(restored.critic.q1.named_parameters())
-            restored_q2 = dict(restored.critic.q2.named_parameters())
-            for name in source_q1:
-                torch.testing.assert_close(
-                    source_q1[name], restored_q1[name], rtol=0, atol=0
-                )
-                torch.testing.assert_close(
-                    source_q2[name], restored_q2[name], rtol=0, atol=0
-                )
+            self.assertEqual(
+                restored.critic.num_critics, source.critic.num_critics
+            )
+            for source_head, restored_head in zip(
+                source.critic.q_nets, restored.critic.q_nets
+            ):
+                source_named = dict(source_head.named_parameters())
+                restored_named = dict(restored_head.named_parameters())
+                self.assertEqual(source_named.keys(), restored_named.keys())
+                for name, value in source_named.items():
+                    torch.testing.assert_close(
+                        value, restored_named[name], rtol=0, atol=0
+                    )
             self.assertGreater(
-                restored.twin_parameter_diagnostics()[
+                restored.ensemble_parameter_diagnostics()[
                     "critic/parameter_max_abs_diff"
                 ],
                 0.0,
             )
 
-    def test_legacy_and_symmetric_checkpoint_resume_are_rejected(self):
+    def test_legacy_and_duplicate_head_checkpoint_resume_are_rejected(self):
         learner, obs, reward = components()
         with tempfile.TemporaryDirectory() as directory:
             path = save_contextual_checkpoint(
@@ -1195,23 +1196,25 @@ class ContextualCheckpointTests(unittest.TestCase):
                     reward_builder=target_reward,
                 )
 
-            symmetric = dict(payload)
-            symmetric["online_critic"] = {
+            duplicated = dict(payload)
+            duplicated["online_critic"] = {
                 key: value.clone()
                 for key, value in payload["online_critic"].items()
             }
-            for key in list(symmetric["online_critic"]):
-                if key.startswith("q2."):
-                    symmetric["online_critic"][key] = symmetric[
+            # Copy head 0 onto head 1: two identical heads can never diverge
+            # again, which would collapse the UBOC uncertainty penalty.
+            for key in list(duplicated["online_critic"]):
+                if key.startswith("q_nets.1."):
+                    duplicated["online_critic"][key] = duplicated[
                         "online_critic"
-                    ]["q1." + key[3:]].clone()
-            symmetric_path = Path(directory) / "symmetric.pt"
-            torch.save(symmetric, symmetric_path)
+                    ]["q_nets.0." + key[len("q_nets.1."):]].clone()
+            duplicated_path = Path(directory) / "duplicated.pt"
+            torch.save(duplicated, duplicated_path)
             with self.assertRaisesRegex(
-                ContextualCheckpointError, "symmetric twin-critic"
+                ContextualCheckpointError, "duplicate-head critic ensemble"
             ):
                 load_contextual_checkpoint(
-                    symmetric_path, target,
+                    duplicated_path, target,
                     observation_builder=target_obs,
                     reward_builder=target_reward,
                 )
@@ -1225,7 +1228,7 @@ class ContextualCheckpointTests(unittest.TestCase):
             )
             payload = torch.load(path, weights_only=False)
             for key, value in (
-                ("version", "v9.9.9"),
+                ("version", "v10.9.9"),
                 ("topology_hash", "wrong"),
                 ("mapping_hash", "wrong"),
                 ("network_config", {"wrong": True}),
@@ -1233,6 +1236,8 @@ class ContextualCheckpointTests(unittest.TestCase):
                 ("reward_version", "wrong"),
                 ("sale_enabled", True),
                 ("lap_enabled", True),
+                ("critic_target_mode", "cdq"),
+                ("uboc_beta", 0.25),
             ):
                 changed = dict(payload)
                 changed[key] = value
@@ -1288,7 +1293,7 @@ class ContextualCheckpointTests(unittest.TestCase):
             "failure_traceback": "traceback text",
             "failure_env_step": 17,
             "failure_episode_id": 2,
-            "algorithm_variant": learner.config.algorithm_variant,
+            "algorithm_variant": learner.algorithm_variant,
             "sale_enabled": learner.config.sale_enabled,
             "lap_enabled": learner.config.lap_enabled,
         }

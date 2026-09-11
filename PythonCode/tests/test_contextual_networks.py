@@ -9,7 +9,7 @@ from oht_routing.algorithms.rl.contextual_td7 import (
     ContextualActor,
     ContextualNetworkConfig,
     ContextualNetworkError,
-    ContextualTwinCritic,
+    ContextualEnsembleCritic,
     DirectionalContextEncoder,
     actor_diagnostics,
     critic_diagnostics,
@@ -72,9 +72,9 @@ class ContextualNetworkTests(unittest.TestCase):
         self.config = ContextualNetworkConfig()
         self.encoder = DirectionalContextEncoder(self.config)
         self.actor = ContextualActor(self.config)
-        self.critic = ContextualTwinCritic(self.config)
+        self.critic = ContextualEnsembleCritic(self.config)
 
-    def test_actor_and_twin_critic_shapes_ranges_and_finite_gradients(self):
+    def test_actor_and_ensemble_critic_shapes_ranges_and_gradients(self):
         state = torch.randn(11, 128, requires_grad=True)
         previous_action = torch.randn(11, 1).tanh().requires_grad_(True)
         actor_output = self.actor(
@@ -91,9 +91,15 @@ class ContextualNetworkTests(unittest.TestCase):
             critic_total_tat=make_critic_total_tat(11, self.config),
             previous_action=previous_action,
         )
-        self.assertEqual(critic_output.q1.shape, (11, 1))
-        self.assertEqual(critic_output.q2.shape, (11, 1))
-        (critic_output.q1 + critic_output.q2).mean().backward()
+        self.assertEqual(
+            critic_output.q.shape, (11, self.config.num_critics)
+        )
+        self.assertEqual(critic_output.num_critics, self.config.num_critics)
+        self.assertEqual(critic_output.head(0).shape, (11, 1))
+        torch.testing.assert_close(
+            critic_output.mean, critic_output.q.mean(dim=1, keepdim=True)
+        )
+        critic_output.q.sum(dim=1).mean().backward()
         self.assertIsNotNone(action.grad)
         self.assertTrue(torch.isfinite(action.grad).all())
         self.assertGreater(float(action.grad.abs().sum()), 0.0)
@@ -127,17 +133,17 @@ class ContextualNetworkTests(unittest.TestCase):
             float((actor_low - actor_high).detach().abs().sum()), 0.0
         )
         self.assertGreater(
-            float((critic_low.q1 - critic_high.q1).detach().abs().sum()), 0.0
+            float((critic_low.q - critic_high.q).detach().abs().sum()), 0.0
         )
         self.assertEqual(
             self.actor.network[0].in_features, self.config.actor_input_dim
         )
         self.assertEqual(
-            self.critic.q1.network[0].in_features,
+            self.critic.q_nets[0].network[0].in_features,
             self.config.critic_input_dim,
         )
 
-    def test_total_tat_changes_actor_context_and_twin_q(self):
+    def test_total_tat_changes_actor_context_and_ensemble_q(self):
         batch = 7
         low_inputs = list(make_inputs(batch))
         high_inputs = [value.detach().clone() for value in low_inputs]
@@ -168,7 +174,7 @@ class ContextualNetworkTests(unittest.TestCase):
             batch, self.config, value=2.5
         )
         captured = []
-        hook = self.critic.q1.register_forward_pre_hook(
+        hook = self.critic.q_nets[0].register_forward_pre_hook(
             lambda module, inputs: captured.append(inputs[0].detach().clone())
         )
         try:
@@ -200,12 +206,13 @@ class ContextualNetworkTests(unittest.TestCase):
             rtol=0,
             atol=0,
         )
-        self.assertGreater(
-            float((low.q1 - high.q1).detach().abs().sum()), 0.0
-        )
-        self.assertGreater(
-            float((low.q2 - high.q2).detach().abs().sum()), 0.0
-        )
+        for index in range(self.config.num_critics):
+            self.assertGreater(
+                float(
+                    (low.head(index) - high.head(index)).detach().abs().sum()
+                ),
+                0.0,
+            )
 
     def test_actor_loss_reaches_every_observation_group(self):
         inputs = make_inputs(5, requires_grad=True)
@@ -254,8 +261,7 @@ class ContextualNetworkTests(unittest.TestCase):
         )
         loss = (
             actor_output.action.square().mean()
-            + critic_output.q1.square().mean()
-            + critic_output.q2.square().mean()
+            + critic_output.q.square().mean()
         )
         loss.backward()
         parameters = list(self.encoder.parameters())
@@ -266,34 +272,63 @@ class ContextualNetworkTests(unittest.TestCase):
             all(torch.isfinite(parameter.grad).all() for parameter in parameters)
         )
 
-    def test_twin_critics_do_not_share_parameters(self):
-        q1_ids = {id(parameter) for parameter in self.critic.q1.parameters()}
-        q2_ids = {id(parameter) for parameter in self.critic.q2.parameters()}
-        self.assertTrue(q1_ids.isdisjoint(q2_ids))
+    def test_ensemble_critics_do_not_share_parameters(self):
+        head_ids = [
+            {id(parameter) for parameter in q_net.parameters()}
+            for q_net in self.critic.q_nets
+        ]
+        self.assertEqual(len(head_ids), self.config.num_critics)
+        for index, ids in enumerate(head_ids):
+            for other in head_ids[index + 1:]:
+                self.assertTrue(ids.isdisjoint(other))
 
-    def test_sale_twin_critics_are_independently_initialized(self):
+    def test_ensemble_size_follows_config(self):
+        for num_critics in (2, 3, 7):
+            with self.subTest(num_critics=num_critics):
+                config = ContextualNetworkConfig(num_critics=num_critics)
+                critic = ContextualEnsembleCritic(config)
+                self.assertEqual(critic.num_critics, num_critics)
+                output = critic(
+                    torch.randn(4, config.stacked_context_dim),
+                    torch.randn(4, config.stacked_action_dim).tanh(),
+                    critic_total_tat=make_critic_total_tat(4, config),
+                )
+                self.assertEqual(output.q.shape, (4, num_critics))
+
+    def test_ensemble_size_below_two_is_rejected(self):
+        for num_critics in (0, 1):
+            with self.subTest(num_critics=num_critics):
+                with self.assertRaisesRegex(ValueError, "num_critics"):
+                    ContextualNetworkConfig(num_critics=num_critics)
+
+    def test_sale_ensemble_critics_are_independently_initialized(self):
         torch.manual_seed(101)
-        critic = ContextualTwinCritic(
+        critic = ContextualEnsembleCritic(
             self.config, sale_embedding_dim=16, sale_feature_dim=16
         )
-        q1 = dict(critic.q1.named_parameters())
-        q2 = dict(critic.q2.named_parameters())
-        self.assertEqual(q1.keys(), q2.keys())
-        self.assertTrue(
-            {id(value) for value in q1.values()}.isdisjoint(
-                {id(value) for value in q2.values()}
-            )
-        )
-        self.assertTrue(all(
-            left.untyped_storage().data_ptr()
-            != right.untyped_storage().data_ptr()
-            for left, right in zip(q1.values(), q2.values())
-        ))
-        max_difference = max(
-            float((q1[name] - q2[name]).detach().abs().max())
-            for name in q1
-        )
-        self.assertGreater(max_difference, 0.0)
+        heads = [dict(q_net.named_parameters()) for q_net in critic.q_nets]
+        schema = heads[0].keys()
+        for head in heads[1:]:
+            self.assertEqual(head.keys(), schema)
+        for index, left in enumerate(heads):
+            for right in heads[index + 1:]:
+                self.assertTrue(
+                    {id(value) for value in left.values()}.isdisjoint(
+                        {id(value) for value in right.values()}
+                    )
+                )
+                self.assertTrue(all(
+                    a.untyped_storage().data_ptr()
+                    != b.untyped_storage().data_ptr()
+                    for a, b in zip(left.values(), right.values())
+                ))
+                self.assertGreater(
+                    max(
+                        float((left[name] - right[name]).detach().abs().max())
+                        for name in schema
+                    ),
+                    0.0,
+                )
 
         batch = 7
         state = torch.randn(batch, self.config.context_dim)
@@ -307,10 +342,12 @@ class ContextualNetworkTests(unittest.TestCase):
             sale_state_action,
             critic_total_tat=make_critic_total_tat(batch, self.config),
         )
-        self.assertTrue(torch.isfinite(output.q1).all())
-        self.assertTrue(torch.isfinite(output.q2).all())
+        self.assertTrue(torch.isfinite(output.q).all())
         self.assertGreater(
-            float((output.q1 - output.q2).detach().abs().mean()), 0.0
+            float(
+                output.q.detach().std(dim=1, unbiased=True).mean()
+            ),
+            0.0,
         )
 
     def test_models_are_shared_across_batch_not_rail_specific(self):
@@ -327,7 +364,7 @@ class ContextualNetworkTests(unittest.TestCase):
 
     def test_source_contains_no_region_mask_or_aggregation_path(self):
         source = inspect.getsource(DirectionalContextEncoder).lower()
-        source += inspect.getsource(ContextualTwinCritic).lower()
+        source += inspect.getsource(ContextualEnsembleCritic).lower()
         self.assertNotIn("padding", source)
         self.assertNotIn("region", source)
         self.assertNotIn("masked_mean", source)
@@ -349,8 +386,7 @@ class ContextualNetworkTests(unittest.TestCase):
                     encoding.state,
                     actor_output.pre_tanh,
                     actor_output.action,
-                    critic_output.q1,
-                    critic_output.q2,
+                    critic_output.q,
                 ):
                     self.assertTrue(torch.isfinite(tensor).all())
 
@@ -404,7 +440,7 @@ class ContextualNetworkTests(unittest.TestCase):
         saved = torch.load(stream, weights_only=True)
         encoder = DirectionalContextEncoder(self.config)
         actor = ContextualActor(self.config)
-        critic = ContextualTwinCritic(self.config)
+        critic = ContextualEnsembleCritic(self.config)
         encoder.load_state_dict(saved["encoder"])
         actor.load_state_dict(saved["actor"])
         critic.load_state_dict(saved["critic"])
@@ -417,8 +453,7 @@ class ContextualNetworkTests(unittest.TestCase):
         )
         torch.testing.assert_close(state, loaded_state)
         torch.testing.assert_close(actor_output.action, loaded_actor.action)
-        torch.testing.assert_close(critic_output.q1, loaded_critic.q1)
-        torch.testing.assert_close(critic_output.q2, loaded_critic.q2)
+        torch.testing.assert_close(critic_output.q, loaded_critic.q)
 
     def test_diagnostics_have_required_finite_values(self):
         state = torch.randn(8, 128)
@@ -484,8 +519,7 @@ class ContextualNetworkTests(unittest.TestCase):
             )
             loss = (
                 actor_output.pre_tanh.square().mean()
-                + critic_output.q1.square().mean()
-                + critic_output.q2.square().mean()
+                + critic_output.q.square().mean()
             )
             self.assertTrue(torch.isfinite(loss))
             loss.backward()

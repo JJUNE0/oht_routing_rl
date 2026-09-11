@@ -1836,6 +1836,7 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
             runtime.total_steps = 400_000
             runtime.episode_id = 8
             runtime.transition_aligner.episode_id = 8
+            runtime.learner.set_applied_action_scale(0.73)
             checkpoint = runtime._save_runtime_checkpoint("latest")
             expected_actor = {
                 key: value.detach().clone()
@@ -1873,7 +1874,7 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
             self.assertTrue(inference.checkpoint_loaded)
             self.assertEqual(inference.total_steps, 400_000)
             self.assertEqual(inference.episode_id, 8)
-            self.assertEqual(inference._action_scale(), 1.0)
+            self.assertEqual(inference._action_scale(), 0.73)
             self.assertTrue(inference._state_normalizers_ready_for_bypass())
             self.assertIsNone(inference.replay_buffer)
             self.assertIsNone(inference.transition_aligner.callback)
@@ -1884,6 +1885,7 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
 
             inference.Algorithm(pclient)
             inference.Algorithm(pclient)
+            self.assertEqual(inference.last_diagnostics["curriculum/action_scale"], 0.73)
             self.assertEqual(
                 inference.learner.learner_update_count, expected_updates
             )
@@ -1892,6 +1894,11 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
                 inference.last_diagnostics["action/cross_rail_noise_std"],
                 0.0,
             )
+            inference.total_steps = 12_000
+            self.assertEqual(inference._action_scale(), 0.73)
+            inference.total_steps += 2_000
+            inference.Reset(pclient)
+            self.assertEqual(inference._action_scale(), 0.73)
 
     def test_resume_can_collect_full_replay_before_any_learner_update(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2247,7 +2254,14 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
             "learner/actor_grad_norm_last", "critic/q1_mean",
             "critic/q2_mean", "critic/target_q_mean",
             "critic/q_abs_diff_mean", "critic/td_error_mean",
-            "critic/td_error_max", "grad/encoder_norm",
+            "critic/td_error_max",
+            "critic/q_ensemble_std_mean",
+            "critic/target_ensemble_std_mean",
+            "critic/target_uboc_penalty_mean",
+            "critic/target_vs_min_gap_mean",
+            "critic/q_grad_norm_min",
+            "critic/parameter_pair_l2_mean",
+            "grad/encoder_norm",
             "grad/critic_norm", "learner/actor_updates_total",
             "learner/updates", "replay/size_env_steps",
             "replay/reward_mean", "replay/reward_std",

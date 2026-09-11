@@ -1,0 +1,22 @@
+# GPU 환경 재현용 pin 목록 (검증 호스트: GTX 1080 Ti, sm_61, driver 566.36)
+#
+# torch는 PyPI가 아니라 PyTorch CUDA 인덱스에서 받아야 한다.
+# cu126을 쓰는 이유: 1080 Ti는 Pascal(sm_61)이고, cu128 이후 빌드는
+# Pascal 커널을 빼서 "no kernel image is available" 로 죽는다.
+# cu126 2.14.0의 arch list는 sm_50/60/61/70/75/80/86/90 이다.
+#
+#   uv venv .venv --python 3.14
+#   uv pip install --python .venv/Scripts/python.exe \
+#       --index-url https://download.pytorch.org/whl/cu126 torch==2.14.0
+#   uv pip install --python .venv/Scripts/python.exe -r PythonCode/requirements-gpu.txt
+#
+# 확인:
+#   .venv/Scripts/python.exe -c "import torch; print(torch.__version__, torch.cuda.get_arch_list())"
+#   -> 2.14.0+cu126 ['sm_50', 'sm_60', 'sm_61', ...]
+
+numpy==2.5.3
+pandas==3.0.5
+matplotlib==3.11.1
+wandb==0.29.0
+PyYAML==6.0.3
+pytest==9.1.1

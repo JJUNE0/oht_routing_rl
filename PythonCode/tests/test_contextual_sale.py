@@ -191,7 +191,7 @@ class ContextualSALETests(unittest.TestCase):
             zsa,
             critic_total_tat=batch.critic_total_tat,
         )
-        (actor_output.action.mean() + critic_output.q1.mean()).backward()
+        (actor_output.action.mean() + critic_output.q.mean()).backward()
         self.assertTrue(all(
             parameter.grad is None
             for parameter in learner.sale_online.parameters()
@@ -205,7 +205,7 @@ class ContextualSALETests(unittest.TestCase):
             for parameter in learner.sale_target_fixed.parameters()
         ))
         actor_input = learner.actor.network[0].in_features
-        critic_input = learner.critic.q1[0].in_features
+        critic_input = learner.critic.q_nets[0][0].in_features
         self.assertEqual(actor_input, 32)
         self.assertEqual(critic_input, 49)
 
@@ -253,10 +253,7 @@ class ContextualSALETests(unittest.TestCase):
         )
         torch.testing.assert_close(low_actor, high_actor, rtol=0, atol=0)
         self.assertGreater(
-            float((low_q.q1 - high_q.q1).abs().sum()), 0.0
-        )
-        self.assertGreater(
-            float((low_q.q2 - high_q.q2).abs().sum()), 0.0
+            float((low_q.q - high_q.q).abs().sum()), 0.0
         )
 
 

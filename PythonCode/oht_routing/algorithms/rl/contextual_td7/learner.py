@@ -9,14 +9,25 @@ import time
 import torch
 import torch.nn.functional as F
 
-from .config import ContextualLearnerConfig, ContextualNetworkConfig
+from .config import (
+    ACTOR_Q_MEAN,
+    ContextualLearnerConfig,
+    ContextualNetworkConfig,
+)
 from .learner_types import ContextualLearnerUpdate
 from .networks import (
     ContextualActor,
-    ContextualTwinCritic,
+    ContextualEnsembleCritic,
     DirectionalContextEncoder,
 )
-from .targets import bellman_target, scale_policy_action, target_applied_action
+from .targets import (
+    CRITIC_TARGET_CDQ,
+    CRITIC_TARGET_UBOC,
+    aggregate_critic_target,
+    bellman_target,
+    scale_policy_action,
+    target_applied_action,
+)
 from .sale import SALEOnline, frozen_sale_copy
 from .stacking import (
     encode_observation_stack,
@@ -97,29 +108,59 @@ def _optimizer_parameter_ids(optimizer) -> tuple[list[int], set[int]]:
     return ordered, set(ordered)
 
 
-def _twin_parameter_diagnostic_tensors(critic) -> dict[str, torch.Tensor]:
-    q1 = dict(critic.q1.named_parameters())
-    q2 = dict(critic.q2.named_parameters())
-    if q1.keys() != q2.keys():
-        raise RuntimeError("Q1/Q2 exclusive parameter schemas differ")
-    differences = [
-        (q1[name].detach().double() - q2[name].detach().double()).reshape(-1)
-        for name in q1
-    ]
-    if not differences:
-        raise RuntimeError("Q1/Q2 have no exclusive trainable parameters")
-    flattened = torch.cat(differences)
+def _critic_pair_distance(left, right) -> tuple[torch.Tensor, torch.Tensor]:
+    left_named = dict(left.named_parameters())
+    right_named = dict(right.named_parameters())
+    if left_named.keys() != right_named.keys():
+        raise RuntimeError("ensemble critic parameter schemas differ")
+    if not left_named:
+        raise RuntimeError("ensemble critics have no trainable parameters")
+    squares = []
+    maxima = []
+    for name, parameter in left_named.items():
+        difference = (
+            parameter.detach().double()
+            - right_named[name].detach().double()
+        )
+        squares.append(difference.square().sum())
+        maxima.append(difference.abs().max())
+    return (
+        torch.stack(squares).sum().sqrt(),
+        torch.stack(maxima).max(),
+    )
+
+
+def _ensemble_parameter_diagnostic_tensors(critic) -> dict[str, torch.Tensor]:
+    """Measure how far apart the closest two ensemble members are.
+
+    Every member is trained toward one shared target, so only independent
+    initialization keeps them distinct. Reporting the closest pair makes a
+    collapsed ensemble - which would zero the UBOC penalty - visible, and the
+    checkpoint guard refuses to save on it.
+    """
+    heads = list(critic.q_nets)
+    if len(heads) < 2:
+        raise RuntimeError("ensemble critic requires at least two heads")
+    distances = []
+    maxima = []
+    for index, left in enumerate(heads):
+        for right in heads[index + 1:]:
+            distance, maximum = _critic_pair_distance(left, right)
+            distances.append(distance)
+            maxima.append(maximum)
+    stacked = torch.stack(distances)
     return {
         # Q-specific trainable heads only; the shared SALE task projection and
         # the external contextual encoder are intentionally excluded.
-        "critic/parameter_l2_distance": torch.linalg.vector_norm(flattened),
-        "critic/parameter_max_abs_diff": flattened.abs().max(),
+        "critic/parameter_l2_distance": stacked.min(),
+        "critic/parameter_max_abs_diff": torch.stack(maxima).min(),
+        "critic/parameter_pair_l2_mean": stacked.mean(),
     }
 
 
-def _twin_parameter_diagnostics(critic) -> dict[str, float]:
+def _ensemble_parameter_diagnostics(critic) -> dict[str, float]:
     return _scalar_tensors_to_floats(
-        _twin_parameter_diagnostic_tensors(critic)
+        _ensemble_parameter_diagnostic_tensors(critic)
     )
 
 
@@ -163,6 +204,14 @@ class ContextualTD7Learner:
                 raise ValueError(
                     "network neighbor_count must match replay topology"
                 )
+        if (
+            self.config.critic_target_mode == CRITIC_TARGET_CDQ
+            and int(self.network_config.num_critics) != 2
+        ):
+            raise ValueError(
+                "critic_target_mode 'cdq' is the two-critic minimum; set "
+                "num_critics=2 or switch critic_target_mode to 'uboc'"
+            )
         torch.manual_seed(int(seed))
         if self.device.type == "cuda":
             torch.cuda.manual_seed_all(int(seed))
@@ -178,7 +227,7 @@ class ContextualTD7Learner:
         self.actor = ContextualActor(
             self.network_config, **sale_kwargs
         ).to(self.device)
-        self.critic = ContextualTwinCritic(
+        self.critic = ContextualEnsembleCritic(
             self.network_config, **sale_kwargs
         ).to(self.device)
         self.target_encoder = copy.deepcopy(self.encoder).to(self.device)
@@ -236,7 +285,7 @@ class ContextualTD7Learner:
             "target/critic_distance": 0.0,
             "sale/fixed_online_distance": 0.0,
             "sale/target_fixed_distance": 0.0,
-            **self.twin_parameter_diagnostics(),
+            **self.ensemble_parameter_diagnostics(),
         }
         self.sale_update_count = 0
         self.sale_fixed_generation = 0
@@ -245,19 +294,30 @@ class ContextualTD7Learner:
         self.fixed_target_q_min = float("inf")
         self.fixed_target_q_max = float("-inf")
         self.applied_action_scale = float(self.config.action_scale)
+        self.actor_q_aggregation = self.config.resolved_actor_q_aggregation
 
-    def optimizer_parameter_ownership(self) -> dict[str, set[int]]:
-        q1_ids = _parameter_ids(self.critic.q1.parameters())
-        q2_ids = _parameter_ids(self.critic.q2.parameters())
+    @property
+    def algorithm_variant(self) -> str:
+        return self.config.algorithm_variant_for(
+            self.network_config.num_critics
+        )
+
+    def optimizer_parameter_ownership(self) -> dict[str, object]:
+        head_ids = [
+            _parameter_ids(q_net.parameters()) for q_net in self.critic.q_nets
+        ]
         critic_ids = _parameter_ids(self.critic.parameters())
+        exclusive: set[int] = set()
+        for ids in head_ids:
+            exclusive |= ids
         _, critic_optimizer_ids = _optimizer_parameter_ids(
             self.critic_optimizer
         )
         return {
-            "q1": q1_ids,
-            "q2": q2_ids,
+            "critic_heads": head_ids,
+            "critic_exclusive": exclusive,
             "shared_encoder": _parameter_ids(self.encoder.parameters()),
-            "critic_shared": critic_ids - q1_ids - q2_ids,
+            "critic_shared": critic_ids - exclusive,
             "critic_optimizer": critic_optimizer_ids,
             "target_critic": _parameter_ids(
                 self.target_critic.parameters()
@@ -269,13 +329,14 @@ class ContextualTD7Learner:
         ordered, optimizer_ids = _optimizer_parameter_ids(
             self.critic_optimizer
         )
-        expected = (
-            ownership["q1"]
-            | ownership["q2"]
-            | ownership["critic_shared"]
-        )
-        if ownership["q1"] & ownership["q2"]:
-            raise RuntimeError("Q1 and Q2 share exclusive parameter objects")
+        expected = ownership["critic_exclusive"] | ownership["critic_shared"]
+        heads = ownership["critic_heads"]
+        for index, head in enumerate(heads):
+            for other in heads[index + 1:]:
+                if head & other:
+                    raise RuntimeError(
+                        "ensemble critics share exclusive parameter objects"
+                    )
         if len(ordered) != len(optimizer_ids):
             raise RuntimeError("critic optimizer contains duplicate parameters")
         if optimizer_ids != expected:
@@ -292,8 +353,8 @@ class ContextualTD7Learner:
                 "contextual encoder is owned by its separate optimizer"
             )
 
-    def twin_parameter_diagnostics(self) -> dict[str, float]:
-        return _twin_parameter_diagnostics(self.critic)
+    def ensemble_parameter_diagnostics(self) -> dict[str, float]:
+        return _ensemble_parameter_diagnostics(self.critic)
 
     def _stage_timer_start(self):
         if self.device.type == "cuda":
@@ -468,26 +529,39 @@ class ContextualTD7Learner:
                 target_sale_zsa = self.sale_target_fixed.state_action(
                     target_sale_zs, next_applied
                 )
-            target_q_pair = self.target_critic(
+            target_ensemble = self.target_critic(
                 next_state, next_applied,
                 target_sale_zs, target_sale_zsa,
                 critic_total_tat=batch.next_critic_total_tat,
                 previous_action=next_previous_applied,
+            ).q
+            # One pass yields the aggregate and the ensemble statistics
+            # behind it, so reporting the correction costs no extra reduction.
+            aggregate = aggregate_critic_target(
+                target_ensemble,
+                mode=self.config.critic_target_mode,
+                beta=self.config.uboc_beta,
             )
-            tq1, tq2 = target_q_pair.q1, target_q_pair.q2
+            next_value = aggregate.value
+            target_ensemble_std = aggregate.ensemble_deviation
+            # UBOC replaces the pessimistic minimum with the ensemble mean
+            # less an uncertainty penalty. The gap against that minimum is how
+            # much optimism the correction buys back, and it is the clipped
+            # double-Q gap exactly when the ensemble holds two critics.
+            target_min_gap = aggregate.gap_above_minimum
+            # The clip is applied to the aggregate, not per critic: the
+            # minimum commutes with a shared clamp but the UBOC mean and
+            # spread do not.
             if (
                 math.isfinite(self.fixed_target_q_min)
                 and math.isfinite(self.fixed_target_q_max)
             ):
-                tq1 = tq1.clamp(
-                    self.fixed_target_q_min, self.fixed_target_q_max
-                )
-                tq2 = tq2.clamp(
+                next_value = next_value.clamp(
                     self.fixed_target_q_min, self.fixed_target_q_max
                 )
             target_q = bellman_target(
                 batch.reward, batch.done,
-                tq1, tq2,
+                next_value,
                 gamma=self.config.gamma,
             )
             target_q_bounds = _scalar_tensors_to_floats({
@@ -515,29 +589,34 @@ class ContextualTD7Learner:
         critic_timer = self._stage_timer_start()
         # Contract: replay policy_action is diagnostics only. Critic supervision
         # consumes the residual that was actually applied to the simulator.
-        q_pair = self.critic(
+        q_ensemble = self.critic(
             online_state,
             replay_applied,
             fixed_zs,
             fixed_zsa,
             critic_total_tat=batch.critic_total_tat,
             previous_action=replay_previous_applied,
-        )
+        ).q
         loss_function = (
             F.smooth_l1_loss
             if self.config.resolved_critic_loss_mode == "huber"
             else F.mse_loss
         )
-        q1_loss = loss_function(q_pair.q1, target_q)
-        q2_loss = loss_function(q_pair.q2, target_q)
-        critic_loss = q1_loss + q2_loss
+        # Per-critic loss summed over the ensemble, matching the TD7 and UD7
+        # reference implementations. Every member regresses the same target,
+        # so the gradient each head receives is independent of N.
+        per_critic_loss = loss_function(
+            q_ensemble, target_q.expand_as(q_ensemble), reduction="none"
+        ).mean(dim=0)
+        critic_loss = per_critic_loss.sum()
         if not torch.isfinite(critic_loss):
             raise FloatingPointError("critic loss is non-finite")
         self.encoder_optimizer.zero_grad(set_to_none=True)
         self.critic_optimizer.zero_grad(set_to_none=True)
         critic_loss.backward()
-        q1_grad = _gradient_norm(self.critic.q1.parameters())
-        q2_grad = _gradient_norm(self.critic.q2.parameters())
+        head_grads = torch.stack([
+            _gradient_norm(q_net.parameters()) for q_net in self.critic.q_nets
+        ])
         encoder_grad = _clip_grad_norm(
             self.encoder.parameters(), self.config.encoder_grad_clip
         )
@@ -546,10 +625,8 @@ class ContextualTD7Learner:
         )
         self.encoder_optimizer.step()
         self.critic_optimizer.step()
-        td_priority = torch.maximum(
-            (q_pair.q1.detach() - target_q).abs(),
-            (q_pair.q2.detach() - target_q).abs(),
-        ).reshape(-1)
+        td_errors = (q_ensemble.detach() - target_q).abs()
+        td_priority = td_errors.max(dim=1).values.reshape(-1)
         if self.config.lap_enabled:
             self.replay.update_priorities(batch.sample_keys, td_priority.cpu().numpy())
         critic_timer = self._stage_timer_stop(critic_timer)
@@ -592,19 +669,33 @@ class ContextualTD7Learner:
                 self.sale_fixed.state_action(actor_sale_zs, actor_applied)
                 if self.config.sale_enabled else None
             )
-            q1_actor = self.critic.q1_value(
-                actor_state,
-                actor_applied,
-                actor_sale_zs,
-                actor_sale_zsa,
-                critic_total_tat=batch.critic_total_tat,
-                previous_action=replay_previous_applied,
-            )
+            actor_kwargs = {
+                "critic_total_tat": batch.critic_total_tat,
+                "previous_action": replay_previous_applied,
+            }
+            if self.actor_q_aggregation == ACTOR_Q_MEAN:
+                # UD7 Eq. 26: the policy maximizes the ensemble average.
+                q_actor = self.critic(
+                    actor_state,
+                    actor_applied,
+                    actor_sale_zs,
+                    actor_sale_zsa,
+                    **actor_kwargs,
+                ).q.mean(dim=1, keepdim=True)
+            else:
+                q_actor = self.critic.head_value(
+                    actor_state,
+                    actor_applied,
+                    actor_sale_zs,
+                    actor_sale_zsa,
+                    index=0,
+                    **actor_kwargs,
+                )
             pretanh_penalty = (
                 self.config.pretanh_penalty
                 * policy_output.pre_tanh.square().mean()
             )
-            actor_loss = -q1_actor.mean() + pretanh_penalty
+            actor_loss = -q_actor.mean() + pretanh_penalty
             self.actor_optimizer.zero_grad(set_to_none=True)
             actor_loss.backward()
             actor_grad = _clip_grad_norm(
@@ -648,18 +739,17 @@ class ContextualTD7Learner:
                     if self.config.sale_enabled
                     else torch.zeros((), device=self.device)
                 ),
-                **_twin_parameter_diagnostic_tensors(self.critic),
+                **_ensemble_parameter_diagnostic_tensors(self.critic),
             }
             self._distance_diagnostics.update(
                 _scalar_tensors_to_floats(distance_tensors)
             )
 
-        td1 = (q_pair.q1.detach() - target_q).abs()
-        td2 = (q_pair.q2.detach() - target_q).abs()
-        q_abs_diff = (q_pair.q1.detach() - q_pair.q2.detach()).abs()
+        q_detached = q_ensemble.detach()
+        q_head_std = q_detached.std(dim=1, unbiased=True)
+        q_abs_diff = (q_detached[:, 0] - q_detached[:, 1]).abs()
         finite_values = (
-            critic_loss.detach(), q_pair.q1.detach(), q_pair.q2.detach(),
-            target_q.detach(), td1, td2,
+            critic_loss.detach(), q_detached, target_q.detach(), td_errors,
         )
         finite_ratio = torch.cat(
             [value.reshape(-1).isfinite().float() for value in finite_values]
@@ -667,20 +757,35 @@ class ContextualTD7Learner:
         tensor_diagnostics = {
             "learner/critic_loss": critic_loss,
             "learner/encoder_joint_critic_loss": critic_loss,
-            "critic/q1_mean": q_pair.q1.mean(),
-            "critic/q2_mean": q_pair.q2.mean(),
+            "critic/q1_mean": q_detached[:, 0].mean(),
+            "critic/q2_mean": q_detached[:, 1].mean(),
             "critic/q_abs_diff_mean": q_abs_diff.mean(),
             "critic/q_abs_diff_max": q_abs_diff.max(),
-            "critic/q1_loss": q1_loss,
-            "critic/q2_loss": q2_loss,
-            "critic/q1_grad_norm": q1_grad,
-            "critic/q2_grad_norm": q2_grad,
-            "critic/q_min": torch.minimum(q_pair.q1, q_pair.q2).min(),
-            "critic/q_max": torch.maximum(q_pair.q1, q_pair.q2).max(),
+            "critic/q1_loss": per_critic_loss[0],
+            "critic/q2_loss": per_critic_loss[1],
+            "critic/q1_grad_norm": head_grads[0],
+            "critic/q2_grad_norm": head_grads[1],
+            "critic/q_loss_mean": per_critic_loss.mean(),
+            "critic/q_grad_norm_mean": head_grads.mean(),
+            "critic/q_grad_norm_min": head_grads.min(),
+            "critic/q_ensemble_mean": q_detached.mean(),
+            "critic/q_ensemble_std_mean": q_head_std.mean(),
+            "critic/q_spread_mean": (
+                q_detached.max(dim=1).values - q_detached.min(dim=1).values
+            ).mean(),
+            "critic/q_min": q_detached.min(),
+            "critic/q_max": q_detached.max(),
             "critic/target_q_mean": target_q.mean(),
             "critic/target_q_std": target_q.std(),
-            "critic/td_error_mean": torch.maximum(td1, td2).mean(),
-            "critic/td_error_max": torch.maximum(td1, td2).max(),
+            "critic/target_ensemble_mean": aggregate.ensemble_mean.mean(),
+            "critic/target_ensemble_std_mean": target_ensemble_std.mean(),
+            "critic/target_ensemble_std_max": target_ensemble_std.max(),
+            "critic/target_uboc_penalty_mean": (
+                float(self.config.uboc_beta) * target_ensemble_std.mean()
+            ),
+            "critic/target_vs_min_gap_mean": target_min_gap.mean(),
+            "critic/td_error_mean": td_errors.max(dim=1).values.mean(),
+            "critic/td_error_max": td_errors.max(),
             "grad/encoder_norm": encoder_grad,
             "grad/critic_norm": critic_grad,
             "numeric/learner_finite_ratio": finite_ratio,
@@ -780,6 +885,14 @@ class ContextualTD7Learner:
                 if sale_backward_timer is not None else 0.0
             ),
             "lap/enabled": float(self.config.lap_enabled),
+            "critic/num_critics": float(self.network_config.num_critics),
+            "critic/uboc_enabled": float(
+                self.config.critic_target_mode == CRITIC_TARGET_UBOC
+            ),
+            "critic/uboc_beta": float(self.config.uboc_beta),
+            "critic/actor_reads_ensemble_mean": float(
+                self.actor_q_aggregation == ACTOR_Q_MEAN
+            ),
             "value/current_target_q_min": (
                 float(self.current_target_q_min)
                 if math.isfinite(self.current_target_q_min) else 0.0

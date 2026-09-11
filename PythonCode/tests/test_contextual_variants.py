@@ -52,7 +52,6 @@ class ContextualVariantTests(unittest.TestCase):
             return parse_args()
 
     def test_cli_and_runtime_are_locked_to_reward_q(self):
-        self.assertEqual(CONTEXTUAL_VERSION, "v9.3.1")
         parsed = self.parse()
         self.assertNotIn("reward_version", vars(parsed))
         self.assertEqual(
@@ -68,7 +67,7 @@ class ContextualVariantTests(unittest.TestCase):
         for retired in ("O", "P"):
             with self.assertRaises(SystemExit):
                 self.parse("--reward-version", retired)
-        with self.assertRaisesRegex(ValueError, "only reward_version in \('Q', 'N'\)"):
+        with self.assertRaisesRegex(ValueError, r"only reward_version in \('Q', 'N'\)"):
             ContextualRuntimeConfig(reward_version="O")
 
         config = ContextualRuntimeConfig()
@@ -347,6 +346,16 @@ class ContextualVariantTests(unittest.TestCase):
         )
         self.assertIn("resume_warmstart_steps", RESUME_LAUNCH_CONTROL_FIELDS)
         self.assertIn("use_attention", RESUME_LAUNCH_CONTROL_FIELDS)
+        # The ensemble size and the aggregation rule define the saved critics,
+        # so a resumed run must take them from the checkpoint rather than from
+        # whatever the current defaults happen to be.
+        for field in (
+            "num_critics",
+            "critic_target_mode",
+            "uboc_beta",
+            "actor_q_aggregation",
+        ):
+            self.assertNotIn(field, RESUME_LAUNCH_CONTROL_FIELDS)
 
     def test_cli_accepts_single_and_multiple_simulator_ports(self):
         single = self.parse("--port", "9100")
@@ -814,9 +823,16 @@ class ContextualVariantTests(unittest.TestCase):
                     require_normalizer_frozen=False,
                     target_update_interval=4,
                 )
-                self.assertEqual(config.algorithm_variant, name)
                 self.assertEqual(
-                    contextual_algorithm_variant(sale, lap), name
+                    config.algorithm_variant_for(5), f"{name}_uboc5"
+                )
+                self.assertEqual(
+                    contextual_algorithm_variant(sale, lap, "uboc", 5),
+                    f"{name}_uboc5",
+                )
+                self.assertEqual(
+                    contextual_algorithm_variant(sale, lap, "cdq", 2),
+                    f"{name}_cdq2",
                 )
                 self.assertEqual(
                     config.resolved_critic_loss_mode,
