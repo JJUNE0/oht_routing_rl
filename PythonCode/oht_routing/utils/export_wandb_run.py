@@ -182,7 +182,9 @@ def main():
         ]
         columns = tuple(leading + sorted(keys.difference(leading)))
     else:
-        rows = run.scan_history(keys=list(EXPORT_COLUMNS))
+        # The final evaluation metric is sparse.  W&B's keyed scan omits
+        # rows missing requested keys, so scan raw history and project it.
+        rows = run.scan_history()
         columns = EXPORT_COLUMNS
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)

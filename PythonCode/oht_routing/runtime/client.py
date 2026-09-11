@@ -223,6 +223,9 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
         self._resume_stochastic_episodes_remaining = 0
         self._resume_warmstart_episode_active = False
         self._last_sim_time: float | None = None
+        self._episode_sim_start: float | None = None
+        self._episode_wall_start: float | None = None
+        self._last_episode_wandb_summary = None
         self._stale_sim_time_ticks = 0
         self._stage1_last_applied_action = None
         self._stage1_previous_applied_action = None
@@ -923,6 +926,8 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
         self._last_replay_summary = {}
         self._last_replay_push_ms = 0.0
         self._last_sim_time = None
+        self._episode_sim_start = None
+        self._episode_wall_start = None
         self._stale_sim_time_ticks = 0
         self._stage1_last_applied_action = None
         self._stage1_previous_applied_action = None
@@ -1060,6 +1065,7 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
         # Some simulator sessions send reset without a preceding v=1.
         # Use cached diagnostics: PClient has already read the new handshake.
         self._save_stage1_episode_end()
+        self._log_episode_final_if_complete()
         if (
             getattr(self, "_resume_warmstart_episode_active", False)
             and self.episode_steps > 0
@@ -1122,6 +1128,8 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
         self._last_replay_summary = {}
         self._last_replay_push_ms = 0.0
         self._last_sim_time = None
+        self._episode_sim_start = None
+        self._episode_wall_start = None
         self._stale_sim_time_ticks = 0
         self._stage1_last_applied_action = None
         self._stage1_previous_applied_action = None
@@ -1140,12 +1148,35 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
         if observation_builder is not None:
             observation_builder.reset_episode()
 
+    def _log_episode_final_if_complete(self):
+        """Emit one complete-episode final TAT, including reset-only ends."""
+        identity = (self.episode_id, self.total_steps)
+        if (
+            self.episode_steps > 0
+            and self.config.mode in {"training", "actor_inference"}
+            and not self.training_failed
+            and getattr(self, "_last_episode_wandb_summary", None) != identity
+            and self.last_diagnostics.get("env/sim_time") is not None
+            and np.isfinite(self.last_diagnostics["env/sim_time"])
+            and self.last_diagnostics["env/sim_time"] >= self.config.sim_end_time - 1
+            and not self.last_diagnostics.get("termination/done", 0)
+            and not self.last_diagnostics.get("termination/by_warmup", 0)
+            and not self.last_diagnostics.get("termination/by_resume_warmstart", 0)
+            and self.last_diagnostics.get("env/tat") is not None
+            and np.isfinite(self.last_diagnostics["env/tat"])
+            and self.last_diagnostics["env/tat"] > 0
+        ):
+            self.wandb_logger.log_episode_final(
+                final_tat=self.last_diagnostics["env/tat"], step=self.total_steps
+            )
+            self._last_episode_wandb_summary = identity
+
     def on_terminal(self):
         """Record terminal signal; no terminal state is available at protocol v=1."""
         self._save_stage1_episode_end()
+        identity = (self.episode_id, self.total_steps)
         if self.config.episode_summary_path and self.episode_steps > 0:
             from oht_routing.runtime.episode_results import write_episode_result
-            identity = (self.episode_id, self.total_steps)
             if getattr(self, "_last_episode_summary", None) != identity:
                 write_episode_result(
                     self.config.episode_summary_path, self.config,
@@ -1153,6 +1184,7 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
                     self.episode_steps, self.training_failed,
                 )
                 self._last_episode_summary = identity
+        self._log_episode_final_if_complete()
         if self.transition_aligner is not None:
             self.last_diagnostics["transition/terminal_without_observation"] = 1.0
 
@@ -1646,6 +1678,22 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
         sim_time, stale_sim_time_ticks, protocol_stalled = (
             self._sim_time_progress(pclient)
         )
+        if self._episode_sim_start is None and np.isfinite(sim_time):
+            self._episode_sim_start = float(sim_time)
+            self._episode_wall_start = time.perf_counter()
+        wall_elapsed = (
+            time.perf_counter() - self._episode_wall_start
+            if self._episode_wall_start is not None else 0.0
+        )
+        acceleration_rate = None
+        if (
+            self._episode_sim_start is not None
+            and np.isfinite(sim_time)
+            and wall_elapsed > 0.0
+        ):
+            acceleration_rate = max(
+                0.0, float(sim_time) - self._episode_sim_start
+            ) / wall_elapsed
         recent_tat = self.reward_builder.update_recent_completed_tat(pclient)
         # Expose the shared snapshot to capture/debug consumers without
         # recomputing lifecycle events in a second tracker.
@@ -2264,6 +2312,10 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
             "oht/loading": float(oht_states.count(3)),
             "oht/unloading": float(oht_states.count(5)),
         })
+        if acceleration_rate is not None and np.isfinite(acceleration_rate):
+            self.last_diagnostics["runtime/acceleration_rate"] = float(
+                acceleration_rate
+            )
         predicted_oht = [
             float(
                 getattr(
