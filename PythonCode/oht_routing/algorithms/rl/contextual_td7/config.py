@@ -3,10 +3,31 @@ from dataclasses import dataclass
 from oht_routing.mdp.action import ACTION_MODES, REGION_B_RL
 
 from .stacking import validate_stack_config
+from .targets import (
+    CRITIC_TARGET_CDQ,
+    CRITIC_TARGET_UBOC,
+    UBOC_BETA,
+    validate_critic_target_mode,
+)
 
 
-def contextual_algorithm_variant(sale_enabled: bool, lap_enabled: bool) -> str:
-    return {
+ACTOR_Q_FIRST = "q1"
+ACTOR_Q_MEAN = "mean"
+ACTOR_Q_AGGREGATIONS = ("auto", ACTOR_Q_FIRST, ACTOR_Q_MEAN)
+
+
+def contextual_algorithm_variant(
+    sale_enabled: bool,
+    lap_enabled: bool,
+    critic_target_mode: str = CRITIC_TARGET_CDQ,
+    num_critics: int = 2,
+) -> str:
+    """Name the learning rule that produced an artifact.
+
+    The critic aggregation and the ensemble size are part of the name because
+    UBOC and clipped double-Q learn different critics from the same replay.
+    """
+    base = {
         (True, True): "contextual_td7_sale_lap_v6_compact_actor_critic_tat",
         (False, True): "contextual_td7_no_sale_lap_v6_compact_actor_critic_tat",
         (True, False): "contextual_td7_sale_uniform_v6_compact_actor_critic_tat",
@@ -14,11 +35,14 @@ def contextual_algorithm_variant(sale_enabled: bool, lap_enabled: bool) -> str:
             "contextual_twin_delayed_uniform_v6_compact_actor_critic_tat"
         ),
     }[(bool(sale_enabled), bool(lap_enabled))]
+    validate_critic_target_mode(critic_target_mode)
+    return f"{base}_{critic_target_mode}{int(num_critics)}"
 
 
 @dataclass(frozen=True)
 class ContextualNetworkConfig:
     local_physical_dim: int = 14
+    num_critics: int = 5
     rail_embedding_dim: int = 8
     num_rails: int = 4_999
     relation_dim: int = 2
@@ -57,6 +81,8 @@ class ContextualNetworkConfig:
         for name in positive:
             if int(getattr(self, name)) <= 0:
                 raise ValueError(f"{name} must be positive")
+        if int(self.num_critics) < 2:
+            raise ValueError("num_critics must be at least 2")
         if self.d_model % self.num_heads != 0:
             raise ValueError("d_model must be divisible by num_heads")
         if self.attention_layers != 1:
@@ -138,6 +164,9 @@ class ContextualLearnerConfig:
     lap_alpha: float = 0.4
     lap_min_priority: float = 1.0
     critic_loss_mode: str = "auto"
+    critic_target_mode: str = CRITIC_TARGET_UBOC
+    uboc_beta: float = UBOC_BETA
+    actor_q_aggregation: str = "auto"
 
     def __post_init__(self):
         if not 0 <= self.gamma <= 1:
@@ -160,11 +189,20 @@ class ContextualLearnerConfig:
             raise ValueError("LAP alpha/min priority must be positive")
         if self.critic_loss_mode not in {"auto", "huber", "mse"}:
             raise ValueError("critic_loss_mode must be auto, huber, or mse")
+        validate_critic_target_mode(self.critic_target_mode)
+        if not 0.0 <= float(self.uboc_beta) < 10.0:
+            raise ValueError("uboc_beta must be in [0, 10)")
+        if self.actor_q_aggregation not in ACTOR_Q_AGGREGATIONS:
+            raise ValueError(
+                f"actor_q_aggregation must be one of {ACTOR_Q_AGGREGATIONS}"
+            )
 
-    @property
-    def algorithm_variant(self):
+    def algorithm_variant_for(self, num_critics: int) -> str:
         return contextual_algorithm_variant(
-            self.sale_enabled, self.lap_enabled
+            self.sale_enabled,
+            self.lap_enabled,
+            self.critic_target_mode,
+            num_critics,
         )
 
     @property
@@ -172,3 +210,19 @@ class ContextualLearnerConfig:
         if self.critic_loss_mode != "auto":
             return self.critic_loss_mode
         return "huber" if self.lap_enabled else "mse"
+
+    @property
+    def resolved_actor_q_aggregation(self) -> str:
+        """Which critics the policy gradient reads.
+
+        UBOC maximizes the ensemble mean (UD7 Eq. 26); clipped double-Q keeps
+        this project's single-head policy gradient. Setting the field
+        explicitly isolates the two changes in an ablation.
+        """
+        if self.actor_q_aggregation != "auto":
+            return self.actor_q_aggregation
+        return (
+            ACTOR_Q_MEAN
+            if self.critic_target_mode == CRITIC_TARGET_UBOC
+            else ACTOR_Q_FIRST
+        )

@@ -5,6 +5,11 @@ import numpy as np
 import torch
 
 from oht_routing.algorithms.rl.contextual_td7 import (
+    ACTOR_Q_FIRST,
+    ACTOR_Q_MEAN,
+    CRITIC_TARGET_CDQ,
+    CRITIC_TARGET_UBOC,
+    UBOC_BETA,
     ContextualLearnerConfig,
     ContextualNetworkConfig,
     ContextualStepReplayBuffer,
@@ -95,9 +100,11 @@ class ContextualLearnerTests(unittest.TestCase):
             for a, b in zip(online.parameters(), target.parameters()):
                 self.assertTrue(torch.equal(a, b))
                 self.assertIsNot(a, b)
-        for online_head, target_head in (
-            (learner.critic.q1, learner.target_critic.q1),
-            (learner.critic.q2, learner.target_critic.q2),
+        self.assertEqual(
+            learner.critic.num_critics, SMALL_NETWORK.num_critics
+        )
+        for online_head, target_head in zip(
+            learner.critic.q_nets, learner.target_critic.q_nets
         ):
             for online, target in zip(
                 online_head.parameters(), target_head.parameters()
@@ -105,7 +112,7 @@ class ContextualLearnerTests(unittest.TestCase):
                 torch.testing.assert_close(online, target, rtol=0, atol=0)
                 self.assertIsNot(online, target)
         self.assertGreater(
-            learner.twin_parameter_diagnostics()[
+            learner.ensemble_parameter_diagnostics()[
                 "critic/parameter_max_abs_diff"
             ],
             0.0,
@@ -375,12 +382,14 @@ class ContextualLearnerTests(unittest.TestCase):
         self.assertNotIn(id(learner.encoder.rail_embedding.weight), groups[1])
         self.assertNotIn(id(learner.encoder.rail_embedding.weight), groups[2])
         ownership = learner.optimizer_parameter_ownership()
-        self.assertFalse(ownership["q1"] & ownership["q2"])
+        heads = ownership["critic_heads"]
+        self.assertEqual(len(heads), SMALL_NETWORK.num_critics)
+        for index, head in enumerate(heads):
+            for other in heads[index + 1:]:
+                self.assertFalse(head & other)
         self.assertEqual(
             ownership["critic_optimizer"],
-            ownership["q1"]
-            | ownership["q2"]
-            | ownership["critic_shared"],
+            ownership["critic_exclusive"] | ownership["critic_shared"],
         )
         self.assertFalse(
             ownership["critic_optimizer"] & ownership["target_critic"]
@@ -389,34 +398,38 @@ class ContextualLearnerTests(unittest.TestCase):
             ownership["critic_optimizer"] & ownership["shared_encoder"]
         )
         self.assertGreater(len(ownership["critic_shared"]), 0)
-        for online_head, target_head in (
-            (learner.critic.q1, learner.target_critic.q1),
-            (learner.critic.q2, learner.target_critic.q2),
+        for online_head, target_head in zip(
+            learner.critic.q_nets, learner.target_critic.q_nets
         ):
             for online, target in zip(
                 online_head.parameters(), target_head.parameters()
             ):
                 torch.testing.assert_close(online, target, rtol=0, atol=0)
                 self.assertIsNot(online, target)
-        target_q1 = dict(learner.target_critic.q1.named_parameters())
-        target_q2 = dict(learner.target_critic.q2.named_parameters())
-        self.assertGreater(max(
-            float(
-                (target_q1[name] - target_q2[name])
-                .detach().abs().max()
-            )
-            for name in target_q1
-        ), 0.0)
+        target_heads = [
+            dict(q_net.named_parameters())
+            for q_net in learner.target_critic.q_nets
+        ]
+        for index, left in enumerate(target_heads):
+            for right in target_heads[index + 1:]:
+                self.assertGreater(max(
+                    float((left[name] - right[name]).detach().abs().max())
+                    for name in left
+                ), 0.0)
 
-    def test_twin_gradients_outputs_and_parameters_remain_diverse(self):
+    def test_ensemble_gradients_outputs_and_parameters_remain_diverse(self):
         learner = ContextualTD7Learner(
             make_replay(), network_config=SMALL_NETWORK,
             config=self.config(), seed=41,
         )
-        initial = learner.twin_parameter_diagnostics()
+        initial = learner.ensemble_parameter_diagnostics()
         self.assertGreater(initial["critic/parameter_l2_distance"], 0.0)
         self.assertGreater(
             initial["critic/parameter_max_abs_diff"], 0.0
+        )
+        self.assertGreaterEqual(
+            initial["critic/parameter_pair_l2_mean"],
+            initial["critic/parameter_l2_distance"],
         )
         result = learner.update()
         diagnostics = result.diagnostics
@@ -427,13 +440,22 @@ class ContextualLearnerTests(unittest.TestCase):
             "critic/q2_loss",
             "critic/q1_grad_norm",
             "critic/q2_grad_norm",
+            "critic/q_loss_mean",
+            "critic/q_grad_norm_mean",
+            "critic/q_grad_norm_min",
+            "critic/q_ensemble_mean",
+            "critic/q_ensemble_std_mean",
+            "critic/q_spread_mean",
             "critic/parameter_l2_distance",
             "critic/parameter_max_abs_diff",
+            "critic/parameter_pair_l2_mean",
         ):
             self.assertTrue(np.isfinite(diagnostics[key]), key)
         self.assertGreater(diagnostics["critic/q_abs_diff_mean"], 0.0)
         self.assertGreater(diagnostics["critic/q1_grad_norm"], 0.0)
         self.assertGreater(diagnostics["critic/q2_grad_norm"], 0.0)
+        self.assertGreater(diagnostics["critic/q_grad_norm_min"], 0.0)
+        self.assertGreater(diagnostics["critic/q_ensemble_std_mean"], 0.0)
         self.assertGreater(
             diagnostics["critic/parameter_l2_distance"], 0.0
         )
@@ -495,6 +517,188 @@ class ContextualLearnerTests(unittest.TestCase):
         )
         self.assertIn(
             "value/fixed_target_q_max", second.diagnostics
+        )
+
+
+class UBOCLearnerTests(unittest.TestCase):
+    """The UD7 critic rule as the learner actually wires it."""
+
+    def config(self, **overrides):
+        return ContextualLearnerConfig(**{
+            "batch_size": 32,
+            "target_noise": 0.0,
+            "target_update_interval": 4,
+            "policy_update_delay": 2,
+            "minimum_replay_env_steps": 1,
+            "minimum_action_enabled_env_steps": 1,
+            "require_normalizer_frozen": False,
+            "sale_enabled": False,
+            "lap_enabled": False,
+            **overrides,
+        })
+
+    def make(self, *, num_critics=5, seed=17, **kwargs):
+        return ContextualTD7Learner(
+            make_replay(),
+            network_config=replace(SMALL_NETWORK, num_critics=num_critics),
+            config=self.config(**kwargs),
+            seed=seed,
+        )
+
+    def test_uboc_is_the_default_rule(self):
+        config = ContextualLearnerConfig()
+        self.assertEqual(config.critic_target_mode, CRITIC_TARGET_UBOC)
+        self.assertAlmostEqual(config.uboc_beta, UBOC_BETA, places=12)
+        self.assertEqual(ContextualNetworkConfig().num_critics, 5)
+
+    def test_actor_aggregation_follows_the_target_mode(self):
+        self.assertEqual(
+            self.config().resolved_actor_q_aggregation, ACTOR_Q_MEAN
+        )
+        self.assertEqual(
+            self.config(
+                critic_target_mode=CRITIC_TARGET_CDQ
+            ).resolved_actor_q_aggregation,
+            ACTOR_Q_FIRST,
+        )
+        # An explicit setting isolates the two changes in an ablation.
+        self.assertEqual(
+            self.config(
+                actor_q_aggregation=ACTOR_Q_FIRST
+            ).resolved_actor_q_aggregation,
+            ACTOR_Q_FIRST,
+        )
+
+    def test_cdq_mode_requires_exactly_two_critics(self):
+        with self.assertRaisesRegex(ValueError, "two-critic minimum"):
+            self.make(num_critics=5, critic_target_mode=CRITIC_TARGET_CDQ)
+        learner = self.make(
+            num_critics=2, critic_target_mode=CRITIC_TARGET_CDQ
+        )
+        self.assertEqual(learner.critic.num_critics, 2)
+        self.assertEqual(learner.actor_q_aggregation, ACTOR_Q_FIRST)
+
+    def test_update_reports_the_uboc_correction(self):
+        learner = self.make()
+        diagnostics = learner.update().diagnostics
+        self.assertEqual(diagnostics["critic/num_critics"], 5.0)
+        self.assertEqual(diagnostics["critic/uboc_enabled"], 1.0)
+        self.assertAlmostEqual(
+            diagnostics["critic/uboc_beta"], UBOC_BETA, places=6
+        )
+        self.assertEqual(
+            diagnostics["critic/actor_reads_ensemble_mean"], 1.0
+        )
+        self.assertGreater(diagnostics["critic/target_ensemble_std_mean"], 0.0)
+        self.assertGreaterEqual(
+            diagnostics["critic/target_ensemble_std_max"],
+            diagnostics["critic/target_ensemble_std_mean"],
+        )
+        # The penalty is exactly beta times the reported spread, and the
+        # aggregate sits above the ensemble minimum by construction.
+        self.assertAlmostEqual(
+            diagnostics["critic/target_uboc_penalty_mean"],
+            UBOC_BETA * diagnostics["critic/target_ensemble_std_mean"],
+            places=5,
+        )
+        self.assertGreater(diagnostics["critic/target_vs_min_gap_mean"], 0.0)
+
+    def test_cdq_mode_reports_no_correction_and_no_gap(self):
+        learner = self.make(
+            num_critics=2, critic_target_mode=CRITIC_TARGET_CDQ
+        )
+        diagnostics = learner.update().diagnostics
+        self.assertEqual(diagnostics["critic/uboc_enabled"], 0.0)
+        self.assertEqual(diagnostics["critic/num_critics"], 2.0)
+        self.assertEqual(
+            diagnostics["critic/actor_reads_ensemble_mean"], 0.0
+        )
+        # The minimum is the aggregate, so there is nothing above it.
+        self.assertAlmostEqual(
+            diagnostics["critic/target_vs_min_gap_mean"], 0.0, places=6
+        )
+
+    def test_every_head_receives_gradient_from_one_shared_target(self):
+        learner = self.make(num_critics=4)
+        learner.update()
+        norms = [
+            float(
+                sum(
+                    float(parameter.grad.detach().square().sum())
+                    for parameter in q_net.parameters()
+                    if parameter.grad is not None
+                )
+            )
+            for q_net in learner.critic.q_nets
+        ]
+        self.assertEqual(len(norms), 4)
+        for norm in norms:
+            self.assertGreater(norm, 0.0)
+
+    def test_priority_is_the_worst_head_error(self):
+        learner = self.make(num_critics=3)
+        diagnostics = learner.update().diagnostics
+        # The priority is the per-sample maximum across heads, so it agrees
+        # with the reported TD error and is never below its own mean.
+        self.assertGreaterEqual(
+            diagnostics["lap/td_error_max"], diagnostics["lap/td_error_mean"]
+        )
+        self.assertAlmostEqual(
+            diagnostics["lap/td_error_mean"],
+            diagnostics["critic/td_error_mean"],
+            places=5,
+        )
+        self.assertAlmostEqual(
+            diagnostics["lap/td_error_max"],
+            diagnostics["critic/td_error_max"],
+            places=5,
+        )
+
+    def test_value_clip_bounds_the_aggregate_before_bootstrapping(self):
+        learner = self.make(target_update_interval=1)
+        learner.update()
+        self.assertTrue(np.isfinite(learner.fixed_target_q_min))
+        self.assertTrue(np.isfinite(learner.fixed_target_q_max))
+        # Collapse the clip window onto one point. Every next-state aggregate
+        # must then land on it, so the target reduces to the reward plus a
+        # fixed discounted constant and nothing of the critics survives.
+        learner.fixed_target_q_min = 0.25
+        learner.fixed_target_q_max = 0.25
+        batch = learner.replay.sample(
+            learner.config.batch_size, device=learner.device
+        )
+        diagnostics = learner.update(batch).diagnostics
+        expected = (
+            batch.reward
+            + learner.config.gamma * (1.0 - batch.done) * 0.25
+        )
+        self.assertAlmostEqual(
+            diagnostics["critic/target_q_mean"],
+            float(expected.mean()),
+            places=5,
+        )
+        self.assertAlmostEqual(
+            diagnostics["critic/target_q_std"],
+            float(expected.std()),
+            places=5,
+        )
+
+    def test_zero_beta_reduces_uboc_to_the_ensemble_mean(self):
+        learner = self.make(uboc_beta=0.0)
+        diagnostics = learner.update().diagnostics
+        self.assertAlmostEqual(
+            diagnostics["critic/target_uboc_penalty_mean"], 0.0, places=9
+        )
+        self.assertGreater(diagnostics["critic/target_vs_min_gap_mean"], 0.0)
+
+    def test_algorithm_variant_names_the_aggregation_and_size(self):
+        self.assertTrue(
+            self.make(num_critics=5).algorithm_variant.endswith("_uboc5")
+        )
+        self.assertTrue(
+            self.make(
+                num_critics=2, critic_target_mode=CRITIC_TARGET_CDQ
+            ).algorithm_variant.endswith("_cdq2")
         )
 
 

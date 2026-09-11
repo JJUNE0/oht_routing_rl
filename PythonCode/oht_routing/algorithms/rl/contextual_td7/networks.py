@@ -407,6 +407,8 @@ class ContextualActor(nn.Module):
 
 
 class CriticHead(nn.Module):
+    """One non-SALE critic head over the flattened state-action input."""
+
     def __init__(self, config: ContextualNetworkConfig):
         super().__init__()
         input_dim = config.critic_input_dim
@@ -426,8 +428,10 @@ class CriticHead(nn.Module):
 def _sale_critic_head(input_dim: int, hidden_dim: int) -> nn.Sequential:
     """Build one Q-exclusive SALE critic head.
 
-    Q1 and Q2 must call this constructor independently. Copying a head or its
-    state dict would preserve exact symmetry under the shared twin-Q loss.
+    Every ensemble member must call this constructor independently. Copying a
+    head or its state dict would preserve exact symmetry, and the ensemble
+    shares one target, so independent initialization is the only thing that
+    keeps the members - and therefore the UBOC spread - distinct.
     """
     return nn.Sequential(
         nn.Linear(input_dim, hidden_dim),
@@ -440,12 +444,30 @@ def _sale_critic_head(input_dim: int, hidden_dim: int) -> nn.Sequential:
 
 
 @dataclass(frozen=True)
-class TwinCriticOutput:
-    q1: torch.Tensor
-    q2: torch.Tensor
+class EnsembleCriticOutput:
+    """Per-critic Q-values as [B, N], ordered by ensemble index."""
+
+    q: torch.Tensor
+
+    @property
+    def num_critics(self) -> int:
+        return int(self.q.shape[1])
+
+    @property
+    def mean(self) -> torch.Tensor:
+        return self.q.mean(dim=1, keepdim=True)
+
+    def head(self, index: int) -> torch.Tensor:
+        return self.q[:, int(index):int(index) + 1]
 
 
-class ContextualTwinCritic(nn.Module):
+class ContextualEnsembleCritic(nn.Module):
+    """N independently initialized critic heads over a shared projection.
+
+    N == 2 reproduces the TD7 twin critic; N > 2 supplies the ensemble that
+    UBOC needs to estimate the uncertainty penalty of the Bellman target.
+    """
+
     def __init__(
         self, config: ContextualNetworkConfig | None = None,
         *, sale_embedding_dim: int = 0, sale_feature_dim: int = 0,
@@ -453,8 +475,8 @@ class ContextualTwinCritic(nn.Module):
         super().__init__()
         self.config = config or ContextualNetworkConfig()
         self.sale_enabled = sale_embedding_dim > 0
+        num_critics = int(self.config.num_critics)
         if self.sale_enabled:
-            from .sale import avg_l1_norm
             self.task_sa_projection = nn.Linear(
                 self.config.critic_state_action_dim,
                 sale_feature_dim,
@@ -464,25 +486,24 @@ class ContextualTwinCritic(nn.Module):
                 + 2 * sale_embedding_dim
                 + self.config.stacked_critic_extra_dim
             )
-            self.q1 = _sale_critic_head(
-                input_dim, self.config.hidden_dim
-            )
-            self.q2 = _sale_critic_head(
-                input_dim, self.config.hidden_dim
+            self.q_nets = nn.ModuleList(
+                _sale_critic_head(input_dim, self.config.hidden_dim)
+                for _ in range(num_critics)
             )
         else:
             self.task_sa_projection = None
-            self.q1 = CriticHead(self.config)
-            self.q2 = CriticHead(self.config)
+            self.q_nets = nn.ModuleList(
+                CriticHead(self.config) for _ in range(num_critics)
+            )
 
-    def forward(
-        self, state: torch.Tensor, action: torch.Tensor,
-        sale_state: torch.Tensor | None = None,
-        sale_state_action: torch.Tensor | None = None,
-        *,
-        critic_total_tat: torch.Tensor,
-        previous_action: torch.Tensor | None = None,
-    ) -> TwinCriticOutput:
+    @property
+    def num_critics(self) -> int:
+        return len(self.q_nets)
+
+    def _critic_input(
+        self, state, action, sale_state, sale_state_action,
+        *, critic_total_tat, previous_action,
+    ) -> torch.Tensor:
         _require_tensor("state", state, (self.config.stacked_context_dim,))
         _require_tensor("action", action, (self.config.stacked_action_dim,))
         if previous_action is None:
@@ -517,28 +538,42 @@ class ContextualTwinCritic(nn.Module):
             context_dim=self.config.context_dim + self.config.action_dim,
             action_dim=self.config.action_dim,
         )
-        if self.sale_enabled:
-            from .sale import avg_l1_norm
-            if sale_state is None or sale_state_action is None:
-                raise ValueError("SALE critic requires fixed z_s and z_sa")
-            state_action = torch.cat(
-                (
-                    avg_l1_norm(self.task_sa_projection(state_action)),
-                    sale_state.detach(),
-                    sale_state_action.detach(),
-                    critic_extra,
-                ),
-                -1,
-            )
-        else:
-            state_action = torch.cat((state_action, critic_extra), dim=-1)
-        q1 = self.q1(state_action)
-        q2 = self.q2(state_action)
-        _require_finite("critic.q1", q1)
-        _require_finite("critic.q2", q2)
-        return TwinCriticOutput(q1=q1, q2=q2)
+        if not self.sale_enabled:
+            return torch.cat((state_action, critic_extra), dim=-1)
+        from .sale import avg_l1_norm
+        if sale_state is None or sale_state_action is None:
+            raise ValueError("SALE critic requires fixed z_s and z_sa")
+        return torch.cat(
+            (
+                avg_l1_norm(self.task_sa_projection(state_action)),
+                sale_state.detach(),
+                sale_state_action.detach(),
+                critic_extra,
+            ),
+            -1,
+        )
 
-    def q1_value(
+    def forward(
+        self, state: torch.Tensor, action: torch.Tensor,
+        sale_state: torch.Tensor | None = None,
+        sale_state_action: torch.Tensor | None = None,
+        *,
+        critic_total_tat: torch.Tensor,
+        previous_action: torch.Tensor | None = None,
+    ) -> EnsembleCriticOutput:
+        state_action = self._critic_input(
+            state,
+            action,
+            sale_state,
+            sale_state_action,
+            critic_total_tat=critic_total_tat,
+            previous_action=previous_action,
+        )
+        q = torch.cat([q_net(state_action) for q_net in self.q_nets], dim=1)
+        _require_finite("critic.q", q)
+        return EnsembleCriticOutput(q=q)
+
+    def head_value(
         self,
         state,
         action,
@@ -547,12 +582,17 @@ class ContextualTwinCritic(nn.Module):
         *,
         critic_total_tat,
         previous_action=None,
-    ):
-        return self(
+        index: int = 0,
+    ) -> torch.Tensor:
+        """Evaluate a single ensemble member without building the others."""
+        state_action = self._critic_input(
             state,
             action,
             sale_state,
             sale_state_action,
             critic_total_tat=critic_total_tat,
             previous_action=previous_action,
-        ).q1
+        )
+        q = self.q_nets[int(index)](state_action)
+        _require_finite(f"critic.q{int(index) + 1}", q)
+        return q

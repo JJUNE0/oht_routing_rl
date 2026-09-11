@@ -80,12 +80,19 @@ class ContextualRuntimeDiagnosticsMixin:
                 bad_count >= self.config.minimum_sign_sample_count
             ),
         })
-        q1 = self.last_diagnostics.get("critic/q1_mean")
-        q2 = self.last_diagnostics.get("critic/q2_mean")
-        if q1 is not None and q2 is not None:
-            q_mean = 0.5 * (float(q1) + float(q2))
-            if np.isfinite(q_mean):
-                self._phase2_q_means.append(q_mean)
+        # Track the whole ensemble, not the first two heads.
+        ensemble_mean = self.last_diagnostics.get("critic/q_ensemble_mean")
+        if ensemble_mean is not None:
+            q_mean = float(ensemble_mean)
+        else:
+            q1 = self.last_diagnostics.get("critic/q1_mean")
+            q2 = self.last_diagnostics.get("critic/q2_mean")
+            q_mean = (
+                0.5 * (float(q1) + float(q2))
+                if q1 is not None and q2 is not None else None
+            )
+        if q_mean is not None and np.isfinite(q_mean):
+            self._phase2_q_means.append(q_mean)
         for lag in (100, 1_000):
             self.last_diagnostics[f"critic/q_mean_delta_{lag}"] = (
                 self._phase2_q_means[-1] - self._phase2_q_means[-lag - 1]

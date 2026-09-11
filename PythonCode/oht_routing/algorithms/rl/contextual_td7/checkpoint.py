@@ -155,24 +155,36 @@ def _load_normalizer(normalizer, state):
     normalizer.load_state_dict(state)
 
 
-def _twin_state_max_abs_diff(state_dict) -> float:
-    q1 = {
-        key[3:]: value
-        for key, value in state_dict.items()
-        if key.startswith("q1.")
-    }
-    q2 = {
-        key[3:]: value
-        for key, value in state_dict.items()
-        if key.startswith("q2.")
-    }
-    if not q1 or q1.keys() != q2.keys():
+def _ensemble_state_min_pair_max_abs_diff(state_dict) -> float:
+    """Return the closest-pair separation among the saved ensemble heads.
+
+    Zero means two heads are byte-identical. They would then stay identical
+    forever - every head regresses the same target - which collapses the UBOC
+    uncertainty penalty toward the plain ensemble mean.
+    """
+    heads: dict[int, dict[str, object]] = {}
+    for key, value in state_dict.items():
+        if not key.startswith("q_nets."):
+            continue
+        index, _, remainder = key[len("q_nets."):].partition(".")
+        heads.setdefault(int(index), {})[remainder] = value
+    if len(heads) < 2:
         raise ContextualCheckpointError(
-            "checkpoint twin-critic parameter schema is invalid"
+            "checkpoint ensemble-critic parameter schema is invalid"
         )
-    return max(
-        float((q1[key].detach() - q2[key].detach()).abs().max().cpu())
-        for key in q1
+    ordered = [heads[index] for index in sorted(heads)]
+    schema = ordered[0].keys()
+    if not schema or any(head.keys() != schema for head in ordered[1:]):
+        raise ContextualCheckpointError(
+            "checkpoint ensemble-critic parameter schema is invalid"
+        )
+    return min(
+        max(
+            float((left[key].detach() - right[key].detach()).abs().max().cpu())
+            for key in schema
+        )
+        for index, left in enumerate(ordered)
+        for right in ordered[index + 1:]
     )
 
 
@@ -471,17 +483,17 @@ def save_contextual_checkpoint(
 ) -> Path:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    if learner.twin_parameter_diagnostics()[
+    if learner.ensemble_parameter_diagnostics()[
         "critic/parameter_max_abs_diff"
     ] <= 0.0:
         raise ContextualCheckpointError(
-            "refusing to save a symmetric online twin critic"
+            "refusing to save an online critic ensemble with duplicate heads"
         )
-    if _twin_state_max_abs_diff(
+    if _ensemble_state_min_pair_max_abs_diff(
         learner.target_critic.state_dict()
     ) <= 0.0:
         raise ContextualCheckpointError(
-            "refusing to save a symmetric target twin critic"
+            "refusing to save a target critic ensemble with duplicate heads"
         )
     payload = {
         "version": CONTEXTUAL_VERSION,
@@ -494,7 +506,11 @@ def save_contextual_checkpoint(
         "learner_config": asdict(learner.config),
         "action_scale": learner.config.action_scale,
         "applied_action_scale": learner.applied_action_scale,
-        "algorithm_variant": learner.config.algorithm_variant,
+        "algorithm_variant": learner.algorithm_variant,
+        "num_critics": int(learner.network_config.num_critics),
+        "critic_target_mode": learner.config.critic_target_mode,
+        "uboc_beta": float(learner.config.uboc_beta),
+        "actor_q_aggregation": learner.actor_q_aggregation,
         "sale_enabled": learner.config.sale_enabled,
         "lap_enabled": learner.config.lap_enabled,
         "lap_metadata": {
@@ -615,6 +631,11 @@ def load_contextual_checkpoint(
         "action_mode": learner.config.action_mode,
         "sale_enabled": learner.config.sale_enabled,
         "lap_enabled": learner.config.lap_enabled,
+        # The aggregation rule and its coefficient define what the saved
+        # critics were regressing, so resuming under a different one would
+        # continue a different value function from these weights.
+        "critic_target_mode": learner.config.critic_target_mode,
+        "uboc_beta": float(learner.config.uboc_beta),
     }
     for key, value in expected.items():
         saved = payload.get(key)
@@ -627,10 +648,10 @@ def load_contextual_checkpoint(
             f"runtime={value!r}"
         )
     for state_key in ("online_critic", "target_critic"):
-        if _twin_state_max_abs_diff(payload[state_key]) <= 0.0:
+        if _ensemble_state_min_pair_max_abs_diff(payload[state_key]) <= 0.0:
             raise ContextualCheckpointError(
-                "symmetric twin-critic checkpoint resume refused: "
-                f"{state_key} has identical Q1/Q2 parameters"
+                "duplicate-head critic ensemble resume refused: "
+                f"{state_key} holds two identical critic heads"
             )
     learner.encoder.load_state_dict(payload["online_encoder"])
     learner.actor.load_state_dict(payload["online_actor"])
@@ -639,7 +660,7 @@ def load_contextual_checkpoint(
     learner.target_actor.load_state_dict(payload["target_actor"])
     learner.target_critic.load_state_dict(payload["target_critic"])
     learner._distance_diagnostics.update(
-        learner.twin_parameter_diagnostics()
+        learner.ensemble_parameter_diagnostics()
     )
     if learner.config.sale_enabled:
         learner.sale_online.load_state_dict(payload["sale_online"])

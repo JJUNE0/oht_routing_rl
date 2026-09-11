@@ -4,6 +4,28 @@
 # .gitignore 자체는 추적
 !/.gitignore
 !/EXPERIMENTS_v*.md
+!/UD7_START.md
+!/HEADLESS.md
+!/HEADLESS_IMPLEMENTATION_REPORT.md
+!/HEADLESS_PARITY_FIX.md
+!/HEADLESS_REVALIDATION.md
+!/HEADLESS_REVIEW_5_PERCENT.md
+!/GUI_HEADLESS_COMPARISON.md
+!/INPUT_TIME_AUDIT.md
+!/LINUX_SIMULATION_PLAN.md
+!/start_ud7_stage1.cmd
+!/start_ud7_stage2_best.cmd
+!/start_ud7_stage1_headless.cmd
+!/start_ud7_stage2_headless.cmd
+!/tools/
+/tools/*
+!/tools/pinokio/
+/tools/pinokio/*
+!/tools/pinokio/HeadlessProgram.cs
+!/tools/pinokio/HeadlessLoader.cs
+!/tools/pinokio/PatchTransport.cs
+!/tools/pinokio/VerifyFramework.cs
+!/tools/pinokio/build.ps1
 
 # PythonCode 디렉토리만 추적
 !/PythonCode/
@@ -23,9 +45,18 @@ PythonCode/wandb/
 PythonCode/*.db
 PythonCode/*.log
 PythonCode/*.csv
+PythonCode/*.pt
 PythonCode/oht_routing/topology/cache/topology_neighbor_audit.json
 PythonCode/simulator/log/
 PythonCode/simulator/log/*.txt
 PythonCode/tests/
+!PythonCode/tests/
+PythonCode/tests/*
+!PythonCode/tests/test_headless.py
+!PythonCode/tests/test_episode_checkpoints.py
+!PythonCode/tests/test_stage1_finalizer.py
+!PythonCode/tests/test_gui_handshake.py
+!PythonCode/tests/test_evaluate_windows.py
+!PythonCode/tests/test_final_window.py
 PythonCode/oht_routing_rl_v6.zip
 PythonCode/oht_routing_rl_v6_meeting.zip

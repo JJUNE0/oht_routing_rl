@@ -10,6 +10,9 @@ import numpy as np
 
 from oht_dispatching.config import DISPATCH_MODES
 from oht_routing.algorithms.rl.contextual_td7 import (
+    ACTOR_Q_AGGREGATIONS,
+    CRITIC_TARGET_CDQ,
+    CRITIC_TARGET_MODES,
     REPLAY_EVICTION_MODES,
     REPLAY_EVICTION_RANDOM,
     REPLAY_SAMPLING_MODES,
@@ -179,6 +182,26 @@ def _validate_runtime_modes(config: ContextualRuntimeConfig) -> None:
         )
     if config.dispatch_mode not in DISPATCH_MODES:
         raise ValueError(f"dispatch_mode must be one of {DISPATCH_MODES}")
+    if config.critic_target_mode not in CRITIC_TARGET_MODES:
+        raise ValueError(
+            f"critic_target_mode must be one of {CRITIC_TARGET_MODES}"
+        )
+    if not isinstance(config.num_critics, Integral) or config.num_critics < 2:
+        raise ValueError("num_critics must be an integer of at least 2")
+    if (
+        config.critic_target_mode == CRITIC_TARGET_CDQ
+        and int(config.num_critics) != 2
+    ):
+        raise ValueError(
+            "critic_target_mode 'cdq' is the two-critic minimum; pass "
+            "--num-critics 2 or use --critic-target-mode uboc"
+        )
+    if not np.isfinite(config.uboc_beta) or not 0.0 <= config.uboc_beta < 10.0:
+        raise ValueError("uboc_beta must be finite and in [0, 10)")
+    if config.actor_q_aggregation not in ACTOR_Q_AGGREGATIONS:
+        raise ValueError(
+            f"actor_q_aggregation must be one of {ACTOR_Q_AGGREGATIONS}"
+        )
     if (
         config.replay_sampling_mode
         in {REPLAY_SAMPLING_SNAPSHOT, REPLAY_SAMPLING_RANDOM_RAIL}

@@ -11,9 +11,11 @@ import torch
 
 from oht_dispatching.config import DISPATCH_FIRST_MATCH
 from oht_routing.algorithms.rl.contextual_td7 import (
+    CRITIC_TARGET_UBOC,
     DEFAULT_STATE_CAPACITY_MARGIN,
     REPLAY_EVICTION_FIFO,
     REPLAY_SAMPLING_RAIL,
+    UBOC_BETA,
     read_contextual_runtime_config,
 )
 from oht_routing.mdp.action import REGION_B_RL
@@ -30,6 +32,7 @@ from oht_routing.version import CONTEXTUAL_VERSION
 
 
 RESUME_LAUNCH_CONTROL_FIELDS = {
+    "episode_summary_path",
     "mode",
     "action_enabled",
     "reward_version",
@@ -67,6 +70,7 @@ RESUME_LAUNCH_CONTROL_FIELDS = {
     "load_stage1_policy_path",
 }
 _PATH_CONFIG_FIELDS = {
+    "episode_summary_path",
     "load_state_normalizer_path",
     "save_state_normalizer_path",
     "load_stage1_policy_path",
@@ -121,6 +125,7 @@ class ContextualRuntimeConfig:
     latest_checkpoint_interval: int = 1_000
     periodic_checkpoint_interval: int = 5_000
     checkpoint_root: str | None = None
+    episode_summary_path: str | None = None
     resume_checkpoint_path: str | None = None
     load_stage1_policy_path: str | None = None
     resume_inference_until_replay_full: bool = False
@@ -142,6 +147,12 @@ class ContextualRuntimeConfig:
     lap_enabled: bool = True
     use_attention: bool = False
     critic_loss_mode: str = "auto"
+    # UD7 defaults: a five-critic ensemble aggregated by UBOC. Set
+    # critic_target_mode="cdq" with num_critics=2 for the TD7 baseline.
+    num_critics: int = 5
+    critic_target_mode: str = CRITIC_TARGET_UBOC
+    uboc_beta: float = UBOC_BETA
+    actor_q_aggregation: str = "auto"
     early_stop_queued_threshold: float = 500.0
     tat_termination_policy: str = TAT_TERMINATION_REWARD_PROFILE
     tat_termination_start_episode: int | None = None

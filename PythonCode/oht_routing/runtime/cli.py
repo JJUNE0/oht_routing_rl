@@ -10,6 +10,8 @@ from oht_routing.mdp.reward.config import (
     canonical_reward_version,
 )
 from oht_routing.algorithms.rl.contextual_td7 import (
+    ACTOR_Q_AGGREGATIONS,
+    CRITIC_TARGET_MODES,
     REPLAY_EVICTION_MODES,
     REPLAY_SAMPLING_RANDOM_RAIL,
     REPLAY_SAMPLING_RAIL,
@@ -273,6 +275,41 @@ def parse_args():
     parser.add_argument(
         "--critic-loss-mode", choices=("auto", "huber", "mse")
     )
+    parser.add_argument(
+        "--num-critics",
+        type=int,
+        help=(
+            "Size of the critic ensemble. UD7 uses 5; the TD7 clipped "
+            "double-Q baseline requires exactly 2."
+        ),
+    )
+    parser.add_argument(
+        "--critic-target-mode",
+        choices=CRITIC_TARGET_MODES,
+        help=(
+            "Critic aggregation for the Bellman target. 'uboc' is the UD7 "
+            "ensemble mean less beta times its spread; 'cdq' is the TD7 "
+            "two-critic minimum."
+        ),
+    )
+    parser.add_argument(
+        "--uboc-beta",
+        type=float,
+        help=(
+            "UBOC uncertainty coefficient. The default 1/sqrt(pi) keeps the "
+            "clipped double-Q expectation; UD7 ablates 1/(2*sqrt(pi)) and "
+            "2/sqrt(pi)."
+        ),
+    )
+    parser.add_argument(
+        "--actor-q-aggregation",
+        choices=ACTOR_Q_AGGREGATIONS,
+        help=(
+            "Which critics the policy gradient reads. 'auto' follows the "
+            "target mode: the ensemble mean under uboc, the first head "
+            "under cdq."
+        ),
+    )
     parser.add_argument("--wandb-log-interval", type=int)
     parser.add_argument("--console-log-interval", type=int)
     parser.add_argument("--early-stop-queued-threshold", type=float)
@@ -397,5 +434,9 @@ def parse_args():
         "--sim-end-time",
         type=int,
         help="Override PClient's simulator episode end time after every init/reset.",
+    )
+    parser.add_argument(
+        "--episode-summary-path", type=Path,
+        help="Append terminal episode metrics to this JSONL file (headless batches).",
     )
     return parser.parse_args()

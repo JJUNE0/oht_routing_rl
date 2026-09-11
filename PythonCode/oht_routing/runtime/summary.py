@@ -9,6 +9,11 @@ from oht_routing.mdp.observation import (
     OBSERVATION_VERSION,
     RELATION_DIM,
 )
+from oht_routing.algorithms.rl.contextual_td7 import (
+    ACTOR_Q_MEAN,
+    CRITIC_TARGET_UBOC,
+    ContextualLearnerConfig,
+)
 from oht_routing.runtime.console import print_header, print_section
 from oht_routing.runtime.config_validation import make_reward_config
 from oht_routing.runtime.stages import (
@@ -40,6 +45,10 @@ def print_runtime_summary(client):
         if config.resume_inference_until_replay_full
         else "minimum"
     )
+    resolved_actor_aggregation = ContextualLearnerConfig(
+        critic_target_mode=config.critic_target_mode,
+        actor_q_aggregation=config.actor_q_aggregation,
+    ).resolved_actor_q_aggregation
     exploration_end_step = (
         config.effective_warmup_steps
         + config.exploration_noise_anneal_steps
@@ -173,6 +182,32 @@ def print_runtime_summary(client):
                 config.resume_deterministic_first_episode,
             ),
             ("resume warm-start steps", config.resume_warmstart_steps),
+        ),
+    )
+    uboc = config.critic_target_mode == CRITIC_TARGET_UBOC
+    print_section(
+        "critic",
+        (
+            ("algorithm", "UD7 (UBOC)" if uboc else "TD7 (clipped double-Q)"),
+            ("aggregation", config.critic_target_mode),
+            ("critics", config.num_critics),
+            (
+                "target rule",
+                (
+                    f"mean - {config.uboc_beta:.7f} * std  "
+                    f"(beta = 1/sqrt(pi))"
+                    if uboc else "min over the two critics"
+                ),
+            ),
+            (
+                "policy reads",
+                (
+                    "ensemble mean"
+                    if resolved_actor_aggregation == ACTOR_Q_MEAN
+                    else "first critic head"
+                ),
+            ),
+            ("variant", client.algorithm_variant),
         ),
     )
     print_section(

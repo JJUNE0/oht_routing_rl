@@ -126,6 +126,14 @@ RL_RAIL_COST_EXPORT_COLUMNS = {
     "rail_cost/residual_abs_mean",
     "rail_cost/final_cost_mean",
 }
+UD7_EXPORT_COLUMNS = {
+    "critic/q_ensemble_std_mean",
+    "critic/target_ensemble_std_mean",
+    "critic/target_uboc_penalty_mean",
+    "critic/target_vs_min_gap_mean",
+    "critic/q_grad_norm_min",
+    "critic/parameter_pair_l2_mean",
+}
 
 
 if len(WANDB_METRIC_KEYS) != len(set(WANDB_METRIC_KEYS)):
@@ -142,6 +150,8 @@ if not OBSERVATION_EXPORT_COLUMNS <= set(WANDB_METRIC_KEYS):
     raise RuntimeError("observation diagnostics are missing from W&B export schema")
 if not RL_RAIL_COST_EXPORT_COLUMNS <= set(WANDB_METRIC_KEYS):
     raise RuntimeError("RL rail-cost diagnostics are missing from W&B export schema")
+if not UD7_EXPORT_COLUMNS <= set(WANDB_METRIC_KEYS):
+    raise RuntimeError("UD7 ensemble diagnostics are missing from W&B export schema")
 
 EXPORT_COLUMNS = ("_step",) + WANDB_METRIC_KEYS
 EXPORT_SCHEMA_VERSION = EXP_META["version"]

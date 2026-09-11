@@ -5,6 +5,8 @@ from __future__ import annotations
 from datetime import datetime
 
 from oht_routing.algorithms.rl.contextual_td7 import (
+    CRITIC_TARGET_UBOC,
+    ContextualLearnerConfig,
     REPLAY_EVICTION_FIFO,
     contextual_algorithm_variant,
 )
@@ -196,21 +198,21 @@ EXP_META = {
     "distributed_runtime": "central_gpu_owner_with_independent_collectors",
     "distributed_live_replay": "central_packed_ram",
     "distributed_inference": "deadline_bounded_dynamic_microbatch",
-    "note": "rewardq_delaybudget",
+    "note": "ud7",
     "description": (
-        "Reward Q rebalances per-rail credit onto measured delay: on Stage 2 "
-        "the delay terms (StopTime, density, rail-cycle outcome) carry 50.1% "
-        "of the budget against 3.3% under Reward P, TAT falls to 29.9% by "
-        "dilution, and the predicted-traffic forecast falls to 2.6% because "
-        "that signal is accurate about demand rather than congestion and is "
-        "already an observation feature. The increase is routed through "
-        "density (OHT per rail metre, weight 5.5) and the rail-cycle outcome "
-        "(weight 660, clip 22.0, neutral 2.0->1.70 at the measured "
-        "route-ratio median) rather than through StopTime, which is lowered "
-        "0.60->0.30 because it fires on 0.94% of rail-steps and otherwise "
-        "supplies three quarters of the local variance. Global backlog and "
-        "idle coefficients, observations, networks, replay, action mapping, "
-        "and routing are unchanged; tat_weight moves 4.3->4.0."
+        "UD7: the critic Bellman target drops the clipped double-Q minimum "
+        "over two critics for the UBOC aggregation over N critics, "
+        "mean - beta * unbiased_std with beta = 1/sqrt(pi) = 0.5641896 and "
+        "N = 5. The penalty scales with how much the ensemble still "
+        "disagrees, so it is largest early and fades as the critics "
+        "converge; the value clip now applies to that aggregate rather than "
+        "per critic, because the minimum commutes with a shared clamp but "
+        "the mean and spread do not. The policy gradient reads the ensemble "
+        "mean instead of the first head. Everything else is the v9 "
+        "contract: SALE, LAP, decoupled encoders, delayed policy updates, "
+        "target policy smoothing, observations, action mapping, replay and "
+        "reward are unchanged. Pass --critic-target-mode cdq --num-critics "
+        "2 for the TD7 baseline arm."
     ),
 }
 
@@ -699,6 +701,15 @@ WANDB_METRIC_KEYS = (
     "critic/q_abs_diff_mean",
     "critic/td_error_mean",
     "critic/td_error_max",
+    # UBOC mechanism: the ensemble spread is the uncertainty, beta times it is
+    # the correction actually applied, and the gap against the ensemble
+    # minimum is the optimism UBOC buys back over clipped double-Q.
+    "critic/q_ensemble_std_mean",
+    "critic/target_ensemble_std_mean",
+    "critic/target_uboc_penalty_mean",
+    "critic/target_vs_min_gap_mean",
+    "critic/q_grad_norm_min",
+    "critic/parameter_pair_l2_mean",
     "grad/encoder_norm",
     "grad/critic_norm",
     "learner/actor_updates_total",
@@ -831,7 +842,18 @@ def runtime_exp_meta(config) -> dict:
     sale = bool(config.sale_enabled)
     lap = bool(config.lap_enabled)
     action_mode = str(config.action_mode)
-    meta["algorithm_variant"] = contextual_algorithm_variant(sale, lap)
+    actor_q_aggregation = ContextualLearnerConfig(
+        critic_target_mode=config.critic_target_mode,
+        actor_q_aggregation=config.actor_q_aggregation,
+    ).resolved_actor_q_aggregation
+    meta["num_critics"] = int(config.num_critics)
+    meta["critic_target_mode"] = str(config.critic_target_mode)
+    meta["uboc_beta"] = float(config.uboc_beta)
+    meta["actor_q_aggregation"] = actor_q_aggregation
+    meta["actor_q_aggregation_configured"] = str(config.actor_q_aggregation)
+    meta["algorithm_variant"] = contextual_algorithm_variant(
+        sale, lap, config.critic_target_mode, config.num_critics
+    )
     meta["use_attention"] = bool(config.use_attention)
     meta["neighbor_aggregation"] = (
         "directional_cross_attention"
@@ -846,7 +868,9 @@ def runtime_exp_meta(config) -> dict:
     )
     meta["distributed_enabled"] = bool(config.num_sim > 1)
     meta["note"] = (
-        f"{meta['note']}_r{contract.version}_s{int(config.num_stacks)}i"
+        f"{meta['note']}_{config.critic_target_mode}"
+        f"{int(config.num_critics)}"
+        f"_r{contract.version}_s{int(config.num_stacks)}i"
         f"{int(config.stack_interval)}_dispatch_"
         f"{str(config.dispatch_mode).replace('-', '_')}_normreuse"
         f"{int(config.state_normalizer_warmup_bypass)}_b"
@@ -1076,7 +1100,13 @@ def runtime_exp_meta(config) -> dict:
         f"rail_cost_formula={meta['rail_cost_formula']}, "
         f"critic_loss={config.critic_loss_mode}, "
         f"neighbor_aggregation={meta['neighbor_aggregation']}, "
-        "independently initialized Q1/Q2 heads, "
+        f"critic_target={config.critic_target_mode} over "
+        f"{int(config.num_critics)} independently initialized heads"
+        + (
+            f" (beta={float(config.uboc_beta):.7f})"
+            if config.critic_target_mode == CRITIC_TARGET_UBOC else ""
+        )
+        + f", policy_reads={actor_q_aggregation}, "
         f"reward {contract.version} (global/local="
         f"{reward_config.global_alpha:g}/{reward_config.local_alpha:g}), "
         f"tat_signal={contract.tat_signal_description}, "

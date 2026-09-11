@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+import math
 from pathlib import Path
 from typing import Mapping
 
@@ -399,7 +400,7 @@ class ContextualObservationBuilder:
     @staticmethod
     def _finite_nonnegative(value, *, name: str) -> float:
         result = float(value or 0.0)
-        if not np.isfinite(result) or result < 0.0:
+        if not math.isfinite(result) or result < 0.0:
             raise ObservationContractError(
                 f"{name} must be finite and non-negative, got {result}"
             )

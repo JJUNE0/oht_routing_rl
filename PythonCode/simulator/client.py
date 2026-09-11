@@ -20,7 +20,7 @@ class PClient:
        BUFFER_SIZE= int(8912);
        RAILINE_COUNT = 0;
        OHT_COUNT =0;
-       RECV_TIMEOUT = 60      # recv 무응답 감지 주기(초). 초과해도 연결은 유지하고 로그만 남긴다(진단용).
+       RECV_TIMEOUT = 60      # Diagnostics interval; incomplete/active messages fail after 180s.
        LAST_V = -1            # 마지막으로 읽은 명령 바이트(hang 진단 로그용)
        TOTAL_BYTES_READ = 0   # 세션 누적 수신 바이트(스트림 위치 추적용)
        MESSAGE_FILE_PATH = "C:\\PINOKIO\\PYTHON_MESSAGE.txt";
@@ -297,7 +297,9 @@ class PClient:
 
 
        def RecieveEndSim(self):
-           recieveMessage = self.RecieveMessage(1);
+           # The GUI can spend minutes loading a model or selecting output files.
+           # This is safe only before a new command, never inside a packet.
+           recieveMessage = self.RecieveMessage(1, allow_idle=self.LAST_V in (-1, 1, 2));
            self.LAST_V = recieveMessage[0];
            return recieveMessage[0];
 
@@ -1467,7 +1469,7 @@ class PClient:
 
             return byteArr;
 
-       def RecieveMessage(self, bufferSize):
+       def RecieveMessage(self, bufferSize, *, allow_idle=False):
           rebufferSize = bufferSize;
           returnData  =bytes();
 
@@ -1482,7 +1484,9 @@ class PClient:
                 # recv 무응답. 어느 recv가 몇 바이트 받고 멈췄는지 기록.
                 waited += self.RECV_TIMEOUT;
                 got = bufferSize - rebufferSize;
-                hangmsg = ("[HANG] RecieveMessage 대기 " + str(waited) + "s — 요청 "
+                idle = allow_idle and got == 0
+                label = "[WAIT: GUI Open Files / next episode]" if idle else "[HANG]"
+                hangmsg = (label + " RecieveMessage 대기 " + str(waited) + "s — 요청 "
                            + str(bufferSize) + "B 중 " + str(got) + "B 수신 후 멈춤 (마지막 v="
                            + str(self.LAST_V) + ", 세션누적수신=" + str(self.TOTAL_BYTES_READ) + "B).");
                 print(hangmsg);
@@ -1490,7 +1494,7 @@ class PClient:
                     self.WriteAdminLog(hangmsg);
                 except Exception:
                     pass
-                if waited >= 180:
+                if waited >= 180 and not idle:
                     # 180s 무응답 = 진짜 hang(대개 desync로 시뮬이 더 못 보내는 상태). 영원히 붙잡지 말고
                     # 예외 → main의 except가 소켓 닫고 재접속(동료 코드처럼 회복).
                     raise RuntimeError("RecieveMessage 180s 무응답 — desync 의심, 재접속 (마지막 v=" + str(self.LAST_V) + ")")
@@ -1508,7 +1512,8 @@ class PClient:
             rebufferSize = rebufferSize -len(data)
             returnData =returnData + data ;
             self.TOTAL_BYTES_READ += len(data);
-            count + 1;
+            count += 1;
+            waited = 0;
           if (count >= 2):
               self.secData["Count 3 통신 Error"] = count;
           return returnData;

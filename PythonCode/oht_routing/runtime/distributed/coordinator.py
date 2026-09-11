@@ -173,7 +173,10 @@ class CentralTrainingCoordinator:
 
     def _checkpoint_variant(self) -> str:
         algorithm = contextual_algorithm_variant(
-            self.config.sale_enabled, self.config.lap_enabled
+            self.config.sale_enabled,
+            self.config.lap_enabled,
+            self.config.critic_target_mode,
+            self.config.num_critics,
         )
         return (
             f"ctx_td7_{CONTEXTUAL_VERSION}_dist{self.num_workers}_"
@@ -385,10 +388,14 @@ class CentralTrainingCoordinator:
             sale_enabled=self.config.sale_enabled,
             lap_enabled=self.config.lap_enabled,
             critic_loss_mode=self.config.critic_loss_mode,
+            critic_target_mode=self.config.critic_target_mode,
+            uboc_beta=self.config.uboc_beta,
+            actor_q_aggregation=self.config.actor_q_aggregation,
         )
         network_config = ContextualNetworkConfig(
             num_rails=len(topology.all_rail_ids),
             neighbor_count=int(topology.incoming_neighbor_ids.shape[1]),
+            num_critics=self.config.num_critics,
             num_stacks=self.config.num_stacks,
             stack_interval=self.config.stack_interval,
             use_attention=self.config.use_attention,

@@ -17,10 +17,12 @@ from oht_routing.algorithms.rl.contextual_td7 import (
     ContextualActor,
     ContextualLearnerConfig,
     ContextualNetworkConfig,
+    CRITIC_TARGET_UBOC,
     ContextualObservationHistory,
     ContextualStepReplayBuffer,
     ContextualTD7Learner,
     DirectionalContextEncoder,
+    REPLAY_SAMPLING_RANDOM_RAIL,
     REPLAY_SAMPLING_RAIL,
     REPLAY_SAMPLING_SNAPSHOT,
     contextual_algorithm_variant,
@@ -60,6 +62,7 @@ from oht_routing.runtime.diagnostics import ContextualRuntimeDiagnosticsMixin
 from oht_routing.runtime.config import ContextualRuntimeConfig
 from oht_routing.runtime.config_validation import make_reward_config
 from oht_routing.runtime.stages import (
+    STAGE_ONE,
     STAGE_TWO,
     STAGE_TWO_STAGE1_POLICY_STEPS,
 )
@@ -118,6 +121,14 @@ class _InferenceReplayContext:
         self.rng = np.random.default_rng(seed)
 
 
+# Abbreviated like the free-flow-residual action tag, to keep the checkpoint
+# directory name inside the Windows path budget.
+_SAMPLING_MODE_TAGS = {
+    REPLAY_SAMPLING_RANDOM_RAIL: "rrail",
+    REPLAY_SAMPLING_SNAPSHOT: "snap",
+}
+
+
 class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
     def __init__(self, config: ContextualRuntimeConfig | None = None):
         self.config = config or ContextualRuntimeConfig()
@@ -130,6 +141,7 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
         ):
             torch.manual_seed(self.config.seed)
             network_config = ContextualNetworkConfig(
+                num_critics=self.config.num_critics,
                 num_stacks=self.config.num_stacks,
                 stack_interval=self.config.stack_interval,
                 use_attention=self.config.use_attention,
@@ -235,7 +247,10 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
     @property
     def algorithm_variant(self):
         return contextual_algorithm_variant(
-            self.config.sale_enabled, self.config.lap_enabled
+            self.config.sale_enabled,
+            self.config.lap_enabled,
+            self.config.critic_target_mode,
+            self.config.num_critics,
         )
 
     @property
@@ -262,15 +277,27 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
             if self.config.action_mode == FREE_FLOW_RESIDUAL
             else self.config.action_mode
         )
+        sampling_tag = _SAMPLING_MODE_TAGS.get(
+            self.config.replay_sampling_mode,
+            self.config.replay_sampling_mode,
+        )
+        # The aggregation rule names the algorithm and the ensemble size
+        # changes the critic, so both belong in the directory name: a UBOC run
+        # and a clipped double-Q run must not share a checkpoint tree.
+        family = (
+            "ud7" if self.config.critic_target_mode == CRITIC_TARGET_UBOC
+            else "td7"
+        ) + f"q{int(self.config.num_critics)}"
         return (
-            f"ctx_td7_{CONTEXTUAL_VERSION}_s{int(self.config.sale_enabled)}_"
+            f"ctx_{family}_{CONTEXTUAL_VERSION}_"
+            f"s{int(self.config.sale_enabled)}_"
             f"l{int(self.config.lap_enabled)}_"
             f"a{int(self.config.use_attention)}_"
             f"g{self.config.stage or 0}_"
             f"k{self.config.num_stacks}_i{self.config.stack_interval}_"
             f"r{self.config.reward_version}_"
             f"{action_mode_tag}_"
-            f"{self.config.replay_sampling_mode}_"
+            f"{sampling_tag}_"
             f"e{self.config.replay_eviction_mode}_"
             f"c{self.config.curriculum_scale_start:g}-"
             f"{self.config.curriculum_scale_end:g}-"
@@ -417,10 +444,14 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
             sale_enabled=self.config.sale_enabled,
             lap_enabled=self.config.lap_enabled,
             critic_loss_mode=self.config.critic_loss_mode,
+            critic_target_mode=self.config.critic_target_mode,
+            uboc_beta=self.config.uboc_beta,
+            actor_q_aggregation=self.config.actor_q_aggregation,
         )
         network_config = ContextualNetworkConfig(
             num_rails=len(self.topology.all_rail_ids),
             neighbor_count=int(self.topology.incoming_neighbor_ids.shape[1]),
+            num_critics=self.config.num_critics,
             num_stacks=self.config.num_stacks,
             stack_interval=self.config.stack_interval,
             use_attention=self.config.use_attention,
@@ -1026,6 +1057,9 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
         )
 
     def Reset(self, pclient):
+        # Some simulator sessions send reset without a preceding v=1.
+        # Use cached diagnostics: PClient has already read the new handshake.
+        self._save_stage1_episode_end()
         if (
             getattr(self, "_resume_warmstart_episode_active", False)
             and self.episode_steps > 0
@@ -1108,8 +1142,48 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
 
     def on_terminal(self):
         """Record terminal signal; no terminal state is available at protocol v=1."""
+        self._save_stage1_episode_end()
+        if self.config.episode_summary_path and self.episode_steps > 0:
+            from oht_routing.runtime.episode_results import write_episode_result
+            identity = (self.episode_id, self.total_steps)
+            if getattr(self, "_last_episode_summary", None) != identity:
+                write_episode_result(
+                    self.config.episode_summary_path, self.config,
+                    self.last_diagnostics, self.episode_id, self.total_steps,
+                    self.episode_steps, self.training_failed,
+                )
+                self._last_episode_summary = identity
         if self.transition_aligner is not None:
             self.last_diagnostics["transition/terminal_without_observation"] = 1.0
+
+    def _save_stage1_episode_end(self):
+        if (self.config.stage != STAGE_ONE or self.config.mode != "training"
+                or self.learner is None or self.training_failed
+                or self.episode_steps <= 0 or not self.last_diagnostics):
+            return
+        from oht_routing.runtime.episode_checkpoints import episode_selection, save_episode
+        metadata = self._runtime_checkpoint_metadata("episode_end")
+        metadata["episode_end"] = episode_selection(
+            diagnostics=self.last_diagnostics, episode_steps=self.episode_steps,
+            total_steps=self.total_steps, warmup_steps=self.config.effective_warmup_steps,
+            sim_end_time=self.config.sim_end_time,
+            normalizers_ready=self._state_normalizers_ready_for_bypass(),
+            learner_updates=self.learner.learner_update_count,
+        )
+
+        def write(path, runtime_metadata):
+            save_contextual_checkpoint(
+                path, self.learner, observation_builder=self.observation_builder,
+                reward_builder=self.reward_builder, runtime_metadata=runtime_metadata,
+                runtime_config=asdict(self.config), exploration_rng=self.exploration_rng,
+            )
+
+        try:
+            self.last_checkpoint_path = save_episode(self.checkpoint_root, metadata, write)
+        except Exception as error:
+            # Do not silently reset into another episode after losing its model.
+            self._enter_training_failure(error)
+            raise ContextualTrainingFailure("Stage 1 episode checkpoint save failed") from error
 
     def capture_environment_tick(self, pclient):
         if (
@@ -1209,6 +1283,11 @@ class ClientAlgorithm(ContextualRuntimeDiagnosticsMixin):
             return 1.0
         if self.config.action_mode == EXP_RESIDUAL:
             return float(self.config.action_scale)
+        if self.config.mode == "actor_inference" and self.checkpoint_loaded:
+            # An evaluated checkpoint is a fixed policy. Recomputing the
+            # curriculum after warmup bypass changes its scale immediately,
+            # and advancing evaluation ticks would keep changing it again.
+            return float(self.learner.applied_action_scale)
         start = int(self.config.effective_warmup_steps)
         end = int(self.config.curriculum_end_step)
         scale_start = float(self.config.curriculum_scale_start)

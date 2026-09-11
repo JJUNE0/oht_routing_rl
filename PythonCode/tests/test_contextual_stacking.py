@@ -13,7 +13,7 @@ from oht_routing.algorithms.rl.contextual_td7 import (
     ContextualStepReplayBuffer,
     ContextualTD7Learner,
     ContextualActor,
-    ContextualTwinCritic,
+    ContextualEnsembleCritic,
     interleave_state_action,
 )
 from oht_routing.algorithms.rl.contextual_td7.replay_buffer import (
@@ -273,7 +273,7 @@ class ContextualStackingTests(unittest.TestCase):
         torch.testing.assert_close(first[:, -1], action[0])
 
         actor = ContextualActor(config)
-        critic = ContextualTwinCritic(config)
+        critic = ContextualEnsembleCritic(config)
         actor_output = actor(state, previous_action=previous_action)
         critic_total_tat = torch.arange(
             2 * config.num_stacks * config.critic_extra_dim,
@@ -286,8 +286,10 @@ class ContextualStackingTests(unittest.TestCase):
             previous_action=previous_action,
         )
         self.assertEqual(actor_output.action.shape, (2, 1))
-        self.assertEqual(critic_output.q1.shape, (2, 1))
-        self.assertEqual(critic.q1.network[0].in_features, config.critic_input_dim)
+        self.assertEqual(critic_output.q.shape, (2, config.num_critics))
+        self.assertEqual(
+            critic.q_nets[0].network[0].in_features, config.critic_input_dim
+        )
 
     def test_stacked_sale_learner_update_smoke(self):
         replay = stacked_replay(capacity=10, count=10)

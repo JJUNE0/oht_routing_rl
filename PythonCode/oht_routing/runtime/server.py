@@ -1,6 +1,8 @@
 """TCP server lifecycle for the contextual simulator protocol."""
 
 import socket
+import os
+from pathlib import Path
 import traceback
 from datetime import datetime
 
@@ -47,6 +49,14 @@ def _run_session(connection, address, port, client):
     )
     print(message)
     pclient.WriteAdminLog(message)
+    if pclient.RAILINE_COUNT == 0:
+        print(
+            "[contextual-runtime] connected without a model (rails=0). "
+            "In the GUI Python TCP/IP tab, use Open Files and select the "
+            "single-input FOLDER. Its batch run sends the model reset; "
+            "ordinary Open/Run does not. Waiting for model initialization.",
+            flush=True,
+        )
 
     command_count = 0
     while True:
@@ -63,14 +73,35 @@ def _run_session(connection, address, port, client):
                 f"[DESYNC] unexpected v={command}; "
                 f"pending={len(pending)}B: {preview}"
             )
+        if command in (0, 3, 4, 5, 6) and pclient.RAILINE_COUNT == 0:
+            raise ConnectionError(
+                "[MODEL NOT LOADED] GUI sent an active frame with rails=0. "
+                "Stop this GUI run and restart Python. Enable TCP/IP, then "
+                "use Open Files to select the single-input FOLDER; do not "
+                "use ordinary Open followed by Run. No policy step was run."
+            )
         handle_command(command, pclient, client)
+        if command == 1 and os.environ.get("PINOKIO_HEADLESS") == "1":
+            # The headless host owns exactly one episode per connection.
+            # Save terminal artifacts first, then close without an expected
+            # ConnectionResetError traceback. GUI sessions still reuse TCP.
+            return
 
 
 def _accept_sessions(server, port, client):
+    stop_file = os.environ.get("PINOKIO_STOP_FILE")
     while True:
         print(datetime.now().strftime("%Y.%m.%d - %H:%M:%S"))
         print(f"[contextual-runtime] waiting on {HOST}:{port}")
-        connection, address = server.accept()
+        while True:
+            if stop_file and Path(stop_file).is_file():
+                return
+            try:
+                connection, address = server.accept()
+                break
+            except socket.timeout:
+                if not stop_file:
+                    raise
         with connection:
             try:
                 _run_session(connection, address, port, client)
@@ -97,6 +128,8 @@ def serve_contextual(client, port=None):
     _configure_listener_socket(server)
     server.bind((HOST, port))
     server.listen(1)
+    if os.environ.get("PINOKIO_STOP_FILE"):
+        server.settimeout(1.0)
     capture_status = "stopped"
     try:
         _accept_sessions(server, port, client)

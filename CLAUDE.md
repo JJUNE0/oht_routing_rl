@@ -31,7 +31,7 @@ run_{MMDD_HHMM}_{version}_{cost_structure}_{action_range}_{reward_version}_{note
 - 모든 코드·실험 변경은 `vMAJOR.MINOR.PATCH` 버전으로
   분리하고 현재 major와 같은 `EXPERIMENTS_v{MAJOR}.md`에
   해당 버전의 새 `##` 섹션을 만들어 기록한다. 현재 기록 파일은
-  `EXPERIMENTS_v3.md`다.
+  `EXPERIMENTS_v10.md`다.
 - `CONTEXTUAL_VERSION`의 MAJOR를 올릴 때는 다른 변경을 기록하기 전에
   루트에 `EXPERIMENTS_v{new_major}.md`를 새로 만들고, 새 major의 모든
   기록은 그 파일에만 작성한다. 이전 major 파일은 이력으로 보존한다.

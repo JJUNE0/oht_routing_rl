@@ -79,8 +79,9 @@ def run_variant(sale, lap, device, updates, benchmark_iterations):
         minimum_action_enabled_env_steps=1,
         require_normalizer_frozen=False,
     )
+    network_config = ContextualNetworkConfig()
     learner = ContextualTD7Learner(
-        replay, network_config=ContextualNetworkConfig(),
+        replay, network_config=network_config,
         config=config, device=device, seed=2612,
     )
     losses = []
@@ -91,7 +92,9 @@ def run_variant(sale, lap, device, updates, benchmark_iterations):
     synchronize(device)
     smoke_seconds = time.perf_counter() - started
     if not np.isfinite(losses).all():
-        raise FloatingPointError(f"{config.algorithm_variant}: non-finite loss")
+        raise FloatingPointError(
+            f"{learner.algorithm_variant}: non-finite loss"
+        )
 
     benchmarks = {}
     for batch_size in (256, 512, 1024):
@@ -132,9 +135,11 @@ def run_variant(sale, lap, device, updates, benchmark_iterations):
             if device.type == "cuda" else 0.0
         )
     result = {
-        "algorithm_variant": config.algorithm_variant,
+        "algorithm_variant": learner.algorithm_variant,
         "sale_enabled": sale,
         "lap_enabled": lap,
+        "num_critics": int(network_config.num_critics),
+        "critic_target_mode": config.critic_target_mode,
         "critic_loss_mode": config.resolved_critic_loss_mode,
         "updates": updates,
         "benchmark_updates": benchmark_iterations * 3,
