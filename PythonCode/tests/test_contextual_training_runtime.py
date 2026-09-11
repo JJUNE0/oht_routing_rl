@@ -1,4 +1,6 @@
 import copy
+import csv
+import sys
 import tempfile
 import unittest
 from dataclasses import replace
@@ -491,6 +493,133 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
             },
         )
         self.assertEqual(captured["step"], 400_010)
+
+    def test_final_tat_is_sparse_and_uses_explicit_episode_step(self):
+        config = ContextualRuntimeConfig(
+            mode="actor_inference", wandb_enabled=True, device="cpu"
+        )
+        calls = []
+
+        class Run:
+            def __init__(self):
+                self.summary = {}
+
+            def log(self, payload, step):
+                calls.append((payload, step))
+
+            def finish(self):
+                pass
+
+        with patch.dict("sys.modules", {"wandb": SimpleNamespace(init=lambda **_: Run())}):
+            logger = ContextualWandbLogger(config)
+        logger.log_episode_final(final_tat=172.5, step=42)
+        self.assertEqual(calls, [({"eval/final_tat": 172.5}, 42)])
+        self.assertEqual(set(logger.metric_keys) & {"eval/final_tat"}, {"eval/final_tat"})
+
+    def test_acceleration_rate_is_simulated_delta_over_episode_wall_time(self):
+        runtime, pclient = training_runtime(
+            mode="actor_inference", warmup_steps=0,
+            normalizer_freeze_steps=1, wandb_log_interval=100,
+        )
+        with patch("oht_routing.runtime.client.time.perf_counter", return_value=100.0):
+            pclient.SimTime = 10.0
+            runtime.Algorithm(pclient)
+        self.assertEqual(runtime._episode_wall_start, 100.0)
+        with patch("oht_routing.runtime.client.time.perf_counter", return_value=102.0):
+            pclient.SimTime = 20.0
+            runtime.Algorithm(pclient)
+        self.assertAlmostEqual(runtime.last_diagnostics["runtime/acceleration_rate"], 5.0)
+        runtime.Reset(pclient)
+        self.assertIsNone(runtime._episode_wall_start)
+        self.assertIsNone(runtime._episode_sim_start)
+        with patch("oht_routing.runtime.client.time.perf_counter", return_value=1000.0):
+            pclient.SimTime = 0.0
+            runtime.Algorithm(pclient)
+        self.assertEqual(runtime._episode_wall_start, 1000.0)
+        runtime.on_new_connection()
+        self.assertIsNone(runtime._episode_wall_start)
+        self.assertIsNone(runtime._episode_sim_start)
+
+    def test_final_tat_terminal_reset_fallback_is_once_and_complete_only(self):
+        runtime, pclient = training_runtime(mode="actor_inference")
+        calls = []
+        runtime.wandb_logger.log_episode_final = lambda **kwargs: calls.append(kwargs)
+        runtime.episode_steps = 3
+        runtime.total_steps = 3
+        runtime.last_diagnostics = {
+            "env/sim_time": runtime.config.sim_end_time,
+            "env/tat": 181.0,
+            "termination/done": 0.0,
+            "termination/by_warmup": 0.0,
+            "termination/by_resume_warmstart": 0.0,
+        }
+        runtime.on_terminal()
+        runtime.on_terminal()
+        self.assertEqual(len(calls), 1)
+        runtime.Reset(pclient)
+        self.assertEqual(len(calls), 1)
+
+        # A complete episode with no v=1 must still log when Reset arrives.
+        runtime.episode_steps = 3
+        runtime.total_steps = 6
+        runtime.last_diagnostics = {
+            "env/sim_time": runtime.config.sim_end_time - 1,
+            "env/tat": 175.0,
+        }
+        runtime.Reset(pclient)
+        self.assertEqual(calls[-1], {"final_tat": 175.0, "step": 6})
+        self.assertEqual(len(calls), 2)
+
+        runtime.episode_steps = 2
+        runtime.total_steps = 8
+        runtime.last_diagnostics = {
+            "env/sim_time": runtime.config.sim_end_time - 10,
+            "env/tat": 181.0,
+            "termination/done": 1.0,
+        }
+        runtime.Reset(pclient)
+        self.assertEqual(len(calls), 2)
+
+        runtime.config = replace(runtime.config, mode="training")
+        runtime.episode_steps = 2
+        runtime.total_steps = 10
+        full = {"env/sim_time": runtime.config.sim_end_time - 1, "env/tat": 170.0}
+        for changes in ({"env/tat": float("nan")}, {"env/tat": 0.0},
+                        {"env/sim_time": float("inf")}, {"termination/done": 1},
+                        {"termination/by_warmup": 1}, {"termination/by_resume_warmstart": 1}):
+            with self.subTest(changes=changes):
+                runtime.last_diagnostics = {**full, **changes}
+                runtime._log_episode_final_if_complete()
+                self.assertEqual(len(calls), 2)
+        runtime.last_diagnostics = full
+        runtime.training_failed = True
+        runtime._log_episode_final_if_complete()
+        self.assertEqual(len(calls), 2)
+        runtime.training_failed = False
+        runtime._log_episode_final_if_complete()
+        self.assertEqual(calls[-1], {"final_tat": 170.0, "step": 10})
+
+    def test_exporter_raw_scan_preserves_sparse_and_regular_rows(self):
+        from oht_routing.utils import export_wandb_run as exporter
+
+        rows = [{"_step": 1, "env/step": 1}, {"_step": 2, "eval/final_tat": 181.0}]
+
+        class Api:
+            def run(self, _):
+                return SimpleNamespace(scan_history=lambda: iter(rows))
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "out.csv"
+            fake_wandb = SimpleNamespace(Api=lambda: Api())
+            with patch.dict("sys.modules", {"wandb": fake_wandb}), patch.object(
+                sys, "argv", ["export", "entity/project/run", "--output", str(output)]
+            ):
+                exporter.main()
+            with output.open(newline="", encoding="utf-8-sig") as stream:
+                exported = list(csv.DictReader(stream))
+        self.assertEqual(len(exported), 2)
+        self.assertEqual(exported[0]["eval/final_tat"], "")
+        self.assertEqual(exported[1]["eval/final_tat"], "181.0")
 
     def test_rich_compatibility_diagnostics_stay_out_of_compact_wandb(self):
         runtime, pclient = training_runtime(
@@ -2187,6 +2316,7 @@ class ContextualTrainingRuntimeTests(unittest.TestCase):
     def test_wandb_schema_matches_export_and_runtime_config(self):
         self.assertEqual(set(WANDB_METRIC_KEYS), set(EXPORT_COLUMNS) - {"_step"})
         expected = {
+            "eval/final_tat", "runtime/acceleration_rate",
             "env/step", "env/episode", "episode/step", "env/sim_time",
             "stage/id", "stage/active_policy",
             "stage1/active", "stage1/remaining_steps",

@@ -1,5 +1,26 @@
 # Contextual TD7 experiment history — V10
 
+## v10.7.0 — Log episode final TAT and simulation acceleration in W&B
+
+- Add sparse `eval/final_tat` (seconds) at completed episode boundaries and
+  `runtime/acceleration_rate` (simulated seconds / wall seconds) at the existing
+  W&B logging cadence. The TAT source is the last active simulator packet;
+  the separate result-DB evaluation window is unchanged.
+- Measure acceleration from the first active packet of each episode, excluding
+  GUI connection/model-loading waits. Include simulator execution, policy/learner
+  work and TCP waits while the episode runs; reset the clock for every episode.
+- Keep terminal-only metrics sparse in CSV exports: scan history without a
+  required-key intersection, then project the configured export columns.
+- Delegate implementation and regression tests to gpt-5.6-luna; root reviews
+  metric semantics, export/step behavior, documentation and PR integration.
+- Preserve checkpoint/reward/simulation behavior and the running training
+  process. New logging applies when a Python controller starts with this code.
+- Validation: 62 runtime/headless tests and 26 subtests pass. Cover sparse
+  terminal logging, duplicate/Reset-only ends, invalid/failed/early boundaries,
+  first-packet timing and episode/reconnection resets, and CSV row preservation.
+  Both training and actor-inference schemas contain the new keys; export has
+  221 columns. No online W&B run or simulator rollout was started for this change.
+
 ## v10.6.5 — Package the validated headless release for GitHub
 
 - Branch from contextual-td7-v9 as headless, including the UD7 prerequisites,

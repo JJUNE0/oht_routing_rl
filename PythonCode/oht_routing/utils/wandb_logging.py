@@ -228,6 +228,7 @@ def _make_run_name(exp_meta):
 
 WANDB_METRIC_KEYS = (
     "env/step", "env/episode", "env/sim_time", "env/tat", "env/operation_rate",
+    "eval/final_tat", "runtime/acceleration_rate",
     "env/queued", "env/waiting", "env/transferring", "env/completed",
     "env/termination_reason", "episode/step",
     "stage/id", "stage/active_policy",
@@ -546,6 +547,8 @@ WANDB_METRIC_KEYS = (
     "env/step",
     "env/episode",
     "episode/step",
+    "eval/final_tat",
+    "runtime/acceleration_rate",
     "stage/id",
     "stage/active_policy",
     "stage1/active",
@@ -1189,6 +1192,12 @@ class ContextualWandbLogger:
             if key in diagnostics
         }
         self.run.log(payload, step=int(step))
+
+    def log_episode_final(self, *, final_tat, step):
+        """Log one sparse final TAT value for a complete eval episode."""
+        if self.run is None or final_tat is None:
+            return
+        self.run.log({"eval/final_tat": float(final_tat)}, step=int(step))
 
     def _finish(self, status, *, reason=None, step=None):
         if self.run is None or self._finished:

@@ -106,6 +106,20 @@ Ctrl+C는 이 실행기가 시작한 자식 프로세스만 종료하고, 완료
 CSV의 TAT는 종료 직전 마지막 active packet의 `TotalTat`입니다.
 종료 신호 자체에는 최종 관측이 없습니다. `full_horizon`과 `early_termination`을
 함께 확인해야 하며, 학습 중 lowest TAT가 무노이즈 평가에서도 최저임을 보장하지 않습니다.
+
+v10.7.0부터 W&B에는 다음 두 지표도 기록합니다.
+
+- `eval/final_tat`: 정상 완주한 에피소드의 마지막 active packet TAT(초).
+  종료 때 한 번만 기록하며, 중간 tick에는 값을 채우지 않습니다.
+  이 값은 위의 에피소드 TAT이며 `evaluate.py`의 12시간 구간 점수와 구분합니다.
+- `runtime/acceleration_rate`: 에피소드 첫 active packet 이후 진행한 시뮬레이션
+  초를 실제 경과 초로 나눈 배수입니다. `10`이면 실제 1초 동안 시뮬레이션이
+  10초 진행했다는 뜻입니다. 기존 W&B 주기로 기록하고 에피소드마다 초기화합니다.
+  GUI 연결·DB 로딩 대기는 제외하고 실행 중 Python 연산·TCP 대기는 포함합니다.
+
+이미 실행 중인 Python에는 코드가 자동 반영되지 않으며, 새 실행부터 적용됩니다.
+CSV export는 terminal 지표가 없는 중간 행도 보존하고 해당 열을 빈칸으로 둡니다.
+
 최종 목표 비교에는 `eval_tat_s`를 사용합니다. baseline은 174.4236초, 5% 목표는
 165.70242초이며, Stage 1처럼 평가 구간 이전에 끝난 실행에는 최종 달성 판정이 없습니다.
 입력 DB는 하나만 지정해도 `--episodes` 횟수만큼 반복합니다. 에피소드마다 Python은

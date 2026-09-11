@@ -3,7 +3,7 @@
 import re
 
 
-CONTEXTUAL_VERSION = "v10.6.5"
+CONTEXTUAL_VERSION = "v10.7.0"
 _SEMVER_PATTERN = re.compile(r"^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
 
 
