@@ -23,6 +23,34 @@ DEFAULT_INPUT = ROOT.parent / "db/base/AICC_Input_260403.db"
 BUILD = ROOT / "tools/pinokio"
 RUNTIME_FILES = ("Pinokio.Headless.exe", "Pinokio.Headless.exe.config",
                  "Pinokio.TCP.IP.dll", "Pinokio.Utill.Log.dll")
+# Controller options this launcher already owns. A sweep that sets them again
+# through the override list would desynchronize the native simulator, the
+# result collector or the run's own output layout, so name the launcher flag
+# that owns each one instead of silently letting the last value win.
+RESERVED_TRAINING_OPTIONS = {
+    "--port": "pass --port before the --",
+    "--ports": "pass --port before the --",
+    "--num-sim": "one simulator per launch; pass --port before the --",
+    "--mode": "pass --mode before the --",
+    "--stage": "pass --mode stage1 or --mode stage2 before the --",
+    "--sim-end-time": "pass --end-time before the --, so the native simulator agrees",
+    "--device": "pass --device before the --",
+    "--wandb": "pass --no-wandb before the --",
+    "--no-wandb": "pass --no-wandb before the --",
+    "--episode-summary-path": "this launcher collects the per-episode metrics itself",
+    "--checkpoint-root": "the training runner names each run's checkpoint root",
+    "--resume-checkpoint": "pass --checkpoint before the --",
+    "--load-stage1-policy": "pass --stage1-policy before the --",
+}
+
+
+def split_training_overrides(argv=None):
+    """Split launcher arguments from the training overrides after a bare --."""
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if "--" not in argv:
+        return argv, []
+    boundary = argv.index("--")
+    return argv[:boundary], argv[boundary + 1:]
 
 
 def result_name(pattern, input_path, episode):
@@ -35,7 +63,14 @@ def result_name(pattern, input_path, episode):
 
 
 def parse_options(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
+    argv, overrides = split_training_overrides(argv)
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        epilog=("Everything after a bare -- is passed to the Python controller's "
+                "own CLI, so any training option can be swept: "
+                "run_headless.py --mode stage1 --episodes 50 -- --seed 3 "
+                "--exploration-noise-std 0.05"),
+    )
     parser.add_argument("--mode", choices=("stage1", "stage2", "inference", "baseline", "simulator"), default="stage1")
     inputs = parser.add_mutually_exclusive_group()
     inputs.add_argument("--input", type=Path)
@@ -48,12 +83,28 @@ def parse_options(argv=None):
     parser.add_argument("--checkpoint", type=Path, help="Inference checkpoint; default: fresh Stage 1 lowest-TAT policy")
     parser.add_argument("--stage1-policy", type=Path, help="Frozen prefix required when evaluating a Stage 2 checkpoint")
     parser.add_argument("--rl-cost-lambda", type=float, help="Optional inference cost-strength experiment (0..1); default: saved checkpoint value")
-    parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda", help="Inference device; UD7 training uses CUDA")
+    parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda", help="Training and inference device")
+    parser.add_argument("--note", help="One-word run tag for the run/checkpoint name; default: each runner's own tag")
     parser.add_argument("--no-wandb", action="store_true")
     parser.add_argument("--check", action="store_true", help="Validate paths/options without starting any process or run")
     parser.add_argument("--keep-work", action="store_true", help="Keep decrypted per-episode working DBs for debugging")
     parser.add_argument("--timeout", type=float, default=21600, help="Maximum wall seconds per episode (default: 6h)")
     options = parser.parse_args(argv)
+    options.train_args = tuple(overrides)
+    if options.note is not None and not re.fullmatch(r"[A-Za-z0-9._-]{1,32}", options.note):
+        parser.error("--note must be 1..32 characters of letters, digits, '.', '_' or '-'")
+    if options.train_args:
+        if options.mode == "simulator":
+            parser.error("simulator mode starts no Python controller; training overrides need "
+                         "--mode stage1/stage2/inference/baseline")
+        if not options.train_args[0].startswith("--"):
+            parser.error("training overrides must begin with an option, for example: -- --seed 3")
+        for token in options.train_args:
+            name = token.split("=", 1)[0]
+            if name in RESERVED_TRAINING_OPTIONS:
+                parser.error(f"{name} is set by this launcher; {RESERVED_TRAINING_OPTIONS[name]}")
+            if name == "--rl-cost-lambda" and options.rl_cost_lambda is not None:
+                parser.error("--rl-cost-lambda was given twice; keep either the launcher option or the override")
     options.inputs = (sorted(options.input_dir.resolve().glob("*.db"))
                       if options.input_dir else [(options.input or DEFAULT_INPUT).resolve()])
     if not options.inputs or any(not path.is_file() for path in options.inputs):
@@ -124,7 +175,12 @@ def server_command(options, summary_path):
         common.append("--no-wandb")
     if options.mode in ("stage1", "stage2"):
         script = "run_ud7_stage1.py" if options.mode == "stage1" else "run_ud7_best_stage2.py"
-        return [sys.executable, "-u", str(ROOT / "PythonCode" / script), *common]
+        # main.py has no run tag of its own, so --note reaches only the two
+        # training runners that name a checkpoint root. Overrides come last so
+        # a swept value wins over the runner's default.
+        tag = ["--note", options.note] if options.note else []
+        return [sys.executable, "-u", str(ROOT / "PythonCode" / script),
+                "--device", options.device, *tag, *common, *options.train_args]
     arguments = ["--mode", "actor_inference" if options.mode == "inference" else "baseline_only",
                  "--reward-version", "Q", "--sim-end-time", str(options.end_time),
                  "--device", options.device if options.mode == "inference" else "cpu"]
@@ -134,7 +190,8 @@ def server_command(options, summary_path):
             arguments += ["--stage", "2", "--load-stage1-policy", str(options.stage1_policy)]
         if getattr(options, "rl_cost_lambda", None) is not None:
             arguments += ["--rl-cost-lambda", str(options.rl_cost_lambda)]
-    return [sys.executable, "-u", str(ROOT / "PythonCode/run_headless_server.py"), *arguments, *common]
+    return [sys.executable, "-u", str(ROOT / "PythonCode/run_headless_server.py"),
+            *arguments, *common, *options.train_args]
 
 
 def stop_owned(process, stop_file=None):
@@ -240,13 +297,17 @@ def run(options):
                           "checkpoint": str(options.checkpoint) if options.checkpoint else None,
                           "stage1_policy": str(options.stage1_policy) if options.stage1_policy else None,
                           "rl_cost_lambda_override": options.rl_cost_lambda,
+                          "note": options.note, "train_args": list(options.train_args),
                           "headless_built": all((BUILD / "bin" / f).is_file() for f in RUNTIME_FILES)}, indent=2))
         return
     if os.name != "nt":
         raise RuntimeError("This installed Pinokio engine requires Windows/.NET Framework 4.8")
     from oht_routing.utils.wandb_logging import EXP_META, _make_run_name
-    EXP_META.update(note="headless", reward_version="Q",
-                    description=f"Headless {options.mode}: {options.episodes} episodes, original Pinokio TCP protocol.")
+    overrides = " ".join(options.train_args)
+    EXP_META.update(note=options.note or "headless", reward_version="Q",
+                    description=(f"Headless {options.mode}: {options.episodes} episodes, "
+                                 "original Pinokio TCP protocol."
+                                 + (f" Training overrides: {overrides}." if overrides else "")))
     base = options.output_dir.resolve() / _make_run_name(EXP_META)
     output, suffix = base, 0
     while True:
@@ -263,6 +324,7 @@ def run(options):
                 "checkpoint": str(options.checkpoint) if options.checkpoint else None,
                 "stage1_policy": str(options.stage1_policy) if options.stage1_policy else None,
                 "rl_cost_lambda_override": options.rl_cost_lambda,
+                "note": options.note, "train_args": list(options.train_args),
                 "completed_episodes": 0}
     atomic_json(output / "run.json", manifest)
     print(f"[batch] output={output}", flush=True)

@@ -1,5 +1,35 @@
 # Contextual TD7 experiment history — V10
 
+## v10.8.0 — Sweepable headless training launches
+
+- `run_headless.py` forwards everything after a bare `--` to the Python
+  controller's own CLI, so every `main.py` training option becomes a sweep
+  axis. Previously `run_ud7_stage1.py` and `run_ud7_best_stage2.py` held a
+  fixed argument list and only the input DB and episode count could vary.
+- The overrides are appended after each runner's defaults, so a swept value
+  wins while the UD7 contract (UBOC 5, reward Q, SALE/LAP, random eviction,
+  replay capacity, stage horizon) stays the default for anything not swept.
+- Reject the options the launcher owns — `--port`/`--ports`/`--num-sim`,
+  `--mode`/`--stage`, `--sim-end-time`, `--device`, `--wandb`/`--no-wandb`,
+  `--episode-summary-path`, `--checkpoint-root`, `--resume-checkpoint`,
+  `--load-stage1-policy` — naming the launcher flag that sets each one.
+  `--sim-end-time` matters most: the native simulator takes its horizon from
+  `--end-time`, and a second value would desynchronize the two.
+- `--device` now reaches training as well as inference, replacing the
+  hardcoded CUDA in both training runners. The default stays `cuda`.
+- `--note` sets the run tag that names the W&B run and the checkpoint root,
+  so sweep configurations started in the same minute stay distinguishable.
+  Omitting it keeps each runner's existing tag (`episodebest`, `besttat`,
+  `headless`), so an unswept launch is byte-identical to v10.7.0.
+- Record `note` and `train_args` in `--check` output and in each run's
+  `run.json`, and append the overrides to the W&B run description, so a
+  finished run states the parameters it used.
+- Validation: 16 headless tests and 27 subtests pass, plus the full 444-test
+  suite. `run_ud7_stage1.py --check` resolves swept `--seed`, `--batch-size`,
+  `--warmup-steps` and `--exploration-noise-std` into the runtime config while
+  keeping the UD7 defaults, and an unknown override is rejected by `main.py`
+  before any process starts. No simulator rollout was run for this change.
+
 ## v10.7.0 — Log episode final TAT and simulation acceleration in W&B
 
 - Add sparse `eval/final_tat` (seconds) at completed episode boundaries and

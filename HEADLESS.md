@@ -64,6 +64,41 @@ Stage 1 기본 입력은 다음 파일입니다:
 
 `C:\Users\junheemike\Documents\SKH\AICC0601_2612_반출용\db\base\AICC_Input_260403.db`
 
+## 파라미터 스윕
+
+`--` 뒤의 인자는 Python 컨트롤러(`main.py`)의 CLI로 그대로 전달되므로 학습
+옵션은 무엇이든 스윕 축이 됩니다. 각 runner의 기본값(UBOC 5, reward Q,
+SALE/LAP, random eviction, replay 용량, stage horizon) *뒤에* 덧붙으므로 넘긴
+값만 바뀌고 나머지 UD7 계약은 그대로 유지됩니다.
+
+```powershell
+# 탐험 노이즈와 시드를 바꿔 실행. --note가 run/checkpoint 이름을 구분한다.
+.\start_ud7_stage1_headless.cmd --episodes 50 --port 9120 --note noise05 -- --seed 3 --exploration-noise-std 0.05
+
+# 실행 전 확인: 프로세스를 띄우지 않고 인자와 경로만 검사
+.\.venv\Scripts\python.exe PythonCode
+un_headless.py --mode stage1 --check --port 9120 -- --seed 3 --batch-size 512
+
+# 실제로 반영되는 학습 설정 전체를 출력
+.\.venv\Scripts\python.exe PythonCode
+un_ud7_stage1.py --check --port 9120 --seed 3 --batch-size 512
+```
+
+런처가 직접 정하는 옵션은 override로 받지 않고 거부합니다 — `--port`/`--ports`/
+`--num-sim`, `--mode`/`--stage`, `--sim-end-time`, `--device`, `--wandb`/`--no-wandb`,
+`--episode-summary-path`, `--checkpoint-root`, `--resume-checkpoint`,
+`--load-stage1-policy`. 특히 `--sim-end-time`은 native 시뮬레이터가 `--end-time`에서
+horizon을 받으므로 두 값이 갈라지면 안 됩니다. 대신 런처 쪽 플래그를 쓰세요.
+`--device`는 이제 inference뿐 아니라 학습에도 적용되며 기본값은 `cuda`입니다.
+
+메모리: Stage 1 기본값은 `--replay-capacity-env-steps 100000` + random eviction이라
+학습 프로세스 하나가 10GB 이상을 씁니다. 여러 설정을 병렬로 돌리지 말고
+순차 실행하거나, 병렬이 필요하면 `-- --replay-capacity-env-steps 50000`처럼
+용량을 줄여 잡으세요.
+
+각 실행의 `run.json`과 `--check` 출력에 `note`와 `train_args`가 기록되고,
+W&B run description에도 override가 덧붙습니다.
+
 ```powershell
 # input 폴더의 모든 .db를 정렬해서 차례로 실행; episodes가 더 많으면 순환
 .\start_ud7_stage1_headless.cmd --input-dir "..\db\base" --episodes 100 --port 9120 --output-dir "results\headless" --name "ud7_{input}_{episode:04d}"

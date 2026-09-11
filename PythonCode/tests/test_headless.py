@@ -128,7 +128,8 @@ class HeadlessTests(unittest.TestCase):
             self.assertTrue(root.exists())
 
     def test_launch_preserves_training_stage_and_explicit_port(self):
-        options = SimpleNamespace(port=9119, no_wandb=True, mode="stage1")
+        options = SimpleNamespace(port=9119, no_wandb=True, mode="stage1", device="cuda",
+                                  note=None, train_args=())
         command = server_command(options, Path("metrics.jsonl"))
         self.assertTrue(any(p.endswith("run_ud7_stage1.py") for p in command))
         self.assertEqual(command[command.index("--port") + 1], "9119")
@@ -136,7 +137,8 @@ class HeadlessTests(unittest.TestCase):
 
     def test_stage2_inference_preserves_its_frozen_prefix(self):
         options = SimpleNamespace(port=9119, no_wandb=True, mode="inference", device="cuda",
-                                  end_time=45000, checkpoint=Path("stage2.pt"), stage1_policy=Path("prefix.pt"))
+                                  end_time=45000, checkpoint=Path("stage2.pt"), stage1_policy=Path("prefix.pt"),
+                                  note=None, train_args=())
         command = server_command(options, Path("metrics.jsonl"))
         self.assertEqual(command[command.index("--stage") + 1], "2")
         self.assertEqual(command[command.index("--load-stage1-policy") + 1], "prefix.pt")
@@ -146,7 +148,7 @@ class HeadlessTests(unittest.TestCase):
     def test_inference_strength_override_is_explicit_and_bounded(self):
         options = SimpleNamespace(port=9119, no_wandb=True, mode="inference", device="cuda",
                                   end_time=45000, checkpoint=Path("stage2.pt"), stage1_policy=Path("prefix.pt"),
-                                  rl_cost_lambda=0.45)
+                                  rl_cost_lambda=0.45, note=None, train_args=())
         command = server_command(options, Path("metrics.jsonl"))
         self.assertEqual(command[command.index("--rl-cost-lambda") + 1], "0.45")
         options.rl_cost_lambda = None
@@ -158,6 +160,62 @@ class HeadlessTests(unittest.TestCase):
                 with self.subTest(value=value), self.assertRaises(SystemExit):
                     parse_options(["--mode", "inference", "--input", str(source),
                                    "--checkpoint", str(source), "--rl-cost-lambda", value])
+
+    def test_training_overrides_reach_the_runner_and_reserved_options_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "input.db"
+            source.touch()
+            base = ["--mode", "stage1", "--input", str(source), "--port", "9121"]
+            options = parse_options([*base, "--note", "noise05", "--",
+                                     "--seed", "3", "--exploration-noise-std", "0.05"])
+            self.assertEqual(options.train_args,
+                             ("--seed", "3", "--exploration-noise-std", "0.05"))
+            command = server_command(options, Path("metrics.jsonl"))
+            self.assertTrue(any(part.endswith("run_ud7_stage1.py") for part in command))
+            self.assertEqual(command[-4:],
+                             ["--seed", "3", "--exploration-noise-std", "0.05"])
+            self.assertEqual(command[command.index("--note") + 1], "noise05")
+            self.assertEqual(command[command.index("--port") + 1], "9121")
+            for reserved in (["--port", "9999"], ["--sim-end-time", "500"], ["--stage", "2"],
+                             ["--checkpoint-root", "elsewhere"], ["--no-wandb"],
+                             ["--device", "cpu"], ["--port=9999"]):
+                with self.subTest(reserved=reserved[0]), self.assertRaises(SystemExit):
+                    parse_options([*base, "--", *reserved])
+            # A bare value is a typo, not an override; catch it before launch.
+            with self.assertRaises(SystemExit):
+                parse_options([*base, "--", "seed", "3"])
+            self.assertEqual(parse_options(base).train_args, ())
+
+    def test_overrides_reach_evaluation_modes_but_not_the_bare_simulator(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "input.db"
+            source.touch()
+            options = parse_options(["--mode", "baseline", "--input", str(source),
+                                     "--end-time", "120", "--", "--console-log-interval", "25"])
+            command = server_command(options, Path("metrics.jsonl"))
+            self.assertTrue(any(part.endswith("run_headless_server.py") for part in command))
+            self.assertEqual(command[-2:], ["--console-log-interval", "25"])
+            # The simulator mode starts no controller, so an override is a mistake.
+            with self.assertRaises(SystemExit):
+                parse_options(["--mode", "simulator", "--input", str(source),
+                               "--end-time", "120", "--", "--seed", "3"])
+            for note in ("has space", "x" * 33, ""):
+                with self.subTest(note=note), self.assertRaises(SystemExit):
+                    parse_options(["--mode", "stage1", "--input", str(source), "--note", note])
+
+    def test_training_device_is_selectable_and_defaults_to_cuda(self):
+        for device in ("cuda", "cpu"):
+            with self.subTest(device=device):
+                options = SimpleNamespace(port=9119, no_wandb=True, mode="stage1",
+                                          device=device, note=None, train_args=())
+                command = server_command(options, Path("metrics.jsonl"))
+                self.assertEqual(command[command.index("--device") + 1], device)
+                self.assertNotIn("--note", command)
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "input.db"
+            source.touch()
+            self.assertEqual(
+                parse_options(["--mode", "stage1", "--input", str(source)]).device, "cuda")
 
     def test_stage2_checkpoint_cannot_silently_skip_prefix_and_policy_is_pinned_once(self):
         with tempfile.TemporaryDirectory() as directory:

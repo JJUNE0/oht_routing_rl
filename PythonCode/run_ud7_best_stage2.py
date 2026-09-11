@@ -11,7 +11,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def launch_args(source):
+def launch_args(source, device="cuda"):
     return [
         "--mode", "training", "--action-enabled", "--stage", "2",
         "--reward-version", "Q", "--load-stage1-policy", str(source),
@@ -19,7 +19,7 @@ def launch_args(source):
         "--num-critics", "5", "--replay-eviction-mode", "random",
         "--replay-capacity-env-steps", "200000",
         "--exploration-noise-std", "0.05",
-        "--exploration-noise-final-std", "0.05", "--device", "cuda",
+        "--exploration-noise-final-std", "0.05", "--device", device,
         "--checkpoint-root", str(source.parent.parent / "stage2"),
     ]
 
@@ -31,7 +31,12 @@ def main():
     parser.add_argument("--port", type=int, default=9100)
     parser.add_argument("--episode-summary-path", type=Path)
     parser.add_argument("--no-wandb", action="store_true")
-    options = parser.parse_args()
+    parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
+    parser.add_argument("--note", default="besttat",
+                        help="Run tag used by the run/checkpoint name")
+    # Unrecognized arguments are main.py training options. They are appended
+    # after this runner's defaults, so a swept value wins over the default.
+    options, overrides = parser.parse_known_args()
     pointer = ROOT / "ud7_stage1_current.json"
     if not pointer.is_file():
         raise RuntimeError("Start run_ud7_stage1.py first; no new Stage 1 run is selected.")
@@ -42,13 +47,14 @@ def main():
     os.chdir(ROOT)
     from oht_routing.utils.wandb_logging import EXP_META
     EXP_META.update(
-        note="besttat",
+        note=options.note,
         description=(
             "UD7 Stage 2 from the fresh Stage 1 run's lowest eligible "
             "episode-end TAT checkpoint. Frozen deterministic "
             "Stage 1 inference for the first 2000 ticks of every episode, then "
             "fresh UD7 Stage 2 training with policy warm start, LAP, random "
             "replay eviction and flat exploration std 0.05."
+            + (f" Training overrides: {' '.join(overrides)}." if overrides else "")
         ),
     )
     # Freeze the selected artifact per launch; subsequent Stage 1 improvements
@@ -61,7 +67,7 @@ def main():
         pinned = launch_dir / "stage1_policy.pt"
         shutil.copyfile(source, pinned)
         source = pinned
-    args = launch_args(source)
+    args = launch_args(source, options.device)
     if not options.check:
         args[-1] = str(source.parent / "checkpoints")
     args += ["--port", str(options.port)]
@@ -69,6 +75,7 @@ def main():
         args += ["--episode-summary-path", str(options.episode_summary_path.resolve())]
     if options.no_wandb:
         args += ["--no-wandb"]
+    args += overrides
     from oht_routing.runtime.cli import parse_args
     from oht_routing.runtime.config import runtime_config_from_args
     sys.argv = [str(Path(__file__).resolve()), *args]

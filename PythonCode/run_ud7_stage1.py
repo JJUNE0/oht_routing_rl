@@ -15,15 +15,21 @@ def main():
     parser.add_argument("--port", type=int, default=9100)
     parser.add_argument("--episode-summary-path", type=Path)
     parser.add_argument("--no-wandb", action="store_true")
-    options = parser.parse_args()
+    parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
+    parser.add_argument("--note", default="episodebest",
+                        help="Run tag used by the run/checkpoint name")
+    # Unrecognized arguments are main.py training options. They are appended
+    # after this runner's defaults, so a swept value wins over the default.
+    options, overrides = parser.parse_known_args()
     os.chdir(ROOT)
     from oht_routing.utils.wandb_logging import EXP_META, _make_run_name
     EXP_META.update(
-        reward_version="Q", note="episodebest",
+        reward_version="Q", note=options.note,
         description=("Fresh UD7 Stage 1 (UBOC 5, reward Q, SALE/LAP, random eviction). "
                      "Save a full checkpoint at each episode end; retain lowest "
                      "last-packet TAT among full episodes after warmup with frozen "
-                     "normalizers. No checkpoint or normalizer warm start."),
+                     "normalizers. No checkpoint or normalizer warm start."
+                     + (f" Training overrides: {' '.join(overrides)}." if overrides else "")),
     )
     destination = ROOT / "checkpoints" / _make_run_name(EXP_META)
     if not options.check:
@@ -41,7 +47,7 @@ def main():
         "--mode", "training", "--action-enabled", "--stage", "1",
         "--reward-version", "Q", "--critic-target-mode", "uboc",
         "--num-critics", "5", "--replay-eviction-mode", "random",
-        "--replay-capacity-env-steps", "100000", "--device", "cuda",
+        "--replay-capacity-env-steps", "100000", "--device", options.device,
         "--checkpoint-root", str(destination),
         "--port", str(options.port),
     ]
@@ -49,6 +55,7 @@ def main():
         args += ["--episode-summary-path", str(options.episode_summary_path.resolve())]
     if options.no_wandb:
         args += ["--no-wandb"]
+    args += overrides
     from oht_routing.runtime.cli import parse_args
     from oht_routing.runtime.config import runtime_config_from_args
     sys.argv = [str(Path(__file__).resolve()), *args]
