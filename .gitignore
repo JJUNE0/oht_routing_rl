@@ -16,6 +16,7 @@
 !/start_ud7_stage1.cmd
 !/start_ud7_stage2_best.cmd
 !/start_ud7_stage1_headless.cmd
+!/start_td7_stage1_headless.cmd
 !/start_ud7_stage2_headless.cmd
 !/tools/
 /tools/*

@@ -64,6 +64,35 @@ Stage 1 기본 입력은 다음 파일입니다:
 
 `C:\Users\junheemike\Documents\SKH\AICC0601_2612_반출용\db\base\AICC_Input_260403.db`
 
+## 학습 대상 선택 (UD7 / TD7)
+
+`--algorithm`으로 Stage 1 학습 대상을 고릅니다. 기본값은 `ud7`이고, 생략하면
+기존 실행과 완전히 동일합니다.
+
+| 대상 | critic 계약 | Stage 1 runner | 포인터 |
+|---|---|---|---|
+| `ud7` (기본) | UBOC ensemble, critic 5개 | `run_ud7_stage1.py` | `ud7_stage1_current.json` |
+| `td7` | clipped double-Q, critic 2개 | `run_td7_stage1.py` | `td7_stage1_current.json` |
+
+critic 계약을 뺀 나머지(reward Q, SALE/LAP, random eviction, replay 용량,
+stage horizon, warmup, 에피소드 체크포인트/선택 규칙)는 동일해서 두 실행이
+ensemble 효과만 분리하는 비교쌍이 됩니다.
+
+```powershell
+# TD7 baseline Stage 1
+.\start_td7_stage1_headless.cmd --episodes 50 --port 9120
+
+# 같은 스윕을 두 대상에 적용 (순차 실행)
+.\start_ud7_stage1_headless.cmd --episodes 50 --port 9120 -- --seed 3
+.\start_td7_stage1_headless.cmd --episodes 50 --port 9120 -- --seed 3
+
+# TD7 Stage 1 결과를 무노이즈로 평가 (td7 포인터에서 best를 찾는다)
+.\.venv\Scripts\python.exe PythonCodeun_headless.py --mode inference --algorithm td7 --episodes 1 --port 9120
+```
+
+Stage 2 runner는 UD7만 있습니다. `--mode stage2 --algorithm td7`은 UD7 Stage 2
+계약을 조용히 쓰는 대신 이름을 밝혀 거부합니다.
+
 ## 파라미터 스윕
 
 `--` 뒤의 인자는 Python 컨트롤러(`main.py`)의 CLI로 그대로 전달되므로 학습

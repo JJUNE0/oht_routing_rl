@@ -44,6 +44,17 @@ RESERVED_TRAINING_OPTIONS = {
 }
 
 
+# Stage 1 training targets. Both runners share every setting except the critic
+# contract, so a UD7 run and a TD7 run form a controlled comparison. Each keeps
+# its own "current Stage 1 run" pointer so neither selects the other's policy.
+STAGE1_RUNNERS = {"ud7": "run_ud7_stage1.py", "td7": "run_td7_stage1.py"}
+STAGE2_RUNNERS = {"ud7": "run_ud7_best_stage2.py"}
+
+
+def stage1_pointer(algorithm):
+    return ROOT / f"{algorithm}_stage1_current.json"
+
+
 def split_training_overrides(argv=None):
     """Split launcher arguments from the training overrides after a bare --."""
     argv = list(sys.argv[1:] if argv is None else argv)
@@ -85,6 +96,8 @@ def parse_options(argv=None):
     parser.add_argument("--rl-cost-lambda", type=float, help="Optional inference cost-strength experiment (0..1); default: saved checkpoint value")
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda", help="Training and inference device")
     parser.add_argument("--note", help="One-word run tag for the run/checkpoint name; default: each runner's own tag")
+    parser.add_argument("--algorithm", choices=tuple(STAGE1_RUNNERS), default="ud7",
+                        help="Training target: ud7 (UBOC ensemble) or td7 (clipped double-Q baseline)")
     parser.add_argument("--no-wandb", action="store_true")
     parser.add_argument("--check", action="store_true", help="Validate paths/options without starting any process or run")
     parser.add_argument("--keep-work", action="store_true", help="Keep decrypted per-episode working DBs for debugging")
@@ -93,6 +106,9 @@ def parse_options(argv=None):
     options.train_args = tuple(overrides)
     if options.note is not None and not re.fullmatch(r"[A-Za-z0-9._-]{1,32}", options.note):
         parser.error("--note must be 1..32 characters of letters, digits, '.', '_' or '-'")
+    if options.mode == "stage2" and options.algorithm not in STAGE2_RUNNERS:
+        parser.error(f"no Stage 2 runner for --algorithm {options.algorithm}; "
+                     "train its Stage 1 and evaluate with --mode inference")
     if options.train_args:
         if options.mode == "simulator":
             parser.error("simulator mode starts no Python controller; training overrides need "
@@ -132,9 +148,10 @@ def parse_options(argv=None):
         parser.error("--rl-cost-lambda requires inference and a finite value in [0, 1]")
     if options.mode in ("inference", "stage2"):
         if options.checkpoint is None:
-            pointer = ROOT / "ud7_stage1_current.json"
+            pointer = stage1_pointer(options.algorithm)
             if not pointer.is_file():
-                parser.error("Train fresh Stage 1 first, or provide --checkpoint for inference")
+                parser.error(f"Train a fresh {options.algorithm} Stage 1 first, or provide "
+                             "--checkpoint for inference")
             options.checkpoint = Path(json.loads(pointer.read_text(encoding="utf-8"))["best_policy"])
         options.checkpoint = options.checkpoint.resolve()
         if not options.checkpoint.is_file():
@@ -174,7 +191,7 @@ def server_command(options, summary_path):
     if options.no_wandb or options.mode == "baseline":
         common.append("--no-wandb")
     if options.mode in ("stage1", "stage2"):
-        script = "run_ud7_stage1.py" if options.mode == "stage1" else "run_ud7_best_stage2.py"
+        script = (STAGE1_RUNNERS if options.mode == "stage1" else STAGE2_RUNNERS)[options.algorithm]
         # main.py has no run tag of its own, so --note reaches only the two
         # training runners that name a checkpoint root. Overrides come last so
         # a swept value wins over the runner's default.
@@ -297,7 +314,8 @@ def run(options):
                           "checkpoint": str(options.checkpoint) if options.checkpoint else None,
                           "stage1_policy": str(options.stage1_policy) if options.stage1_policy else None,
                           "rl_cost_lambda_override": options.rl_cost_lambda,
-                          "note": options.note, "train_args": list(options.train_args),
+                          "note": options.note, "algorithm": options.algorithm,
+                          "train_args": list(options.train_args),
                           "headless_built": all((BUILD / "bin" / f).is_file() for f in RUNTIME_FILES)}, indent=2))
         return
     if os.name != "nt":
@@ -324,7 +342,8 @@ def run(options):
                 "checkpoint": str(options.checkpoint) if options.checkpoint else None,
                 "stage1_policy": str(options.stage1_policy) if options.stage1_policy else None,
                 "rl_cost_lambda_override": options.rl_cost_lambda,
-                "note": options.note, "train_args": list(options.train_args),
+                "note": options.note, "algorithm": options.algorithm,
+                "train_args": list(options.train_args),
                 "completed_episodes": 0}
     atomic_json(output / "run.json", manifest)
     print(f"[batch] output={output}", flush=True)

@@ -10,7 +10,7 @@ from unittest.mock import Mock, patch
 
 from run_headless import (parse_options, result_name, require_free_port,
                           read_results, verify_result, clean_work, server_command, require_native_paths,
-                          prepare_inference_checkpoint)
+                          prepare_inference_checkpoint, stage1_pointer)
 from oht_routing.runtime.client import ClientAlgorithm
 from oht_routing.runtime.server import _run_session, _accept_sessions
 
@@ -129,7 +129,7 @@ class HeadlessTests(unittest.TestCase):
 
     def test_launch_preserves_training_stage_and_explicit_port(self):
         options = SimpleNamespace(port=9119, no_wandb=True, mode="stage1", device="cuda",
-                                  note=None, train_args=())
+                                  note=None, train_args=(), algorithm="ud7")
         command = server_command(options, Path("metrics.jsonl"))
         self.assertTrue(any(p.endswith("run_ud7_stage1.py") for p in command))
         self.assertEqual(command[command.index("--port") + 1], "9119")
@@ -203,11 +203,32 @@ class HeadlessTests(unittest.TestCase):
                 with self.subTest(note=note), self.assertRaises(SystemExit):
                     parse_options(["--mode", "stage1", "--input", str(source), "--note", note])
 
+    def test_algorithm_selects_its_own_stage1_runner_and_pointer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "input.db"
+            source.touch()
+            base = ["--input", str(source), "--port", "9121"]
+            for algorithm, script in (("ud7", "run_ud7_stage1.py"), ("td7", "run_td7_stage1.py")):
+                with self.subTest(algorithm=algorithm):
+                    options = parse_options([*base, "--mode", "stage1", "--algorithm", algorithm])
+                    self.assertEqual(options.algorithm, algorithm)
+                    command = server_command(options, Path("metrics.jsonl"))
+                    self.assertTrue(any(part.endswith(script) for part in command))
+                    self.assertEqual(stage1_pointer(algorithm).name,
+                                     f"{algorithm}_stage1_current.json")
+            self.assertEqual(parse_options([*base, "--mode", "stage1"]).algorithm, "ud7")
+            # Only UD7 has a Stage 2 runner; refuse rather than run UD7's.
+            with self.assertRaises(SystemExit):
+                parse_options([*base, "--mode", "stage2", "--algorithm", "td7"])
+            with self.assertRaises(SystemExit):
+                parse_options([*base, "--mode", "stage1", "--algorithm", "sac"])
+
     def test_training_device_is_selectable_and_defaults_to_cuda(self):
         for device in ("cuda", "cpu"):
             with self.subTest(device=device):
                 options = SimpleNamespace(port=9119, no_wandb=True, mode="stage1",
-                                          device=device, note=None, train_args=())
+                                          device=device, note=None, train_args=(),
+                                          algorithm="ud7")
                 command = server_command(options, Path("metrics.jsonl"))
                 self.assertEqual(command[command.index("--device") + 1], device)
                 self.assertNotIn("--note", command)

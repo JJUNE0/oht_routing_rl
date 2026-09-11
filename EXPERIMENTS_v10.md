@@ -1,5 +1,29 @@
 # Contextual TD7 experiment history — V10
 
+## v10.9.0 — TD7 baseline as a second headless training target
+
+- Add `run_td7_stage1.py` and `start_td7_stage1_headless.cmd`. The runner is
+  `run_ud7_stage1.py` with the critic contract replaced: `cdq` over exactly two
+  critics instead of `uboc` over five. Reward Q, SALE/LAP, random eviction,
+  replay capacity, stage horizon, warmup and the episode checkpoint/selection
+  policy are unchanged, so a TD7 run pairs with a UD7 run as a controlled
+  comparison of the ensemble alone.
+- `run_headless.py --algorithm {ud7,td7}` (default `ud7`) picks the Stage 1
+  runner. Every other launcher rule — modes, horizons, overrides after `--`,
+  reserved options, result collection — is untouched, so a UD7 launch that
+  omits the flag is byte-identical to v10.8.0.
+- Each target keeps its own `<algorithm>_stage1_current.json` pointer, and
+  `--mode inference` resolves the checkpoint from the pointer of the selected
+  algorithm. Neither line can select the other's Stage 1 policy.
+- Only UD7 has a Stage 2 runner. `--mode stage2 --algorithm td7` is refused by
+  name rather than silently launching the UD7 Stage 2 contract.
+- `--check` output and each run's `run.json` record the algorithm.
+- Validation: 17 headless tests and 29 subtests pass. `run_td7_stage1.py
+  --check` resolves `critic_target_mode=cdq`, `num_critics=2` with the UD7
+  Stage 1 settings otherwise intact; the launcher selects each runner and
+  pointer, refuses an unknown algorithm, and refuses TD7 Stage 2. No simulator
+  rollout was run for this change.
+
 ## v10.8.0 — Sweepable headless training launches
 
 - `run_headless.py` forwards everything after a bare `--` to the Python
